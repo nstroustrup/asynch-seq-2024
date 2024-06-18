@@ -1,0 +1,889 @@
+---
+title: "Network Validation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(pbapply)
+library(stringr)
+library(JADE)
+library(circlize)
+library(MineICA)
+# library(igraph)
+
+theme_set(theme_cowplot())
+
+dir.create("../figures/main_figure_6/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_6/", showWarnings = FALSE)
+
+source("../scripts/notebooks_helpers/net_validation.R")
+# source("../scripts/helpers/preprocess.R")
+# source("../scripts/helpers/enrichment_analysis.R")
+# source("../scripts/helpers/graphs.R")
+# source("../scripts/helpers/heatmap.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load data
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+```
+
+### Network
+
+```{r}
+net_data_a <- readRDS("../data/gene_network/all_genes_gene_network_d8.rds")
+
+net_data_a$tissue_rho_list <- lapply(net_data_a$tissue_norm_list, function(x)
+  cor(t(x), method = "s"))
+
+net_data_a$tissue_communities_vector <- unlist(lapply(names(net_data_a$tissue_communities), function(i) {
+  genes <- net_data_a$tissue_communities[[i]]
+  setNames(rep_len(i, length(genes)), genes)
+}))
+```
+
+
+### RNAi
+
+```{r}
+rnai_data <- readRDS("../data/formated_counts/counts_and_annots_net_validation.rds")
+for (var in names(data)) {
+  assign(var, data[[var]])
+}
+rm(data)
+```
+
+
+```{r}
+da_models_df <- fread("../data/differential_analysis/models/net_validation.csv")
+
+# standard normalization
+files <- setdiff(list.files("../data/differential_analysis/tables/net_validation/"),
+                 list.files("../data/differential_analysis/tables/net_validation/", pattern = "^ts_"))
+
+da_df <- rbindlist(pblapply(files, function(filename) {
+  out <- fread(paste0("../data/differential_analysis/tables/net_validation/", filename))
+  colnames(out)[3:ncol(out)] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+  out[, Name := str_remove_all(filename, "[.]csv[.]gz")]
+  out
+}))
+da_df <- merge(da_models_df[, .(Name, RNAi, Genotype)], da_df, by = "Name")
+
+```
+
+```{r}
+#generate a long table of the correlations,
+#selecting only correlations whose first node is
+#in the RNAi set because these are the ones we'll use to compare with differential expression analysis
+RNAi_GeneNames = geneid$GeneName[geneid$GeneSymbol %in% unique(da_df$RNAi)]
+rho_df_a <- rbindlist(lapply(names(net_data_a$tissue_rho_list), function(i) {
+  
+  genotype <- switch(i, n2 = "N2", daf2 = "daf-2(e1368)")
+  
+  rho <- net_data_a$tissue_rho_list[[i]]
+  df <- reshape2::melt(rho[which(rownames(rho) %in% RNAi_GeneNames),])
+  df <- as.data.table(df)
+  colnames(df) <- c("GeneName1", "GeneName2", "Correlation")
+  
+  df[, GeneName1 := as.character(GeneName1)]
+  df[, GeneName2 := as.character(GeneName2)]
+  
+  df <- df[GeneName1 != GeneName2]
+  
+  df[, GeneSymbol1 := geneid[GeneName1]$GeneSymbol]
+  df[, GeneSymbol2 := geneid[GeneName2]$GeneSymbol]
+  df[, Genotype := genotype]
+  
+  df[, Community1 := net_data$tissue_communities_vector[GeneName1]]
+  df[, Community2 := net_data$tissue_communities_vector[GeneName2]]
+  
+  df[is.na(Community1), Community1 := "Not in Community"]
+  df[is.na(Community2), Community2 := "Not in Community"]
+  
+  df
+}))
+```
+
+
+```{r}
+conditions_df <- unique(da_models_df[, .(RNAiName = geneid[RNAi, on = "GeneSymbol"]$GeneName, 
+                                         RNAiSymbol = RNAi, 
+                                         Genotype)])
+conditions_df[, Community := net_data$tissue_communities_vector[as.character(RNAiName)]]
+conditions_df[is.na(Community), Community := "Not in Community"]
+conditions_df[, CommunityPlot := Community]
+conditions_df[Community != "Not in Community", CommunityPlot := gsub("y", "y ", Community)]
+conditions_df[, MeasuredCorrelation := RNAiName %in% rownames(net_data$filter_tissue_rho_list$n2)]
+
+# sel_not_in_comm <- conditions_df[Community == "Not in Community" & MeasuredCorrelation == TRUE & Genotype == "N2"]$RNAiSymbol
+sel_not_in_comm <- c("alh-10", "glc-1", "mig-6", "nlp-28", "srp-2", "fmo-5", "mak-1", "osm-11")
+```
+
+
+## Colors
+
+```{r}
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+
+day_colors <- c("goldenrod1", "darkgreen")
+
+tissue_colors <- c("germ_line" = "black", 
+                   "hypodermis" = "#5ac134", 
+                   "intestine" = "#79bbe9", 
+                   "muscle" = "#f68528",
+                   "neurons" = "#E92128")
+
+community_colors <- colorspace::rainbow_hcl(length(net_data$tissue_communities))
+names(community_colors) <- paste0("Community", seq_along(community_colors))
+```
+
+```{r}
+rho_da_df <- merge(rho_df_a[Genotype == "N2"], 
+                      da_df[Genotype == "N2" & ! GeneSymbol %in% unique(RNAi)], 
+                      by.x = c("GeneSymbol1", "GeneName2", "Genotype"), 
+                      by.y = c("RNAi", "GeneName", "Genotype"), 
+                      allow.cartesian = TRUE)
+
+rho_n = unique(rho_df_a$GeneSymbol1)
+rho_n = rho_n[order(rho_n)]
+da_n =  unique(da_df$RNAi)
+da_n[which( !(da_n %in% rho_n))]
+
+
+rho_da_df[, RNAi := GeneSymbol1]
+
+rho_da_df[, Community1Plot := Community1]
+rho_da_df[, Community2Plot := Community2]
+
+rho_da_df[Community1 != "Not in Community", Community1Plot := gsub("y", "y ", Community1)]
+rho_da_df[Community2 != "Not in Community", Community2Plot := gsub("y", "y ", Community2)]
+
+sig_rho_da_df <- rho_da_df[padj <= 1]
+```
+
+## Effect on expression of genes in communities
+
+```{r, fig.width=15, fig.height=15}
+ggplot(rho_ts_da_df, aes(padj, color = Community2Plot)) +
+  scale_x_log10() +
+  facet_wrap(Community1Plot ~ RNAi, scales = "free_x") +
+  stat_ecdf() +
+  theme(legend.position = "top") +
+  xlab("Effect of RNAi (p-value)") +
+  ylab("ECDF") +
+  scale_color_manual(name = NULL, values = setNames(community_colors, gsub("y", "y ", names(community_colors))))
+```
+
+```{r, fig.width=15, fig.height=15}
+ggplot(sig_rho_ts_da_df, aes(abs(log2FoldChange), color = Community2Plot)) +
+  facet_wrap(Community1Plot ~ RNAi, scales = "free_x") +
+  stat_ecdf() +
+  theme(legend.position = "top") +
+  xlab("Effect of RNAi (log2 Scale)") +
+  ylab("ECDF") +
+  scale_color_manual(name = NULL, values = setNames(community_colors, gsub("y", "y ", names(community_colors))))
+```
+
+## Correlation between differential analysis and correlation?
+
+```{r, fig.width=15, fig.height=15}
+corcor_df <- sig_rho_da_df[, .(CorCorLFC = cor(Correlation, log2FoldChange)), by = .(Community1Plot, RNAi)]
+corcor_df$RNAi = factor(corcor_df$RNAi,levels=corcor_df$RNAi[order(corcor_df$CorCorLFC,decreasing=T)])
+sig_rho_da_df$RNAi = factor(sig_rho_da_df$RNAi,levels=as.character(corcor_df$RNAi[order(corcor_df$CorCorLFC,decreasing=T)])
+ggplot(sig_rho_da_df, aes(Correlation, log2FoldChange)) +
+  geom_smooth(color = "purple", formula = y ~ x, se = FALSE, method = "lm", size = 1) +
+  geom_hex() +
+  ggpp::geom_text_npc(aes(npcx = "left", npcy = "bottom",
+                          label = paste0(round(100 * CorCorLFC, 1), "%")), 
+                      corcor_df) +
+  facet_wrap(Community1Plot ~ RNAi, scales = "free") +
+ # scale_color_manual(name = NULL, values = setNames(community_colors, gsub("y", "y ", names(community_colors)))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme(legend.position = "top") +
+  xlab("Correlation in Single Worm Data") +
+  ylab("Effect of RNAi (log2 Scale)")
+```
+
+```{r, fig.width=7.5, fig.height=7.5}
+ggdf <- sig_rho_da_df[Genotype == "N2"]
+
+ggdf$short_community = '';
+not_in_com = grepl("Not",ggdf$Community1Plot)
+ggdf$short_community[not_in_com] = "NG";
+ggdf$short_community[!not_in_com] = paste0("G",substring(ggdf$Community1Plot[!not_in_com],11))
+
+ggdf[, Wrap := paste0(RNAi, " (", short_community, ")")]
+corcor_df <- ggdf[, .(CorCorLFC = cor(Correlation, log2FoldChange)), by = .(Wrap,RNAi)]
+ggdf$CorCorLFC = 0;
+invisible(lapply(corcor_df$Wrap,function(x){
+  cr = corcor_df[Wrap == x,"CorCorLFC"]
+  ggdf[Wrap == x,"CorCorLFC"] <<- cr
+  c()
+}))
+ggdf[, Wrap := factor(Wrap, ggdf[! duplicated(Wrap)][order(CorCorLFC)]$Wrap)]
+```
+
+
+```{r, fig.width=7.5, fig.height=7.5}
+com_colors = community_colors;
+names(com_colors) =gsub("y", "y ", names(community_colors))
+com_colors = c(com_colors,"#000000");
+names(com_colors)[length(com_colors)]="Not in Community";
+lapply(list(c(1,9),c(10,dim(corcor_df)[1])),function(rng){
+  RNAi_to_plot = as.character(corcor_df[order(-(corcor_df$CorCorLFC)^2),RNAi][rng[1]:rng[2]])
+  gp = ggplot(ggdf[RNAi %in% RNAi_to_plot,], 
+         aes(Correlation, log2FoldChange)) +
+    geom_smooth(color = "black", formula = y ~ x, se = FALSE, method = "lm", size = .5) +
+    geom_hex(aes(color = Community2Plot), cex = .75) +
+    ggpp::geom_text_npc(aes(npcx = "left", npcy = "bottom",
+                            label = round(CorCorLFC, 3)), 
+                        corcor_df[RNAi %in% RNAi_to_plot]) + 
+    ggpp::geom_text_npc(aes(npcx = "right", npcy = "top",
+                            label = Wrap), 
+                        corcor_df[RNAi %in% RNAi_to_plot],fontface="italic") +
+    facet_wrap( ~ round(-CorCorLFC^2,2)+Wrap,scales="free_y",ncol=3,drop=T) +
+    #geom_abline() +
+    scale_color_manual(name = NULL, values = setNames(com_colors, gsub("y", "y ", names(community_colors)))) +
+    geom_smooth(se=F) +
+    geom_vline(xintercept = 0, linetype = "dashed",color="#CCCCCC") +
+    geom_hline(yintercept = 0, linetype = "dashed",color="#CCCCCC") +
+    theme(legend.position = "none",  strip.background = element_blank(),
+    strip.text.x = element_blank()) +
+    xlab("Asynch-seq correlation") +
+    ylab("Effect of RNAi (log2 Scale)")
+  plot(gp)
+  ggsave(paste0("../figures/sup_figure_6/correlation_log2_fold_change_n2_",rng[1],"_all_genes.pdf"), width = 10, height = 7.5)
+})
+```
+```{r, fig.width=4, fig.height=5}
+
+ res = as.data.frame(do.call(rbind, lapply(unique(ggdf$RNAi),function(X){
+  tmp = ggdf[as.character(X)]
+  tmp$FoldChange = 2^(tmp$log2FoldChange)
+  tmp = tmp[tmp$FoldChange<100,]#RNAi cross-reactivity (eg vha-3 and vha-11) lead to spurious super high fold changes
+  res = glm(FoldChange~Correlation,tmp,family=gaussian(link="log"))
+  if (summary(res)[["coefficients"]][2,1] > 10)
+    browser()
+  data.frame(RNAi=X,community=unique(tmp$Community1Plot)[1],b=summary(res)[["coefficients"]][2,1],pval_bonferroni=summary(res)[["coefficients"]][2,4]*nrow(ggdf),correlation = cor(tmp$Correlation,tmp$log2FoldChange, method = "s"))
+})))
+ 
+ 
+res$pval_bonferroni[res$pval_bonferroni == 0] = 10^-300
+res$sig = res$pval_bonferroni < .05
+table(res[,c("sig")])
+res$short_community = '';
+not_in_com = grepl("Not",res$community)
+res$short_community[not_in_com] = "NG";
+res$short_community[!not_in_com] = paste0("G",substring(res$community[!not_in_com],11))
+
+com_colors = community_colors;
+names(com_colors) =gsub("y", "y ", names(community_colors))
+com_colors = c(com_colors,"#000000");
+names(com_colors)[length(com_colors)]="Not in Community";
+
+ggplot() +
+ geom_point(aes(correlation,-log10(pval_bonferroni),color=community),res)+
+  geom_hline(yintercept=-log10(0.01),linetype = "dashed",color="#CCCCCC")+
+  geom_vline(xintercept=0,linetype = "dashed",color="#CCCCCC")+
+  scale_color_manual(name = NULL, values = com_colors)+
+  ggrepel::geom_text_repel(aes(correlation,-log10(pval_bonferroni),color=community,label = paste0(RNAi,"(",short_community,")")), res,cex=3,fontface = "italic") + 
+  theme(legend.position = "none") +
+  ylab("p-value (-log10)")+
+  xlab("Fold Change after knockdown / Asynch_seq Correlation")
+ggsave("../figures/sup_figure_6/correlation_log2_fold_change_n2_volcano_all_genes.pdf", width = 4, height = 5)
+
+```
+```{r}
+dat = dcast(sig_rho_ts_da_df,GeneName2+RNAi~GeneName1,value.var=c("Correlation"),drop=F) 
+
+lm(value ~ . , data = dat[,c(""))
+```
+
+```{r, fig.width=15, fig.height=15}
+corcor_df <- sig_rho_ts_da_df[, .(CorCorLFC = cor(Correlation^2, abs(log2FoldChange))), by = .(Community1Plot, RNAi)]
+
+ggplot(sig_rho_ts_da_df, aes(Correlation^2, abs(log2FoldChange))) +
+  geom_smooth(color = "purple", formula = y ~ x, se = FALSE, method = "lm", size = .5) +
+  geom_point(aes(color = Community2Plot), size = 1, alpha = .7) +
+  ggpp::geom_text_npc(aes(npcx = "left", npcy = "bottom",
+                          label = paste0(round(100 * CorCorLFC, 1), "%")), 
+                      corcor_df) +
+  facet_wrap(Community1Plot ~ RNAi, scales = "free") +
+  geom_abline() +
+  scale_color_manual(name = NULL, values = setNames(community_colors, gsub("y", "y ", names(community_colors)))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  xlab("Squared Correlation in Single Worm Data") +
+  ylab("Effect of RNAi (Absolute log2 Scale)")
+```
+
+```{r, fig.width=15, fig.height=15}
+corcor_df <- rho_ts_da_df[, .(CorCorSig = cor(Correlation^2, -log10(padj))), by = .(Community1Plot, RNAi)]
+
+ggplot(sig_rho_ts_da_df, aes(Correlation^2, -log10(padj))) +
+  geom_point(aes(color = Community2Plot), size = 1, alpha = .7) +
+  ggpp::geom_text_npc(aes(npcx = "right", npcy = "top",
+                          label = paste0(round(100 * CorCorSig, 1), "%")), 
+                      corcor_df) +
+  facet_wrap(Community1Plot ~ RNAi, scales = "free") +
+  scale_color_manual(name = NULL, values = setNames(community_colors, gsub("y", "y ", names(community_colors)))) +
+  theme(legend.position = "top") +
+  xlab("Squared Correlation in Single Worm Data") +
+  ylab("Effect of RNAi (Significance)")
+```
+
+## Correlation of RNAi with other genes; differentially expressed or not
+
+```{r, fig.width=15, fig.height=15}
+ggplot(rho_ts_da_df, aes(Correlation^2, color = padj < 1e-3)) +
+  facet_wrap(Community1Plot ~ RNAi, scales = "free_x") +
+  stat_ecdf() +
+  theme(legend.position = "top") +
+  xlab("Effect of RNAi (p-value)") +
+  ylab("ECDF")
+```
+
+```{r}
+ecdf_df <- rbindlist(pblapply(seq_len(nrow(conditions_df)), function(i) {
+  cond_df <- conditions_df[i]
+  
+  da <- ts_da_df[RNAi == cond_df$RNAiSymbol & Genotype == cond_df$Genotype]
+  da_genes <- da[padj < 1e-2]$GeneName
+  
+  rho_df[, Significant := GeneName1 %in% da_genes & GeneName2 %in% da_genes]
+  rho_df[, Significant := ifelse(Significant, "True", "False")]
+  rho_df[, Significant := factor(Significant, c("True", "False"))]
+  
+  ggdf <- rbind(
+    rho_df[Significant == "True"],
+    rho_df[Significant == "False"][sample(.N, size = 10000)]
+  )
+  ggdf <- cbind(ggdf[, .(Correlation, Significant)], cond_df)
+  ggdf
+  
+}))
+```
+
+```{r, fig.width=16,fig.height=8}
+ecdf_df[, Wrap := paste0(RNAiSymbol, " (", CommunityPlot, ")")]
+ecdf_df[, Wrap := factor(Wrap, ecdf_df[! duplicated(Wrap)][order(Community, RNAiSymbol)]$Wrap)]
+
+ggplot(ecdf_df[Genotype == "N2" & (Community != "Not in Community" | RNAiSymbol %in% sel_not_in_comm)], 
+       aes(Correlation^2, color = Significant)) +
+  stat_ecdf() +
+  facet_wrap( ~ Wrap) +
+  scale_color_manual(name = "Differentially Expressed (RNAi)",
+                     values = setNames(genotype_colors, NULL)) +
+  xlab("Squared Gene-Gene Correlation") +
+  ylab("ECDF") +
+  xlim(c(0, 1)) +
+  theme(legend.position = "top")
+ggsave("../figures/sup_figure_6/ecdf_diff_ana_n2.pdf", width = 16, height = 8)
+```
+```{r}
+#set up data tables for clustering and ICA
+
+  geneid$GeneSymbol_mangled= str_replace(geneid$GeneSymbol,"-",".")
+	RNAi_GeneNames = geneid$GeneName[geneid$GeneSymbol %in% unique(ts_da_df$RNAi)]
+
+  tmp = ts_da_df[Genotype=="N2",c("RNAi","GeneSymbol","GeneName","log2FoldChange")]
+  fc = dcast(tmp,GeneName+GeneSymbol~RNAi,value.var="log2FoldChange")
+  tmp = ts_da_df[Genotype=="N2",c("RNAi","GeneSymbol","GeneName","padj")]
+  pv = dcast(tmp,GeneName+GeneSymbol~RNAi,value.var="padj")
+  rownames(fc) = fc$GeneName
+  rownames(pv) = pv$GeneName
+  pv = pv[,!(colnames(pv) %in% c("GeneName","GeneSymbol"))]
+  fc = fc[,!(colnames(fc) %in% c("GeneName","GeneSymbol"))]
+  
+  #get rid of NAs
+	pv_ts = apply(pv,2,FUN = function(x){x[is.na(x)] = 1; return(x)})
+	fc_ts = apply(fc,2,FUN = function(x){x[is.na(x)] = 0; return(x)})
+	
+	#get rid of NAs
+	pv_ts = apply(pv_ts,2,FUN = function(x){x[is.na(x)] = 1; return(x)})
+	fc_ts = apply(fc_ts,2,FUN = function(x){x[is.na(x)] = 0; return(x)})
+	
+	sig_in_any_sample = apply(pv_ts,1,FUN=function(x)return( any(x<.001) ) );
+	fc_sig_ts = fc_ts[sig_in_any_sample,]
+	pv_sig_ts = pv_ts[sig_in_any_sample,]
+	
+	to_keep = which(!(rownames(pv_sig_ts) %in% RNAi_GeneNames))
+	fc_sig_ts = fc_sig_ts[to_keep,]
+	pv_sig_ts = pv_sig_ts[to_keep,]
+	
+	cm  = melt(net_data$tissue_communities_vector)
+	cm$GeneName = rownames(	cm)
+  community_memberships = data.frame(GeneName = RNAi_GeneNames)
+  community_memberships = merge(community_memberships,cm,by="GeneName",all.x=T,all.y=F)
+  community_memberships$value[is.na(community_memberships$value)]="Community0";
+	
+	community_memberships =  merge(community_memberships,geneid,by="GeneName")
+	tissue_dat = unique(ts_da_df[,c("GeneName","Tissue")]);
+	community_memberships =  merge(community_memberships,tissue_dat,by="GeneName")
+	names(community_memberships) = c("GeneName","Community","GeneSymbol","GeneSymbol_mangled","Tissue")
+	community_memberships$com = as.integer(substring(community_memberships$Community,10,10))
+	
+	
+	rownames(community_memberships) = community_memberships$GeneSymbol;
+	
+```
+
+
+```{r}
+n_ica = 6
+#run ICA
+RNAis_to_exclude = c();
+#RNAis_to_exclude = c("rheb-1","idh-1","rps-22","fox-1","F41C3.5")
+fc_sig_ts = fc_sig_ts[,!(colnames(ts_da_df) %in% RNAis_to_exclude)]
+#fc_sig = fc_sig[,!(colnames(fc_sig) %in% RNAis_to_exclude)]
+
+res_ts = runICA(X=fc_sig_ts,nbComp=n_ica, method = "JADE", maxit=100000)
+saveRDS(res_ts,"wt_ICA.rds")
+
+#res = runICA(X=fc_sig,nbComp=ncomp, method = "JADE", maxit=100000)
+ic_colors=  brewer.pal(12,"Paired")[seq(2,12,by=2)]
+
+#res_ts$A = res_ts$A[,c(1,3,2,6,4,5)]
+#res_ts$A = res_ts$A[,c(4,5,6,3,2,1)]
+#res_ts$S = res_ts$S[,c(4,5,6,3,2,1)]
+```
+
+```{r}
+#set up everything for RNAi response clustering
+#cluster RNA's based on raw correlation and make nice dendogram heatmap
+	
+	recalc_corr=F
+	if (recalc_corr){
+		corr_m = matrix(NA,nrow=dim(fc_sig_ts)[2],ncol=dim(fc_sig_ts)[2])
+		rownames(corr_m) = colnames(corr_m) = colnames(fc_sig_ts)
+		for (i in 1:dim(fc_sig_ts)[2]){
+			for (j in 1:dim(fc_sig_ts)[2]){
+				corr_m[i,j] = cor(fc_sig_ts[,i],fc_sig_ts[,j], method = "s")
+			}
+		}
+	}
+	#colfunc <- colorRampPalette(c("blue", "white","red"))
+	#rampbreaks <- seq(-1, 1, length.out = 512+1)
+	if (1)
+	#col=c("green","purple","blue","orange","red","brown","light green","black")
+	#col=c("green","purple","blue","orange","red","brown","light green","black")
+	ngroups = 4;
+	heatmap_group_colors = c("black",brewer.pal(ngroups-1,"Dark2"))
+	clustered_dat =hclust(as.dist(1-corr_m), method = "complete")
+	RNAi_dendogram = as.dendrogram(clustered_dat)
+	
+	RNAi_dendogram_groups = cutree(clustered_dat,k=ngroups)
+	RNAi_dendogram = color_branches(RNAi_dendogram, clusters=RNAi_dendogram_groups[order.dendrogram(RNAi_dendogram)],col=heatmap_group_colors[1:ngroups],groupLabels=T)
+	
+	
+	RNA_dend_group_community_match = data.frame(GeneSymbol = names(RNAi_dendogram_groups),
+					group= RNAi_dendogram_groups,
+					community = community_memberships[names(RNAi_dendogram_groups),"com"]
+					)
+					
+	RNA_dend_group_community_match = merge(RNA_dend_group_community_match,geneid[,c("GeneSymbol","GeneName")],
+						by.x="GeneSymbol",by.y="GeneSymbol",suffixes=c("",""),all.x=T)
+						
+	
+	RNA_dend_group_community_match$community[is.na(RNA_dend_group_community_match$community)] = 0			
+	RNA_dend_group_community_match$in_community = 	0+ RNA_dend_group_community_match$community > 0	
+	RNA_dend_group_community_match$com_name = as.character(RNA_dend_group_community_match$community)
+	
+	#we set RNAis in no community to 0; we set RNAis that aren't even tissue specific (they *can't* be in communities!) to -1
+	RNA_dend_group_community_match$com_name[RNA_dend_group_community_match$community == 0] = ""
+	
+	RNA_dend_group_community_match$tissue_specific = RNA_dend_group_community_match$GeneName %in% tissue_dat$GeneName
+	RNA_dend_group_community_match = merge(RNA_dend_group_community_match,tissue_dat[,c("GeneName","Tissue")],by="GeneName",suffixes=c("",""),all.x=T)
+	RNA_dend_group_community_match$Tissue[is.na(RNA_dend_group_community_match$Tissue)] = ""
+	
+	RNA_dend_group_community_match$community[RNA_dend_group_community_match$tissue_specific == F] = -1
+	
+	RNA_dend_group_community_match$tissue_name = toupper(substring(RNA_dend_group_community_match$Tissue,0,1))
+	
+	#RNA_dend_group_community_match$com_name = paste(RNA_dend_group_community_match$com_name,toupper(substring(RNA_dend_group_community_match$Tissue,0,1)))
+	
+	community_colors = c("#000000","#555555",colorspace::rainbow_hcl(max(RNA_dend_group_community_match$community)))
+	RNA_dend_group_community_match$color =  community_colors[RNA_dend_group_community_match$community+2]
+	
+	
+	tissue_colors_from_oli <- c("germ_line" = "black",
+	                   "hypodermis" = "#5ac134",
+	                   "intestine" = "#79bbe9",
+	                   "muscle" = "#f68528",
+                   "neurons" = "#E92128")
+		
+	tissue_colors = data.frame(tissue_name=c("","N","H","M","I","G"),tissue_color=c("black","#E92128","#5ac134","#f68528","#79bbe9","gray"))
+	
+	RNA_dend_group_community_match = merge(RNA_dend_group_community_match,tissue_colors,by="tissue_name",suffixes=c("",""),all.x=T)
+	rownames(RNA_dend_group_community_match) = RNA_dend_group_community_match$GeneSymbol
+	
+	match_counts = table(RNA_dend_group_community_match[,c("community","group")])
+	match_counts2 = table(RNA_dend_group_community_match[,c("in_community","group")])
+
+	
+	
+	#the dendogram and hclust assign different group IDs, so we need to match them up
+	#cutree labels groups based on the alphabetical order of the RNAi label
+	#the dendogram labels groups according to the leaf order in the tree of RNAi labels, incremental from top to bottom
+	dend_grp_matchup = unique(RNAi_dendogram_groups[rownames(corr_m)[order.dendrogram(RNAi_dendogram)]])
+	heatmap_group_id_lookup =  match(1:ngroups,dend_grp_matchup)	#given a hclust group X, its ID in the dendogram will be dend_grp_lookup[X];
+
+	
+	RNAi_group_colors =  heatmap_group_colors[heatmap_group_id_lookup[1:ngroups]]
+```
+```{r,fig.width=3,fig.height=5}
+	#look at correspondences between rnai response groups and complex heatmaps
+	
+  match_counts3 = match_counts/apply(match_counts,1,FUN=sum)
+  print(match_counts3)
+  match_counts4 = as.data.frame(melt(match_counts,id.vars=c(as.character(1:4))))
+  match_counts4$community = as.factor(match_counts4$community)
+  levels(match_counts4$community) = c("NG MT","NT TS",paste0("G",as.character(1:7)))
+ gp =  ggplot(match_counts4,aes(x= community, y = group, fill = value)) +
+  geom_tile() +
+    
+    geom_text(aes(label=value),col="white") +
+    geom_text(aes(label=value),col="white") +
+   xlab("RNAi Knockdown Group")+
+   ylab("Co-Expression Group")+ 
+   theme(legend.position = "none") 
+ plot(gp)
+  ggsave(paste0("../figures/main_figure_5/RNAi_community_overlap.pdf"), width = 3, height = 5)
+	
+```
+
+
+```{r,fig.width=9,fig.height=7.5}
+#plot heatmap
+	
+	col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+	cm = ColorMapping(col_fun = col_fun)
+	
+clr = rep("black",length(rownames(corr_m)));
+	clr[7] = "red"
+	ra = rowAnnotation(foo = anno_text(RNA_dend_group_community_match[rownames(corr_m),"com_name"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 6, fill = RNA_dend_group_community_match[rownames(corr_m),"color"],
+		 col = "white"),width = max_text_width("1")*2),
+		 bar = anno_text(RNA_dend_group_community_match[rownames(corr_m),"tissue_name"], 
+			location = 0.5, just = "center",
+			 gp = gpar(fontsize = 6, col = RNA_dend_group_community_match[rownames(corr_m),"tissue_color"],
+		 fill = "#555555"),width = max_text_width("1"))
+	)
+		 
+	ca = columnAnnotation(foo = anno_text(RNA_dend_group_community_match[rownames(corr_m),"com_name"], 
+						location = 0.5, just = "center",
+						 gp = gpar(fontsize = 6, fill = RNA_dend_group_community_match[rownames(corr_m),"color"],
+						 col = "white"),height = max_text_height("1")*2,rot = 90),
+					 bar = anno_text(RNA_dend_group_community_match[rownames(corr_m),"tissue_name"], 
+						location = 0.5, just = "center",
+						 gp = gpar(fontsize = 6, col = RNA_dend_group_community_match[rownames(corr_m),"tissue_color"],
+						 fill = "#555555"),
+						 height =max_text_height("1"),rot = 90)
+						)
+		
+		
+		 
+		
+
+	gp = Heatmap(corr_m,cluster_rows=RNAi_dendogram,cluster_columns=RNAi_dendogram,col = cm,
+		row_names_gp = gpar(col =  heatmap_group_colors[heatmap_group_id_lookup[RNAi_dendogram_groups[rownames(corr_m)]]],cex=.65),
+		#row_names_gp = gpar(),row_dend_reorder = FALSE,
+		heatmap_legend_param = list(title="Spearman\nCorrelation"),
+		bottom_annotation =ca,
+		right_annotation =ra,
+		column_names_gp = gpar(col = RNAi_group_colors[RNAi_dendogram_groups[rownames(corr_m)]],cex=.65),
+		row_split = ngroups, column_split = ngroups,row_title = "Knockdown\nGroup %s",column_title = "Knockdown\nGroup %s",
+		row_gap = unit(0, "mm"),column_gap = unit(0, "mm"),border = TRUE,use_raster = TRUE,row_names_centered =T, column_names_centered =T) 
+	
+  plot(gp)
+	pdf("../figures/main_figure_5/RNAi_similarty_heatmap2.pdf",width = 9, height = 7.5)
+	plot(gp)
+  dev.off()
+
+
+```
+
+```{r,fig.width=3.5,fig.height=6.5}
+#plot ica heatmap (makes the ICA heatmap panel for the figure)
+if (1){
+	#col=c("green","purple","blue","orange","red","brown","light green","black")
+	#col=c("green","purple","blue","orange","red","brown","light green","black")
+	clustered_dat =hclust(dist(res_ts$A), method = "complete")
+	row_dend = as.dendrogram(clustered_dat)
+
+	#the dendogram and hclust assign different group IDs, so we need to match them up
+	#cutree labels groups based on the alphabetical order of the RNAi label
+	#the dendogram labels groups according to the leaf order in the tree of RNAi labels, incremental from top to bottom
+	#dend_grp_matchup = unique(grps[rownames(res_ts$A)[order.dendrogram(row_dend)]])
+	#dend_grp_lookup =  match(1:,dend_grp_matchup)	#given a hclust group X, its ID in the dendogram will be dend_grp_lookup[X];
+
+	col_fun = colorRamp2(c(min(res_ts$A),0, max(res_ts$A)), c("purple","white", "green"))
+	cm = ColorMapping(col_fun = col_fun)
+	
+	if (0) ra = rowAnnotation(foo = anno_text(RNA_dend_group_community_match[rownames(res_ts$A),"com_name"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 6, fill = RNA_dend_group_community_match[rownames(res_ts$A),"color"],
+		 col = "white"),width = max_text_width("1")*1.2))
+		 
+		 
+		 ra = rowAnnotation(foo = anno_text(RNA_dend_group_community_match[rownames(res_ts$A),"com_name"], 
+		 		location = 0.5, just = "center",
+		 		 gp = gpar(fontsize = 6, fill = RNA_dend_group_community_match[rownames(res_ts$A),"color"],
+		 		 col = "white"),width = max_text_width("1")*1.1),
+		 		 bar = anno_text(RNA_dend_group_community_match[rownames(res_ts$A),"tissue_name"], 
+		 			location = 0.5, just = "center",
+		 			 gp = gpar(fontsize = 6, col = RNA_dend_group_community_match[rownames(res_ts$A),"tissue_color"],
+		 		 		fill = "#555555"),width = max_text_width("1")*1.1)
+		 	)
+		 
+
+	colnames(res_ts$A) = paste(as.character(seq(1:n_ica)))
+	
+	gp = Heatmap(res_ts$A,cluster_rows=row_dend,cluster_columns = FALSE,col=cm,column_names_rot=0,
+		row_names_gp = gpar(col =  RNAi_group_colors[RNAi_dendogram_groups[rownames(res_ts$A)]],cex=.65),
+		column_names_gp = gpar(col =  ic_colors),
+		right_annotation =ra,
+		heatmap_legend_param = list(title="IC Contribution"),
+		use_raster = TRUE,row_names_centered =T, column_names_centered =T)
+	plot(gp)
+	pdf("../figures/main_figure_5/IC_heatmap3.pdf",width = 3.5, height = 6.5)
+	plot(gp)
+  dev.off()
+
+}
+```
+```{r}
+
+#write ICA gene loadings to disk
+	#geneids = RNAi_fold_change_results$geneid
+	rownames(geneid) = geneid$GeneName
+
+	
+	feature_cutoff_ts = apply(abs(res_ts$S),2,FUN=function(x)quantile(x,.9))
+	genes_contributing_to_ICA_ts= NULL
+	for (i in 1:(dim(res_ts$S)[2])){
+	  dat = data.frame(GeneName=rownames(res_ts$S),ICA.loading=res_ts$S[,i])
+	  dat$change = "";
+	  dat$change[dat$ICA.loading < -feature_cutoff_ts[i]] = "-";
+	  dat$change[dat$ICA.loading > feature_cutoff_ts[i]] = "+";
+		dat = dat[order(abs(dat$ICA.loading),decreasing=F),]
+		dat$GeneSymbol = unlist(geneid[dat$GeneName,"GeneSymbol"])
+		dat$ICA = i;
+		genes_contributing_to_ICA_ts = rbind(dat,genes_contributing_to_ICA_ts)
+	}
+	#reverse
+	genes_contributing_to_ICA_ts = genes_contributing_to_ICA_ts[dim(genes_contributing_to_ICA_ts)[1]:1,]
+	write.csv(genes_contributing_to_ICA_ts,"..\\data\\ica\\IC_membership_ts.csv",row.names=F)
+
+```
+
+```{r}
+library(data.table)
+
+#run bootstrapping
+
+#fancy bootstrapping ecdfs
+#ica is run only on transcripts that showed a significant change in any condition
+#but our null model needs to include all genes measured in the RNAi experiment, so we need to be careful when we select these sets.
+correlationDistributionByICA <- function(ica, genes_in_RNAi_experiment,rho,nboot = 0, feature_cutoff_quantile = .90, quantiles = seq(0,1,.005)) {
+
+  # match genes between ICA and Correlation matrix
+  RNAi_single_worm_intersect_genes <- intersect(rownames(rho), genes_in_RNAi_experiment)
+  rho <- rho[RNAi_single_worm_intersect_genes, RNAi_single_worm_intersect_genes]
+  diag(rho) <- NA
+
+  significant_RNAi_single_worm_intersect_genes = intersect(rownames(ica$S),genes_in_RNAi_experiment)
+#  rho_sig <- rho[RNAi_single_worm_intersect_genes, RNAi_single_worm_intersect_genes]
+ # browser()
+  ica$S <- ica$S[significant_RNAi_single_worm_intersect_genes, ]
+
+  # remove diagonal
+ # rho_nodiag <- rho
+ # diag(rho_nodiag) <- NA
+
+  # cutoff
+  feature_cutoff <- apply(ica$S, 2, function(x) quantile(abs(x), feature_cutoff_quantile))
+
+  # iterate through ICAs or bootstrap iterations
+  if (nboot == 0) {
+    #get the ecdf for each ICA
+    iter <- seq_len(ncol(ica$S))
+  } else {
+    #run a bunch of iterations to estimate ecdf of the null model
+    iter <- seq_len(nboot)
+  }
+  ks_results = list()
+
+  val = rbindlist(lapply(iter, function(i) {
+
+    if (nboot == 0) {
+      #we are not bootstrapping, so get the names of genes in the ICA i
+	in_ica <- names(ica$S[abs(ica$S[, i]) > feature_cutoff[i], i])
+	in_ica = in_ica[in_ica %in% rownames(rho)]
+	not_in_ica <- rownames(rho)[! (rownames(rho) %in% in_ica)]
+	#browser()
+	vals_in_group <- na.omit(as.numeric(rho[in_ica, in_ica]))
+	vals_out_group <- na.omit(as.numeric(rho[not_in_ica, not_in_ica]))
+
+	df <- data.table(Index = i,
+
+		     Value = c(vals_in_group, 
+			       vals_out_group),
+
+		     Group = c(rep_len("Both genes in IC", length(vals_in_group)),
+		       rep_len("Unrelated to IC", length(vals_out_group))))
+
+	ks_results[[i]] <<- ks.test(vals_in_group,vals_out_group,alternative="less",exact=T)
+    } else {
+      #we are bootstrapping, so get a set of genes from the null model for this bootstrap iteration
+      #get the size of the set to use
+      ngenes <- length(names(ica$S[abs(ica$S[, 1]) > feature_cutoff[1], 1]))
+      in_ica <- sample(rownames(rho), size = ngenes)
+      vals_in_group <- na.omit(as.numeric(rho[in_ica, in_ica]))
+      df <- data.table(Index = i,
+
+			     Value = c(vals_in_group),
+
+			     Group = c(rep_len("Both genes in bootstrap",length(vals_in_group))))
+
+	ks_res = NA;
+
+    }
+
+    df <- df[, .(Quantile = quantiles, 
+		 AbsoluteValue = quantile(abs(Value), quantiles, na.rm = TRUE)),
+	     by = .(Group, Index)]
+  }))
+  return(list(df = val,ks_results=ks_results))
+}
+ecdf_df_list <- correlationDistributionByICA(res_ts, rownames(fc_ts),net_data$tissue_rho_list$n2, nboot = 0)
+
+random_ecdf_df_list <- correlationDistributionByICA(res_ts,rownames(fc_ts), net_data$tissue_rho_list$n2, nboot = 100)[["df"]] %>% 
+  .[, .(Q05 = as.numeric(quantile(AbsoluteValue, 0.05)),
+	Q50 = as.numeric(quantile(AbsoluteValue, 0.50)), 
+	Q95 = as.numeric(quantile(AbsoluteValue, 0.95))), 
+    by = .(Group, Quantile)]
+
+ncomps = dim(res_ts$S)[2]
+```
+```{r}
+rand_d = random_ecdf_df_list[Quantile==.5,]
+  all_df = rbind(ecdf_df_list[["df"]][Index == 1],
+              ecdf_df_list[["df"]][Index == 2],
+              ecdf_df_list[["df"]][Index == 3],
+              ecdf_df_list[["df"]][Index == 4],
+              ecdf_df_list[["df"]][Index == 5],
+              ecdf_df_list[["df"]][Index == 6],fill=T)
+	  ggplot(all_df[Quantile==.5,],aes(Index, AbsoluteValue,color=Group)) +
+	           geom_point()
+	  
+```
+
+
+```{r,fig.width=7,fig.height=7}
+plot_separately = T
+	if(plot_separately){
+	 
+		gp_list <- lapply(seq_len(ncomps), function(i) {
+			ggplot(random_ecdf_df_list, aes(Q50, Quantile)) +
+			  geom_ribbon(aes(xmin = Q05, xmax = Q95), alpha = .3,color="dark gray") +
+			  geom_line(aes(x = AbsoluteValue, color = Group), ecdf_df_list[["df"]][Index == i],size=1) +
+			  scale_color_manual(values=c(ic_colors[i],"#000000")) +
+			#  ggtitle(paste("ICA", i,"D=",round(ecdf_df_list[["ks_results"]][[i]]$statistic,3),"p=",signif(ecdf_df_list[["ks_results"]][[i]]$p.value,3))) +
+			   theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+	panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+		    ggtitle(paste("IC",i))+
+			  ylab("cdf") +
+			  xlab("Asynch-Seq Correlation")
+			}
+		)
+		gp <- ggpubr::ggarrange(plotlist = gp_list, common.legend = TRUE,ncol =3,nrow=3)
+		gp <- ggpubr::annotate_figure(gp, top = paste("Number of Components:", ncomps))
+		plot(gp)
+  ggsave(paste0("../figures/main_figure_5/IC_enrichment.pdf"),plot=gp,width=4,height=7)
+		
+	}else{
+	
+		dat = ecdf_df_list[["df"]][ecdf_df_list[["df"]]$Group ==  "Both genes in IC",]
+		gp = ggplot()+
+			geom_line(data=random_ecdf_df_list, aes(x=Q50, y=Quantile)) +
+			  geom_ribbon(data=random_ecdf_df_list,aes(xmin = Q05, xmax = Q95,y=Quantile), alpha = .3,color="dark gray")+
+			
+			  geom_line(data=dat,aes(x = AbsoluteValue, y=Quantile,color = factor(Index))) +
+			  
+			  scale_color_manual(values=ic_colors) +
+			 
+			   theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+		panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+			  ylab("ECDF") +
+			  xlab("Absolute Single Worm Correlation")
+			  
+		plot(gp)
+  ggsave(paste0("../figures/main_figure_5/IC_enrichment.pdf"),plot=gp,width=4,height=7)
+	}
+```
+
+
+```{r}
+
+#plot ecdfs comparing the single-worm correlation values from top hits in each ICA (used to make panels in figures)
+if (0){
+	feature_cutoff = apply(res_ts$S,2,genes_to_use = names(single_worm_data$tissues),
+			FUN=function(x,genes_to_use){quantile(abs(x[names(x)%in%genes_to_use]),.8)})
+	quantlies = seq(0,1,.05)
+	layout(matrix(1:ncomp,nrow=2,byrow=T))
+	
+	
+	ind = sample(nrow(rho_ts_tri)*ncol(rho_ts_tri))
+			 
+	shuffled_res = matrix(c(rho_ts_tri)[ind],nrow=nrow(rho_ts_tri),ncol=ncol(rho_ts_tri))
+	rownames(shuffled_res) = colnames(shuffled_res) = rownames(rho_ts_tri)
+			 
+	par(mar=c(4,4,0,0))
+	for (i in 1:ncomp){
+			group_mem = names(res_ts$S[abs(res_ts$S[,i])>feature_cutoff[i],i]);
+			tissue_specific_group_mem = group_mem[group_mem %in% names(single_worm_data$tissues)]
+			not_group_mem = rownames(rho_ts_tri)[!(rownames(rho_ts_tri) %in% group_mem)]
+			vals_in_group = rho_ts_tri[tissue_specific_group_mem,tissue_specific_group_mem]
+			vals_into_group = rho_ts_tri[tissue_specific_group_mem,not_group_mem]
+			vals_out_group = rho_ts_tri[not_group_mem,not_group_mem]
+			vals_in_group = vals_in_group[!is.na(vals_in_group)]
+			vals_into_group = vals_into_group[!is.na(vals_into_group)]
+			vals_out_group = vals_out_group[!is.na(vals_out_group)]
+			
+			
+			vals_in_group_shuffled = shuffled_res[tissue_specific_group_mem,tissue_specific_group_mem]
+			
+			
+			q_out = quantile(abs(vals_out_group),quantiles,na.rm=T)
+			q_in = quantile(abs(vals_in_group),quantiles,na.rm=T)
+			q_into = quantile(abs(vals_into_group),quantiles,na.rm=T)
+			
+			q_in_shuffled = quantile(abs(vals_in_group_shuffled),quantiles,na.rm=T)
+			
+			plot(q_out,quantiles,xlim=range(q_out,q_in,q_into),col="black",type="l",lwd=1,bty="n",ylab="cdf",xlab="Correlation among Individual Worms")
+			lines(q_in,quantiles,col=ic_colors[i],lwd=1)
+			lines(q_into,quantiles,col=ic_colors[i],lwd=1,lty=2)
+			lines(q_in_shuffled,quantiles,col="grey",lwd=1,lty=1)
+			legend("bottomright",bty="n",title=paste0("IC ",i),legend=c(paste0("Unrelated to IC (N=",length(vals_out_group),")"),
+										     paste0("One gene in IC(N=",length(vals_into_group),")"),
+										     paste0("Both genes in IC (N=",length(vals_in_group),")")),
+										     col=c("black",rep(ic_colors[i],2)),lty=c(1,1,2))
+	}
+}
+```
+

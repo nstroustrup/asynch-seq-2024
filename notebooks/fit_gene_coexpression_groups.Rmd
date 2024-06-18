@@ -1,0 +1,823 @@
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(BASiCS)
+library(dendextend)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+require(scales)
+library(RColorBrewer)
+library(gridExtra)
+library(circlize)
+theme_set(theme_cowplot())
+
+dir.create("../figures/main_figure_3/", showWarnings = FALSE)
+dir.create("../figures/main_figure_4/", showWarnings = FALSE)
+dir.create("../figures/main_figure_7/", showWarnings = FALSE)
+
+dir.create("../figures/sup_figure_3/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_4/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_7/", showWarnings = FALSE)
+
+source("../scripts/notebooks_helpers/gene_variability.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/basics.R")
+source("../scripts/helpers/clustering.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/notebooks_helpers/gene_network.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-4 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+cluster_colors <- c("firebrick", "sienna1", "cornflowerblue", "darkorchid", "black")
+```
+
+## Load data
+
+### Gene names
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+### Set up model comparison structures to guide analysis
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+
+model_names = c("n2_series","d8_glp1","d1_glp1","d1_UV","d8_UV","d_UV","d1_20v25C","d8_20v25C","n2_sw","daf2_sw","d1_sw","d8_sw","d_25C")
+#make a list of which samples match up to each subgroup (biological covariate group)
+```
+#load counts
+```{r}
+  sw <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+  annotations = sw$annots;
+  samples_list = lapply(model_names,function(group){
+    print(group)
+    cur_annots = sw$annots[eval(parse(text=models$Subset[models$Name == group])),]
+    subgroup_vals = as.character(as.data.frame(cur_annots)[,models$BiologicalCovariates[models$Name == group]])
+   # browser()
+    subgroups = unique(subgroup_vals)
+    res = lapply(subgroups,function(subgroup){
+        cur_annots$Sample[subgroup_vals == subgroup]
+    }) 
+    names(res) = subgroups
+    res
+  })
+  names(samples_list) = model_names;
+if (0){#load raw counts
+  # counts_list <- sapply(samples_list, function(samples) sw$counts[, samples])
+  counts_list <- lapply(names(samples_list),function(x){
+      res = lapply(names(samples_list[[x]]),function(y){
+          sw$counts[, colnames(sw$counts)%in% samples_list[[x]][[y]]]
+      })
+      names(res) = names(samples_list[[x]])
+      res;
+  })
+  names(counts_list) = names(samples_list)
+  rm(sw)
+}else{#load batch-corrected counts
+  rm(sw)
+  bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds") 
+  counts_list <- lapply(model_names,function(x){
+      res = lapply(names(samples_list[[x]]),function(y){
+ 
+         bc$batch_counts_list[[x]][, colnames(bc$batch_counts_list[[x]])%in% samples_list[[x]][[y]]]
+    })
+    names(res) = names(samples_list[[x]])
+    res;
+  })
+  names(counts_list) = model_names
+  rm(bc)
+}
+
+nf <- lapply(model_names,function(group){
+   ret = lapply(counts_list[[group]],function(x){
+     normalizationFactor(x, groups = annotations[Sample %in% colnames(x)]$Group)
+   })
+   names(ret) = names(counts_list[[group]])
+   ret;
+})
+   
+names(nf) = model_names;
+
+norm_list <- lapply(model_names,function(group){
+    res = lapply(names(counts_list[[group]]),function(subgroup){
+    
+      normalizeCounts(counts_list[[group]][[subgroup]], nf[[group]][[subgroup]])
+    })
+    names(res) = names(counts_list[[group]])
+    res
+})
+names(norm_list) = model_names;
+
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+#normalize each tissue indepenently
+tissue_norm_list <- lapply(model_names, function(group) {
+      ret = lapply(counts_list[[group]],function(x){
+        k <- normalizationFactorTissueSpecific(x, tissues,annotations[Sample %in% colnames(x)]$Group)
+        ret = normalizeCountsTissueSpecific(x, k, tissues)
+        ret;
+      })
+      names(ret) = names(counts_list[[group]])
+      ret;
+})
+names(tissue_norm_list) = model_names;
+      
+```
+
+
+```{r}
+use_tissue_specific = F
+if (use_tissue_specific){
+  cv_to_use = tissue_norm_list
+}else{
+  cv_to_use = norm_list
+}
+```
+
+
+#add extra data to study the effect of removing nlp-28 effect from day 8 and atp-5 effect from day 1
+```{r}
+source("../scripts/helpers/gene_variability.R")
+setkey(geneid,GeneSymbol)
+
+GeneName = geneid["nlp-28",GeneName]
+da_nlp28 = fread("../data/differential_analysis/tables/net_validation/N2_nlp28_Set3_Day8.csv.gz")
+tmp = norm_list[["d8_sw"]] 
+da_model = ns_fit_da_linear_model(tmp[["QZ0"]],da_nlp28,RNAi_GeneName_to_exclude=GeneName,keep_x=F,keep_residuals=T,differential_analysis_column_name="RNAi_nlp28_vs_EV_log2FoldChange")
+cv_to_use[["d8_n2_da_nlp28"]] = list("QZ0"=tmp[["QZ0"]],"QZ0_da_nlp28"=2^da_model$residuals+da_model$log2_intercepts)
+
+GeneName = geneid["atp-5",GeneName]
+da_atp5 = fread("../data/differential_analysis/tables/net_validation/N2_atp5_Set5_Day8.csv.gz")
+tmp = norm_list[["d1_sw"]] 
+da_model = ns_fit_da_linear_model(tmp[["QZ0"]],da_atp5,RNAi_GeneName_to_exclude=GeneName,keep_x=F,keep_residuals=T,differential_analysis_column_name="RNAi_atp5_vs_EV_log2FoldChange")
+
+cv_to_use[["d1_n2_da_atp5"]] = list("QZ0"=tmp[["QZ0"]],"QZ0_da_atp5"=2^da_model$residuals+da_model$log2_intercepts)
+
+```
+
+  #filter counts to genes expressed at a minimum level in both covariate groups
+```{r}
+min_mu = 20
+# select genes with high mean
+intersect_genes <-lapply(cv_to_use, function(x) Reduce(intersect,lapply(x,rownames)))
+names(intersect_genes) = names(cv_to_use)
+
+mu_list <- lapply(names(cv_to_use), function(group) lapply(names(cv_to_use[[group]]),function(subgroup){ 
+  apply(cv_to_use[[group]][[subgroup]][intersect_genes[[group]], ], 1, mean)}))
+names(mu_list) = names(cv_to_use)
+
+select_genes <- lapply(mu_list,function(x){names(which(rowMeans(simplify2array(x)) > min_mu))})
+names(select_genes)= names(cv_to_use)
+
+filter_tissue_norm_list <- lapply(names(cv_to_use), function(group){
+    ret = lapply(names(cv_to_use[[group]]),function(subgroup)cv_to_use[[group]][[subgroup]][select_genes[[group]], ])
+    names(ret) = names(cv_to_use[[group]])
+    ret;
+    })
+names(filter_tissue_norm_list)= names(cv_to_use)
+
+```   
+     
+#calculate correlation matricies
+```{r}
+filter_tissue_rho_list <- lapply(filter_tissue_norm_list, function(x) lapply(x,function(y)cor(t(y), method = "s")))
+names(filter_tissue_rho_list)= names(filter_tissue_norm_list)
+
+filter_tissue_combined_rho_list <- lapply(filter_tissue_norm_list, function(x){ 
+                                          y = do.call("cbind",x);
+                                          cor(t(y), method = "s")})
+names(filter_tissue_combined_rho_list)= names(filter_tissue_norm_list)
+```
+
+
+```{r}
+res = filter_tissue_rho_list[["d8_n2_da_nlp28"]]
+
+
+a = hist(res[["QZ0"]])
+b = hist(res[["QZ0_da_nlp28"]])
+mycol <- rgb(0, 0, 255, max = 255, alpha = 125, names = "blue50")
+mycol2 <- rgb(255, 0, 0, max = 255, alpha = 125, names = "red50")
+plot(a,col=mycol,ylim=c(0,max(c(a$counts,b$counts))))
+plot(b,col=mycol2,add=T)
+```
+
+```{r}
+#split the series into a set of pairwise comparrisons
+filter_tissue_rho_list[["n2_series_1_6"]] = list(`1` = filter_tissue_rho_list[["n2_series"]][["1"]],`6` = filter_tissue_rho_list[["n2_series"]][["6"]])
+filter_tissue_rho_list[["n2_series_1_10"]] = list(`1` = filter_tissue_rho_list[["n2_series"]][["1"]],`10` = filter_tissue_rho_list[["n2_series"]][["10"]])
+filter_tissue_rho_list[["n2_series_1_12"]] = list(`1` = filter_tissue_rho_list[["n2_series"]][["12"]],`6` = filter_tissue_rho_list[["n2_series"]][["12"]])
+filter_tissue_rho_list[["n2_series_2_10"]] = list(`1` = filter_tissue_rho_list[["n2_series"]][["2"]],`6` = filter_tissue_rho_list[["n2_series"]][["10"]])
+filter_tissue_rho_list[["n2_series_2_12"]] = list(`1` = filter_tissue_rho_list[["n2_series"]][["2"]],`6` = filter_tissue_rho_list[["n2_series"]][["12"]])
+filter_tissue_rho_list = filter_tissue_rho_list[names(filter_tissue_rho_list) != "n2_series"]
+
+
+filter_tissue_norm_list[["n2_series_1_6"]] = list(`1` = filter_tissue_norm_list[["n2_series"]][["1"]],`6` = filter_tissue_norm_list[["n2_series"]][["6"]])
+filter_tissue_norm_list[["n2_series_1_10"]] = list(`1` = filter_tissue_norm_list[["n2_series"]][["1"]],`10` = filter_tissue_norm_list[["n2_series"]][["10"]])
+filter_tissue_norm_list[["n2_series_1_12"]] = list(`1` = filter_tissue_norm_list[["n2_series"]][["12"]],`6` = filter_tissue_norm_list[["n2_series"]][["12"]])
+filter_tissue_norm_list[["n2_series_2_10"]] = list(`1` = filter_tissue_norm_list[["n2_series"]][["2"]],`6` = filter_tissue_norm_list[["n2_series"]][["10"]])
+filter_tissue_norm_list[["n2_series_2_12"]] = list(`1` = filter_tissue_norm_list[["n2_series"]][["2"]],`6` = filter_tissue_norm_list[["n2_series"]][["12"]])
+filter_tissue_norm_list = filter_tissue_norm_list[names(filter_tissue_norm_list) != "n2_series"]
+```
+
+
+#Run community detection
+```{r,fig.height=4,fig.width=12}
+  library(igraph)
+
+coexp_ID_from_number = function(i){
+  sapply(i,function(x){ifelse(x<10,paste0("G0",x),paste0("G",x))})
+}
+
+makeGraph <- function(rho, theta, beta = 2) {
+  adj <- abs(rho)^beta
+  adj[upper.tri(adj, diag = TRUE)] <- 0
+  adj[adj < theta] <- 0
+  gr <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE, weighted = TRUE)
+}
+
+jaccard <- function(a, b) {
+    intersection = length(intersect(a, b))
+    union = length(a) + length(b) - intersection
+    return (intersection/union)
+}
+
+to_fit = names(filter_tissue_rho_list);
+community_info = lapply(to_fit,function(group){
+  subgroup_names = names(filter_tissue_rho_list[[group]])
+ 
+  if (length(subgroup_names)>2)
+    stop(paste("Model",group, "has too many subgroups:",paste(subgroup_names,collapse=" ")))
+  communities= do.call("c",lapply(subgroup_names,function(subgroup){
+    cur_counts = filter_tissue_norm_list[[group]][[subgroup]]
+
+    covar = filter_tissue_rho_list[[group]][[subgroup]]
+    
+    print(paste(group,": Fitting on",subgroup))
+    flush.console()
+    g = makeGraph(covar, theta = 0.3, beta = 2)
+    comun <- cluster_leiden (g, objective_function ="modularity",weights = E(g)$weight,n_iterations=300,resolution_parameter=1)
+    s = sizes(comun);
+    s = s[s>5]
+    if (length(s)==0) stop("All communities were too small")
+    s = s[order(s,decreasing=T)]
+    
+   lapply(names(s),function(x){
+       community_genes = comun$names[comun$membership == x] 
+      
+       sub_counts = cur_counts[community_genes,]
+       pca_res = prcomp(t(sub_counts),scale=T,center=T)
+       pca_info = list(scale=pca_res$scale,center=pca_res$center,rotation=pca_res$rotation,frac_var = pca_res$sdev^2/sum(pca_res$sdev^2));
+       list(all_genes = community_genes, projection_info = pca_info,fit_subgroup = subgroup,group=group)
+    })
+  }))
+  names(communities) = coexp_ID_from_number(1:length(communities))
+  for (i in 1:length(communities)){
+    communities[[i]]$within_group_community_id = i;
+  }
+  communities
+})
+names(community_info) = to_fit
+
+```
+
+```{r}
+#build data structure with lots of data on communities that we'll then use to merge strongly overlapping communities
+all_communities = do.call("c",community_info)
+community_pca_correlation = matrix(NA,nrow=length(all_communities),ncol=length(all_communities))
+community_jaccard_index = matrix(NA,nrow=length(all_communities),ncol=length(all_communities));
+
+for (community_1 in 1:length(all_communities)){
+  for (community_2 in community_1:length(all_communities)){
+   # if (community_1 == community_2) next;
+    coms = list(all_communities[[community_1]],all_communities[[community_2]])
+    com_names = list(paste(coms[[1]]$group,coms[[1]]$fit_subgroup),paste(coms[[2]]$group,coms[[2]]$fit_subgroup))
+    
+    community_source_counts = lapply(coms,function(x){filter_tissue_norm_list[[x$group]][[x$fit_subgroup]]})
+    cur_genes = lapply(coms,function(x){x$all_genes})
+    
+    
+    community_jaccard_index[community_1,community_2] = community_jaccard_index[community_2,community_1] = jaccard(cur_genes[[1]],cur_genes[[2]])
+   
+   
+    cur_pca_info = lapply(coms,function(x){x$projection_info})
+    
+    
+    #collect the genes found in common between both data sets
+    cur_common_genes = list(cur_genes[[1]][cur_genes[[1]] %in% rownames(community_source_counts[[2]])],
+                              cur_genes[[2]][cur_genes[[2]] %in% rownames(community_source_counts[[1]])])
+    if (length(cur_common_genes[[1]]) < .95*length(cur_genes[[1]]) ||
+        length(cur_common_genes[[2]]) < .95*length(cur_genes[[2]]) ){
+      #print(paste("Not enough gene overlap between ",paste(com_names,collapse=" ")))
+      
+      next;
+    }
+    #get the PCA project matrix that works for the genes in common between both data sets.
+    cur_pca_info_common_genes = lapply(1:2,function(cur_community){
+      gene_matchup = match(cur_common_genes[[cur_community]],cur_genes[[cur_community]])
+      pca_info = list(scale=cur_pca_info[[cur_community]]$scale[gene_matchup],center=cur_pca_info[[cur_community]]$center[gene_matchup],rotation=cur_pca_info[[cur_community]]$rotation[gene_matchup,]);
+      pca_info
+    })
+  
+    # stop()
+    #calculate the PCA scores of each individual in each of the two data sets from which the communities were detected
+    score_correlations= unlist(lapply(community_source_counts,function(sub_counts){ 
+      scores = rbindlist(lapply(1:2,function(cur_community){
+        sub_pca_info = cur_pca_info_common_genes[[cur_community]];
+        sub_counts = t(scale(t(sub_counts[ cur_common_genes[[cur_community]],]),center=T,scale=T))
+        scores = t(sub_counts) %*% sub_pca_info$rotation[,1]
+        scores = data.frame(t(unlist(scores)))
+        }))
+      cor(t(scores[1,]),t(scores[2,]), method = "s")
+      
+    }))
+  
+   #score correlations is a vector with two numbers.
+   #the first is the correlation of the two community scores on the source data for community 1
+   #the second is the correlation of the two community scores on the source data for community 2
+   community_pca_correlation[community_1,community_2] = community_pca_correlation[community_2,community_1] = max(score_correlations)
+   
+
+
+  }
+}
+nms = sapply(all_communities,function(x)paste(x$group,x$fit_subgroup,x$within_group_community_id))
+
+rownames(community_pca_correlation) = colnames(community_pca_correlation) = rownames(community_jaccard_index) = colnames(community_jaccard_index) =nms
+
+jaccard_index_cutoff = .30
+community_pca_correlation_cutoff= .9
+
+```
+
+
+```{r,fig.width=16,fig.height=10}
+if (0){
+#plot fancy heatmap of correlation among communities built from PCA scores
+distfun <- function(x) {
+    as.dist(1-abs(x[rownames(x), rownames(x)]))}
+community_pca_correlation_tmp = community_pca_correlation;
+community_pca_correlation_tmp[which(is.na(community_pca_correlation_tmp),arr.ind=T)] = 0
+gene_clusters =as.dendrogram(hclust(distfun(community_pca_correlation_tmp),method="ward.D2"))
+hmp <<- ComplexHeatmap::Heatmap(community_pca_correlation,
+                        use_raster = TRUE,
+                        border = TRUE,
+                       
+                        cluster_rows=gene_clusters,
+                        cluster_columns=gene_clusters,
+                        show_row_names = T, 
+                        show_column_names = T,
+                        show_column_dend = T,
+                        column_names_gp = grid::gpar(fontsize = 8),
+                        row_names_gp = grid::gpar(fontsize = 8),
+                        show_row_dend = F)
+draw(hmp)
+plot(ecdf(abs(community_pca_correlation_tmp)),ylim=c(0,1))
+}
+  
+```
+```{r,fig.width=16,fig.height=10}
+if (0){
+#plot fancy heatmap of correlation among communities built from PCA scores
+distfun <- function(x) {
+    as.dist(1-x[rownames(x), rownames(x)])}
+community_jaccard_index_tmp = community_jaccard_index;
+community_jaccard_index_tmp[which(is.na(community_jaccard_index_tmp),arr.ind=T)] = 0
+gene_clusters =as.dendrogram(hclust(distfun(community_jaccard_index_tmp),method="ward.D2"))
+hmp <<- ComplexHeatmap::Heatmap(community_jaccard_index,
+                        use_raster = TRUE,
+                        border = TRUE,
+                        col = circlize::colorRamp2(c(0, 1), c("white", "firebrick")),
+                        cluster_rows=gene_clusters,
+                        cluster_columns=gene_clusters,
+                        show_row_names = T, 
+                        show_column_names = T,
+                        show_column_dend = T,
+                        column_names_gp = grid::gpar(fontsize = 8),
+                        row_names_gp = grid::gpar(fontsize = 8),
+                        show_row_dend = F)
+draw(hmp)
+plot(ecdf(community_jaccard_index_tmp),ylim=c(.6,1))
+}
+  
+```
+```{r,fig.width=16,fig.height=10}
+#THESE ARE THE GROUPS WE WILL MERGE TOGETHER USING JACCARD
+if (0){
+distfun <- function(x) {
+    as.dist(1-abs(x[rownames(x), rownames(x)]))}
+community_pca_correlation_tmp = community_pca_correlation;
+community_pca_correlation_tmp[which(is.na(community_pca_correlation_tmp),arr.ind=T)] = 0
+community_pca_correlation_tmp[which(community_jaccard_index < jaccard_index_cutoff,arr.ind=T)] = 0
+gene_clusters =as.dendrogram(hclust(distfun(community_pca_correlation_tmp),method="ward.D2"))
+hmp <<- ComplexHeatmap::Heatmap(community_pca_correlation_tmp,
+                        use_raster = TRUE,
+                        border = TRUE,
+                       
+                        cluster_rows=gene_clusters,
+                        cluster_columns=gene_clusters,
+                        show_row_names = T, 
+                        show_column_names = T,
+                        show_column_dend = T,
+                        column_names_gp = grid::gpar(fontsize = 8),
+                        row_names_gp = grid::gpar(fontsize = 8),
+                        show_row_dend = F)
+draw(hmp)
+}
+```
+
+
+```{r,fig.width=16,fig.height=10}
+if (0){
+#THESE ARE THE GROUPS WE WILL MERGE TOGETHER USING COMMUNITY CORRELATION.  NOTE THE PERSISTANCE OF LONG-DISTANCE CONNECTIONS THAT ARE TROUBLESOME
+
+community_pca_correlation_tmp = community_pca_correlation;
+community_pca_correlation_tmp[which(is.na(community_pca_correlation_tmp),arr.ind=T)] = 0
+community_pca_correlation_tmp[which(community_pca_correlation_tmp < community_pca_correlation_cutoff,arr.ind=T)] = 0
+gene_clusters =as.dendrogram(hclust(distfun(community_pca_correlation_tmp),method="ward.D2"))
+hmp <<- ComplexHeatmap::Heatmap(community_pca_correlation_tmp,
+                        use_raster = TRUE,
+                        border = TRUE,
+                       
+                        cluster_rows=gene_clusters,
+                        cluster_columns=gene_clusters,
+                        show_row_names = T, 
+                        show_column_names = T,
+                        show_column_dend = T,
+                        column_names_gp = grid::gpar(fontsize = 8),
+                        row_names_gp = grid::gpar(fontsize = 8),
+                        show_row_dend = F)
+draw(hmp)
+}
+```
+
+
+```{r}
+if (0){
+#MERGE TOGETHER USING JACCARD
+#"flood fill" merge all the communities that overlap with jaccard index greater than the cutoff
+merge_groups_jaccard = rep(-1,length(all_communities));
+
+for (i in 1:length(all_communities)){
+  for (j in i:length(all_communities)){
+    if (i==j || is.na(community_jaccard_index[i,j]) || community_jaccard_index[i,j] < jaccard_index_cutoff)next;
+    
+     previous_group_members = c(which(merge_groups_jaccard != -1 & merge_groups_jaccard %in% c(merge_groups_jaccard[i],merge_groups_jaccard[j])))
+     merge_groups_jaccard[c(i,j,previous_group_members)] = min(i,j,merge_groups_jaccard[previous_group_members]);
+  }
+}
+
+paste("Merging",length(all_communities),"into",length(unique(merge_groups_jaccard))-1+length(which(merge_groups_jaccard==-1)),"groups")
+}
+```
+
+
+```{r}
+if (0){
+#MERGE TOGETHER USING PCA COVARIATION AND JACCARD INDEX
+#"flood fill" merge all the communities that overlap correlate with each other
+merge_groups_community_correlation = rep(-1,length(all_communities));
+
+for (i in 1:length(all_communities)){
+  for (j in i:length(all_communities)){
+    if (i==j ||
+        !(!is.na(community_pca_correlation[i,j]) && community_pca_correlation[i,j] > community_pca_correlation_cutoff) &&
+        ! (community_jaccard_index[i,j] > jaccard_index_cutoff)
+        )next;
+    
+     previous_group_members = c(which(merge_groups_community_correlation != -1 & merge_groups_community_correlation %in% c(merge_groups_community_correlation[i],merge_groups_community_correlation[j])))
+     merge_groups_community_correlation[c(i,j,previous_group_members)] = min(i,j,merge_groups_community_correlation[previous_group_members]);
+  }
+}
+
+paste("Merging",length(all_communities),"into",length(unique(merge_groups_community_correlation))-1+length(which(merge_groups_community_correlation==-1)),"groups")
+}
+
+```
+```{r}
+#MERGE TOGETHER USING two rounds of hierarchical clustering
+#The first uses both the jaccard index and the community PCA correlation.  
+#the second round just uses jaccard index (so we don't have to re-run the PCA analysis for the merged sets)
+
+combined_distance = community_jaccard_index;
+colnames(combined_distance) = names(all_communities)
+rownames(combined_distance) = names(all_communities)
+for (i in 1:length(all_communities)){
+  for (j in i:length(all_communities)){
+    if (i!=j && !is.na(community_pca_correlation[i,j])) combined_distance[i,j] = max(abs(community_pca_correlation[i,j]),community_jaccard_index[i,j]) 
+     }   
+}
+merge_groups_community_correlation = rep(-1,length(all_communities));
+g_clust = as.dendrogram(hclust(as.dist(1-combined_distance),method="ward.D2"))
+
+similarity_cutoff = 1-seq(0,.95,by=.05)
+num_groups = sapply(similarity_cutoff,function(y)quantile(table(cutree(g_clust,h=1-y)),1))
+plot(similarity_cutoff,num_groups,xlab="similarity threshold",ylab="size of largest group")
+
+grps = cutree(g_clust,h=.75);
+grp_sizes = table(grps)[order(table(grps),decreasing=T)]
+
+groups = unique(grps);
+updated_jaccard = matrix(NA,nrow=length(groups),ncol=length(groups))
+for (i in 1:length(groups)){
+  for (j in i:length(groups)){
+    #if (i != j){
+      coms_1 = names(grps)[which(grps == groups[i])]
+      genes_1 = unique(do.call('c',lapply(coms_1,function(x){all_communities[[x]]$all_genes})))
+      coms_2 = names(grps)[which(grps == groups[j])]
+      genes_2 = unique(do.call('c',lapply(coms_2,function(x){all_communities[[x]]$all_genes})))
+      updated_jaccard[i,j] = updated_jaccard[j,i] = jaccard(genes_1,genes_2)
+   # }
+  }
+}
+g_clust_2 = as.dendrogram(hclust(as.dist(1-updated_jaccard),method="ward.D2"))
+grps_2 = cutree(g_clust_2,h=.77);
+grp_sizes_2 = table(grps_2)[order(table(grps_2),decreasing=T)]
+
+merge_groups_community_correlation = rep(-1,length(all_communities));
+grp_name = 1;
+new_groups = unique(grps_2)
+for (i in 1:length(new_groups)){
+  comsets = as.integer(names(grps_2)[which(grps_2 == new_groups[i])])
+  coms = names(grps)[which(grps %in% comsets)]
+  if (length(coms) <= 1) next;
+  merge_groups_community_correlation[match(coms,names(all_communities))] = grp_name
+  grp_name = grp_name + 1;
+}
+grp_sizes_3 = table(merge_groups_community_correlation)[order(table(merge_groups_community_correlation),decreasing=T)]
+paste("Merging",length(all_communities),"into",length(unique(merge_groups_community_correlation))-1+length(which(merge_groups_community_correlation==-1)),"groups")
+
+```
+
+```{r}
+#each value of merge groups tells the new group for the corresponding community in all_communties
+#eg. merge_group[i] is the group for all_communities[i]
+merge_groups = merge_groups_community_correlation
+merge_g= unique(merge_groups[merge_groups!=-1])
+
+#figure out the new names for the global naming scheme
+label_matchup_reference = data.table(new_coexp_group_ID = rep(NA,length(all_communities)),old_coexp_group_ID = rep(NA,length(all_communities)),group = rep(NA,length(all_communities)),fit_subgroup =  rep(NA,length(all_communities)), N =  rep(NA,length(all_communities)),merged_max_N =  rep(NA,length(all_communities)),group_subgroup_size = rep(NA,length(all_communities)),all_communities_index = rep(NA,length(all_communities)))
+
+#assign merged groups their IDS
+for (i in 1:length(merge_g)){
+   merged_group_members = which(merge_groups==merge_g[i]);
+   label_matchup_reference$new_coexp_group_ID[merged_group_members] = i;
+   label_matchup_reference$old_coexp_group_ID[merged_group_members] = sapply(merged_group_members,function(x)all_communities[[x]]$within_group_community_id)
+   label_matchup_reference$group[merged_group_members] =              sapply(merged_group_members,function(x)all_communities[[x]]$group)
+   label_matchup_reference$fit_subgroup[merged_group_members] =       sapply(merged_group_members,function(x)all_communities[[x]]$fit_subgroup)
+   label_matchup_reference$N[merged_group_members] =                  sapply(merged_group_members,function(x)length(all_communities[[x]]$all_genes))
+   label_matchup_reference$merged_max_N[merged_group_members] =       max(label_matchup_reference$N[merged_group_members]);
+   label_matchup_reference$group_subgroup_size[merged_group_members] = length(merged_group_members)
+   label_matchup_reference$all_communities_index[merged_group_members] = merged_group_members
+   
+}
+#longer_start_label is the ID for the first co-expression group that doesn't need to be merged with others
+
+loner_start_label = length(merge_g)+1
+loners = which(merge_groups == -1)
+if (length(loners)>0){
+  label_matchup_reference$new_coexp_group_ID[loners] = loner_start_label-1 + 1:length(loners);
+  label_matchup_reference$old_coexp_group_ID[loners] = sapply(loners,function(x)all_communities[[x]]$within_group_community_id)
+  label_matchup_reference$group[loners] =             sapply(loners,function(x)all_communities[[x]]$group)
+  label_matchup_reference$fit_subgroup[loners] =      sapply(loners,function(x)all_communities[[x]]$fit_subgroup)
+  label_matchup_reference$N[loners] =                 sapply(loners,function(x)length(all_communities[[x]]$all_genes))
+  label_matchup_reference$merged_max_N[loners] =      sapply(loners,function(x)length(all_communities[[x]]$all_genes))
+  label_matchup_reference$group_subgroup_size[loners]  = 1;
+  label_matchup_reference$all_communities_index[loners] = loners
+}
+
+#find the number of genes referred to by each new label
+all_new_labels = unique((label_matchup_reference[, .(new_coexp_group_ID,merged_max_N)]))
+all_new_labels = all_new_labels[order(all_new_labels$merged_max_N,decreasing=T),]
+   
+new_ids_in_order = rep(NA,nrow(all_new_labels))
+#Reassign the new ids so they appear in descending order
+for (i in 1:nrow(all_new_labels)){
+  new_ids_in_order[label_matchup_reference$new_coexp_group_ID ==all_new_labels$new_coexp_group_ID[i]] = i;
+}
+label_matchup_reference$new_coexp_group_ID = new_ids_in_order;
+label_matchup_reference = label_matchup_reference[order(label_matchup_reference$new_coexp_group_ID),]
+
+#provide a merged genelist
+all_new_labels = unique(label_matchup_reference[, .(new_coexp_group_ID,merged_max_N)])
+merged_genelists = list();
+for (i in all_new_labels$new_coexp_group_ID){
+  group_members = label_matchup_reference[new_coexp_group_ID == i,all_communities_index]
+  merged_genelists[[i]] = unique(do.call("c",lapply(group_members,function(x)all_communities[[x]]$all_genes)))
+}
+
+
+```
+
+```{r,fig.width=10,fig.height=10}
+#plot overlap in genesets among the members of each merged group
+merged_groups = unique(label_matchup_reference[group_subgroup_size>1,new_coexp_group_ID])
+merged_group_members_jaccard_index = list()
+for (i in merged_groups){
+  merged_group_members = label_matchup_reference[new_coexp_group_ID==i,all_communities_index];
+  nms = sapply(merged_group_members,function(x)paste(all_communities[[x]]$group,all_communities[[x]]$fit_subgroup))
+  m = matrix(NA,nrow = length(merged_group_members),ncol=length(merged_group_members))
+  rownames(m) = colnames(m) = nms
+  for (j in 1:length(merged_group_members)){
+      for (k in j:length(merged_group_members)){
+        if (j != k)
+        m[j,k] = m[k,j] = jaccard(all_communities[[merged_group_members[j]]]$all_genes,all_communities[[merged_group_members[k]]]$all_genes)
+      }
+  }
+  hclustered = hclust(as.dist(1-m),method="ward.D2")
+  merged_group_members_jaccard_index[[i]] = m;
+  draw(Heatmap(m,cluster_rows = hclustered,cluster_columns=hclustered,row_names_gp = gpar(fontsize = 7),column_names_gp = gpar(fontsize = 7),col = colorRamp2(c(0, .5,.75, 1), c("black", "green", "red","purple"))))
+
+}
+
+```
+
+```{r}
+#plot overlap in genesets among the members of each merged group
+merged_groups = unique(label_matchup_reference[group_subgroup_size>1,new_coexp_group_ID])
+for (i in merged_groups){
+  merged_group_members = which(label_matchup_reference$new_coexp_group_ID==i)
+ hist(unlist(label_matchup_reference[merged_group_members,"N"]),xlim = c(0,max(label_matchup_reference$N)))
+}
+
+```
+
+```{r,fig.width=15,fig.height=8}
+#plot overlap in genesets among the members of each merged group
+merged_groups = unique(label_matchup_reference[,new_coexp_group_ID])
+merged_group_jaccard_index = matrix(NA,nrow = length(merged_groups),ncol=length(merged_groups))
+rownames(merged_group_jaccard_index) = colnames(merged_group_jaccard_index) = merged_groups
+for (i in 1:length(merged_groups)){
+  for (j in i:length(merged_groups)){
+    merged_group_jaccard_index[i,j] = merged_group_jaccard_index[j,i] = jaccard(merged_genelists[[i]],merged_genelists[[j]])
+    }
+}
+hclustered = hclust(as.dist(1-merged_group_jaccard_index),method="ward.D2")
+draw(Heatmap(merged_group_jaccard_index,cluster_rows = hclustered, cluster_columns = hclustered,col = colorRamp2(c(0, .25, .5, 1), c("black", "green", "red","purple"))))
+
+
+```
+
+
+
+     
+     
+```{r}
+#Great!  Here we now have all the new co-expression group IDs and we can use them to merge the groups.
+
+merged_community_info = list();
+
+
+for (cur_group in unique(label_matchup_reference$group)){
+  #cur_group = "n2_sw"
+  print(paste("Merging coexpression groups in",cur_group));
+  flush.console();
+  cur_ref = label_matchup_reference[label_matchup_reference$group==cur_group,]
+  new_coexpr_groups = unique(cur_ref$new_coexp_group_ID)
+  
+  
+  
+  merged_community_info[[cur_group]] = list();
+  for (cur_coexp in new_coexpr_groups){
+    #cat (paste0(cur_coexp,"..."))
+    new_id = coexp_ID_from_number(cur_coexp);
+    source_groups_to_merge = unlist(cur_ref[new_coexp_group_ID == cur_coexp,old_coexp_group_ID])
+    if (length(source_groups_to_merge) == 1){
+      #coexpr groups that don't need to be merged are easy!  We just copy them over using their new name
+      merged_community_info[[cur_group]][[new_id]] = community_info[[cur_group]][[source_groups_to_merge]]
+      source_gene_info = data.frame(GeneName = community_info[[cur_group]][[source_groups_to_merge]]$all_genes);
+      source_gene_info$fit_subgroup = community_info[[cur_group]][[source_groups_to_merge]]$fit_subgroup
+      source_gene_info$source_coexp_group_id = source_groups_to_merge
+     
+      merged_community_info[[cur_group]][[new_id]]$source_gene_info = source_gene_info
+      merged_community_info[[cur_group]][[new_id]]$global_group_community_id = new_id;
+    }else{
+      source_gene_info = rbindlist((lapply(source_groups_to_merge,function(x){
+        res = data.frame(GeneName = community_info[[cur_group]][[x]]$all_genes);
+        res$fit_subgroup = community_info[[cur_group]][[x]]$fit_subgroup
+        res$source_coexp_group_id = x
+        res
+      })))
+      # print("BWA")
+   #   browser()
+      source_gene_count = unlist(lapply(source_groups_to_merge,function(x)length(community_info[[cur_group]][[x]]$all_genes)))
+      source_fit_subgroups =  unlist(lapply(source_groups_to_merge,function(x)community_info[[cur_group]][[x]]$fit_subgroup))
+      #choose the fit_subgroup that has the most genes
+      #we use this to recalculate the PCA later.
+      best_fit_subgroup = unique(source_fit_subgroups[which(source_gene_count==max(source_gene_count))[1]])
+      all_genes = unique(source_gene_info$GeneName)
+      gene_frequency = table(source_gene_info$GeneName)
+      core_genes = names(gene_frequency)[gene_frequency>median(gene_frequency)]
+      if (length(core_genes) == 0) core_genes = names(gene_frequency)[gene_frequency>=median(gene_frequency)]
+      if (length(core_genes) == 0) browser()
+      cur_counts = filter_tissue_norm_list[[cur_group]][[best_fit_subgroup]]
+      sub_counts = cur_counts[core_genes,]
+      pca_res = prcomp(t(sub_counts),scale=T,center=T)
+      pca_info = list(scale=pca_res$scale,center=pca_res$center,rotation=pca_res$rotation,frac_var = pca_res$sdev^2/sum(pca_res$sdev^2));
+      
+
+       
+      merged_community_info[[cur_group]][[new_id]] = 
+        list(all_genes = all_genes, 
+             core_genes = core_genes,
+             projection_info = pca_info,
+             fit_subgroup = best_fit_subgroup,
+             group = cur_group,
+             source_gene_info = source_gene_info,
+             global_group_community_id = new_id);
+     # browser()
+    }
+  }
+}
+
+generate_community_flatfile = function(com_info,gene_type){
+  rbindlist(lapply(names(com_info),function(cur_group){
+  #  print(cur_group)
+    rbindlist(lapply(names(com_info[[cur_group]]),function(cur_com){
+      cur_com_data = com_info[[cur_group]][[cur_com]]
+      if (!gene_type %in% names(cur_com_data))
+        stop(paste("In",cur_group,cur_com,"gene_type must be either all_genes or core_genes.  Found ",paste(names(cur_com_data),collapse=" ")))
+      r = data.frame(GeneName = cur_com_data[[gene_type]])
+      r$fit_subgroup = cur_com_data$fit_subgroup;
+      r$fit_subgroup_2 = ifelse (length(cur_com_data$source_fit_subgroups)>1,setdiff(cur_com_data$source_fit_subgroups,cur_com_data$fit_subgroup),"")
+      com_int = as.integer(substring(cur_com,2,4))
+      r$commmunity = com_int
+      r$group = cur_group
+      r$coexp_group_ID = cur_com
+      r$coexp_group_name = paste(cur_com_data$fit_subgroup,com_int)
+      r = merge(r,tissues_df[,.(GeneName,Tissue)],by="GeneName",all.x=T)
+      r
+    }))
+  }))
+}
+#add some extra (redundant) metadata to the communty_info structure so it 
+#has the exact same structure as the merged_community_info
+for (cur_group in names(community_info)){
+ for (cur_com in names(community_info[[cur_group]])){
+      source_gene_info = data.frame(GeneName = community_info[[cur_group]][[cur_com]]$all_genes);
+      source_gene_info$fit_subgroup = community_info[[cur_group]][[cur_com]]$fit_subgroup
+      source_gene_info$source_coexp_group_id = -1
+      community_info[[cur_group]][[cur_com]]$source_gene_info = source_gene_info
+      community_info[[cur_group]][[cur_com]]$core_genes = community_info[[cur_group]][[cur_com]]$all_genes
+      community_info[[cur_group]][[cur_com]]$global_group_community_id = -1; 
+ }
+}
+
+saveRDS(community_info,"../data/gene_network/model_specific_community_info.rds")
+saveRDS(merged_community_info,"../data/gene_network/global_community_info.rds")
+
+
+community_membership = generate_community_flatfile(community_info,"all_genes");
+write.csv(community_membership,"../data/gene_network/model_specific_community_membership_all_genes.csv",row.names=F)
+community_membership = generate_community_flatfile(community_info,"core_genes");
+write.csv(community_membership,"../data/gene_network/model_specific_community_membership_core_genes.csv",row.names=F)
+
+merged_community_membership = generate_community_flatfile(merged_community_info,"all_genes");
+write.csv(merged_community_membership,"../data/gene_network/global_community_membership_all_genes.csv",row.names=F)
+merged_community_membership = generate_community_flatfile(merged_community_info,"core_genes");
+write.csv(merged_community_membership,"../data/gene_network/global_community_membership_core_genes.csv",row.names=F)
+
+gene_network = list(filter_tissue_norm_list = filter_tissue_norm_list,
+     filter_tissue_rho_list = filter_tissue_rho_list,
+     gene_annotations = gene_annotations,
+     geneid = geneid,
+     community_info=community_info,
+     merged_community_info=merged_community_info,
+     merged_community_membership=merged_community_membership,
+     community_membership=community_membership
+     )
+
+saveRDS(gene_network,"../data/gene_network/community_networks.rds")
+
+
+```
+```{r}
+#print out a nice summary of all groups
+aggregate(new_coexp_group_ID~old_coexp_group_ID+group+fit_subgroup+N,label_matchup_reference,length)
+
+
+group_summary = label_matchup_reference[order(label_matchup_reference$new_coexp_group_ID,label_matchup_reference$N,label_matchup_reference$group,label_matchup_reference$fit_subgroup),]
+```
+

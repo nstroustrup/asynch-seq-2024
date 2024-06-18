@@ -1,0 +1,1134 @@
+---
+title: "Tissue-specific RNAi"
+output: html_document
+date: '2022-03-10'
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(pbapply)
+library(ggrepel)
+library(survival)
+library(DESeq2)
+library(igraph)
+library(ggridges)
+
+#dir.create("../figures/main_figure_4/", showWarnings = FALSE)
+#dir.create("../figures/sup_figure_4/", showWarnings = FALSE)
+
+theme_set(theme_cowplot())
+
+source("../scripts/notebooks_helpers/tissue_specific_rnai.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/helpers/heatmap.R")
+source("../scripts/helpers/differential_analysis.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+
+germsoma_colors <- c(soma = "mediumslateblue", 
+                     germ_line = "black")
+
+tissue_colors <- c("germ_line" = "black", 
+                   "hypodermis" = "#5ac134", 
+                   "intestine" = "#79bbe9", 
+                   "muscle" = "#f68528",
+                   "neurons" = "#E92128")
+```
+
+## Load data
+
+### Tissues
+
+```{r}
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+germsoma <- tissues
+germsoma[germsoma != "germ_line"] <- "soma"
+```
+
+### Load Differential analysis files
+
+```{r}
+models <- fread("../data/differential_analysis/models/single_and_pooled_worms.csv")
+
+files = c("d8_UV.csv.gz","d8_glp1.csv.gz","d1_glp1.csv.gz","d8_20v25C.csv.gz","d_25C.csv.gz")
+da <- rbindlist(lapply(files, function(filename) {
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename))
+  df[, Name := stringr::str_remove(filename, "[.]csv[.]gz")]
+  prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+  prefix = substring(names(df)[3],0,prefix_N-2)
+  names(df)[3:6] = substring(names(df)[3:6],prefix_N)
+  df$comparison = prefix;
+  df
+}))
+
+ts_da <- rbindlist(lapply(files, function(filename) {
+  filename2 = paste0("ts_",filename);
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename2))
+  df[, Name := stringr::str_remove(filename, "[.]csv[.]gz")]
+  prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+  prefix = substring(names(df)[3],0,prefix_N-2)
+  names(df)[3:6] = substring(names(df)[3:6],prefix_N)
+  df$comparison = prefix;
+  df
+}))
+```
+
+```{r,fig.width=12,fig.height=6}
+for (gr in unique(da$Name)){
+  d1 = as.data.frame(da)[da$Name == gr,]
+  d2 = as.data.frame(ts_da)[ts_da$Name == gr,]
+  d1$type = "Standard"
+  d1$Tissue = "Multiple";
+  ts_lookup = tissues[d1$GeneName];
+  wh = !is.na(ts_lookup)
+  d1$Tissue[wh] = ts_lookup[wh]
+  d2$type = "Tissue-specific"
+  comp_label = unique(d1$comparison)
+  d = rbind(d1,d2);
+  q1 = quantile(abs(d1$log2FoldChange[d1$pvalue<.001]),1-min(1,150/length(d1$log2FoldChange[d1$pvalue<.001])),na.rm=T)
+  q2 = quantile(abs(d2$log2FoldChange[d2$pvalue<.001]),1-min(1,150/length(d2$log2FoldChange[d2$pvalue<.001])),na.rm=T)
+  genes_to_label = c(d1$GeneSymbol[d1$pvalue < .001 & abs(d1$log2FoldChange) >= q1],d2$GeneSymbol[d2$pvalue < .001 & abs(d2$log2FoldChange) >= q2])
+  plot(ggplot() + geom_point(aes(log2FoldChange,-log10(pvalue),color=Tissue),d)+facet_wrap(~type+Tissue) + geom_hline(yintercept=-log10(.001),lty=2,col="gray")+ xlab("Log2 fold change") + geom_vline(xintercept=0,col="gray",lty=2)+ ylab("log10 p-value")+ggtitle(paste(gr,comp_label)) + geom_text_repel(aes(log2FoldChange,-log10(pvalue),label = GeneSymbol),d[d$GeneSymbol %in% genes_to_label,],cex=2.5,col="dark red") 
+       );
+}
+```
+
+
+```{r}
+glp1_da = da[Name == "d1_glp1" & GeneName %in% names(tissues[tissues=="germ_line"]),]
+genes_not_downregulated_enough = glp1_da$GeneName[glp1_da$log2FoldChange > -4]
+tissues_conservative = tissues[!(names(tissues) %in% genes_not_downregulated_enough)]
+
+```
+
+
+
+### Load Counts
+
+```{r}
+sw <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+```
+
+
+```{r}
+
+
+#identified from PCA plots calculated below
+basenames_to_exclude = c("P101_B9","P101_B5","P101_F12","P91B12","P91C2","P91H4","P102_F1","P102_D1","P100_A5","P99_B8","P102_C8","P102_B7","P99_A5") #identified in PCA plots
+bad_samples = sw$annots$Basename %in% basenames_to_exclude
+
+
+model_names = c("d8_glp1","d1_glp1","d_glp1","d_25C","d8_UV","n2_sw","daf2_sw","d1_sw","d8_sw")
+#make a list of which samples match up to each subgroup (biological covariate group)
+samples_list = lapply(model_names,function(group){
+  cur_annots = sw$annots[eval(parse(text=models$Subset[models$Name == group])),]
+  subgroup_vals = as.character(as.data.frame(cur_annots)[,models$BiologicalCovariates[models$Name == group]])
+  subgroups = unique(subgroup_vals)
+  res = lapply(subgroups,function(subgroup){
+      cur_annots$Sample[subgroup_vals == subgroup]
+  }) 
+  names(res) = subgroups
+  res
+})
+names(samples_list) = model_names;
+
+# counts_list <- sapply(samples_list, function(samples) sw$counts[, samples])
+counts_list <- lapply(names(samples_list),function(x){
+    res = lapply(names(samples_list[[x]]),function(y){
+        sw$counts[, colnames(sw$counts)%in% samples_list[[x]][[y]]]
+    })
+    names(res) = names(samples_list[[x]])
+    res;
+})
+names(counts_list) = names(samples_list)
+
+
+ercc_list <- lapply(names(samples_list), function(x) { sapply(samples_list[[x]],function(samples) {sw$ercc[, samples]})})
+names(ercc_list) = names(samples_list);
+
+annots <- unique(sw$annots[unlist(samples_list)]) #unique because samples can appear in multiple comparrisons
+setkey(annots, Sample)
+```
+```{r}
+filter_tissue_rho_list <- lapply(filter_tissue_norm_list, function(x) cor(t(x), method = "s"))
+
+
+```
+
+```{r}
+ns_merge_matrix_list = function(l){
+  mrg = Reduce(function(x,y){merge(x,y,by=0)},l, accumulate=FALSE)
+  mrg = mrg[,names(mrg) !="Row.names"]
+  nms = names(mrg)
+  mrg = as.matrix(mrg);
+  colnames(mrg) = nms;
+  rownames(mrg) = rownames(l[[1]])
+  mrg
+}
+```
+
+
+#calculate scale factors
+
+```{r}
+
+source("../scripts/helpers/preprocess.R")
+#normalization factors compares the distribution of mRNA abundances from each sample and calculates the factors needed to align them.
+#here we fit them separately for each group (genotype / food / temperature / etc
+#(this is probably the wrong way to do it if want to compare across groups)
+nf_list <- lapply(names(counts_list), function(x) lapply(counts_list[[x]],function(y)normalizationFactor(y, groups = annots[colnames(y), on = "Sample"]$Group)))
+names(nf_list) = names(counts_list)
+
+#technical factors compares the distribution of ERCC abundances from each sample and calculates the factors needed to align them.
+#here we fit them separately for each group (this is probably the right way to do it)
+tf_list <- lapply(names(ercc_list), function(x) lapply(ercc_list[[x]],function(y)normalizationFactor(y, groups = annots[colnames(y), on = "Sample"]$Group)))
+names(tf_list)= names(ercc_list);
+
+#we can also fit normalization factors across pairs of groups, to put all samples on the same scale 
+#(this is probably the right way to do it if we want to compare across groups)
+nf_comparitive_list <- lapply(names(counts_list), function(x){
+  mrg = ns_merge_matrix_list(counts_list[[x]])
+  normalizationFactor(mrg, groups = annots[colnames(mrg), on = "Sample"]$Group)
+  })
+names(nf_comparitive_list) = names(counts_list)
+
+#we can also fit technical factors across pairs of groups, to put all samples on the same scale
+tf_comparitive_list <- lapply(names(ercc_list), function(y){
+  mrg = ns_merge_matrix_list(ercc_list[[y]])
+  normalizationFactor(mrg, groups = annots[colnames(mrg), on = "Sample"]$Group)
+})
+
+names(tf_comparitive_list)= names(ercc_list);
+
+sf_comparitive_list <- lapply(names(samples_list),function(i) 
+    nf_comparitive_list[[i]]  / tf_comparitive_list[[i]])
+names(sf_comparitive_list) <- names(samples_list)
+
+
+#fit normalization factor separately on each group
+#(this is probably the wrong way to do it if want to compare across groups)
+tissue_nf_list <- lapply(names(counts_list), function(y){
+  lapply(counts_list[[y]],function(x){
+  normalizationFactorTissueSpecific(x, 
+                                    tissues = tissues, 
+                                    groups = annots[colnames(x), on = "Sample"]$Group)
+
+  })
+  })
+names(tissue_nf_list) = names(counts_list)
+
+tissue_sf_list <- lapply(names(samples_list), function(j){
+  lg = lapply(names(samples_list[[j]]),function(i) {
+    lapply(tissue_nf_list[[j]][[i]], function(x) x / tf_list[[j]][[i]])
+  })
+  names(lg) = names(samples_list[[j]]);
+  lg
+})
+names(tissue_sf_list) <- names(samples_list)
+
+#recalculate with a more conservative list of tissue-specific genes
+tissue_nf_list_conservative_tissue <- lapply(names(counts_list), function(y){
+  lapply(counts_list[[y]],function(x){
+  normalizationFactorTissueSpecific(x, 
+                                    tissues = tissues_conservative, 
+                                    groups = annots[colnames(x), on = "Sample"]$Group)
+
+  })
+  })
+names(tissue_nf_list_conservative_tissue) = names(counts_list)
+
+tissue_sf_list_conservative_tissue <- lapply(names(samples_list), function(j){
+  lg = lapply(names(samples_list[[j]]),function(i) {
+    lapply(tissue_nf_list_conservative_tissue[[j]][[i]], function(x) x / tf_list[[j]][[i]])
+  })
+  names(lg) = names(samples_list[[j]]);
+  lg
+})
+names(tissue_sf_list_conservative_tissue) <- names(samples_list)
+
+#fit normalization factors across pairs of groups
+#(this is probably the right way to do it if want to comare across groups)
+tissue_nf_comparative_list <- lapply(names(counts_list), function(y){
+  mrg = ns_merge_matrix_list(counts_list[[y]])
+  normalizationFactorTissueSpecific(mrg, 
+                                    tissues = tissues, 
+                                    groups = annots[colnames(mrg), on = "Sample"]$Group)
+  })
+names(tissue_nf_comparative_list) = names(counts_list)
+
+#calculate scale factors with cross-group technical factors
+#but cross-group normalization factors
+tissue_sf_comparative_list <- lapply(names(samples_list),function(i) 
+    lapply(tissue_nf_comparative_list[[i]], function(x) x / tf_comparitive_list[[i]]))
+names(tissue_sf_comparative_list) <- names(samples_list)
+
+#fit normalization factors across pairs of groups
+#(this is probably the right way to do it if want to comare across groups)
+tissue_nf_comparative_list_conservative_tissue <- lapply(names(counts_list), function(y){
+  mrg = ns_merge_matrix_list(counts_list[[y]])
+  normalizationFactorTissueSpecific(mrg, 
+                                    tissues = tissues_conservative, 
+                                    groups = annots[colnames(mrg), on = "Sample"]$Group)
+  })
+names(tissue_nf_comparative_list_conservative_tissue) = names(counts_list)
+
+#calculate scale factors with cross-group technical factors
+#but cross-group normalization factors
+tissue_sf_comparative_list_conservative_tissue <- lapply(names(samples_list),function(i) 
+    lapply(tissue_nf_comparative_list_conservative_tissue[[i]], function(x) x / tf_comparitive_list[[i]]))
+names(tissue_sf_comparative_list_conservative_tissue) <- names(samples_list)
+
+#calculate scale factors with group-specific technical factors
+#but cross-group normalization factors
+#this isn't the right way to calculate it but we use it for diagnostics as
+#described below
+tissue_sf_comparative_list2 <- lapply(names(samples_list),function(i){
+  tmp = tf_list[[i]];
+  names(tmp) = 1:length(names(tmp));
+  tmp = unlist(tmp)
+  names(tmp) = substring(names(tmp),3)
+    lapply(tissue_nf_comparative_list[[i]],function(x){ 
+      tmp2 = tmp[names(tmp) %in% names(x)]
+      tmp3 = tmp2[match(names(tmp2),names(tmp))]
+      x / tmp3
+    })
+  })
+names(tissue_sf_comparative_list2) <- names(samples_list)
+```
+
+
+```{r}
+germsoma_nf_list <- lapply(names(counts_list),function(y)lapply(counts_list[[y]], function(x) 
+  normalizationFactorTissueSpecific(x, 
+                                    tissues = germsoma, 
+                                    groups = annots[colnames(x), on = "Sample"]$Group)))
+names(germsoma_nf_list) = names(counts_list);
+
+germsoma_sf_list <- lapply(names(samples_list), function(j){
+  lg = lapply(names(samples_list[[j]]),function(i) {
+    lapply(germsoma_nf_list[[j]][[i]], function(x) x / tf_list[[j]][[i]])
+  })
+  names(lg) = names(samples_list[[j]]);
+  lg
+})
+names(germsoma_sf_list) <- names(samples_list)
+
+norm_list <- lapply(names(samples_list), function(j) {
+  lg = lapply(names(samples_list[[j]]),function(i) {
+    normalizeCounts(counts_list[[j]][[i]], nf_list[[j]][[i]])
+  })
+  names(lg) = names(samples_list[[j]])
+  lg
+})
+names(norm_list) <- names(samples_list)
+
+tissue_norm_list <- lapply(names(samples_list), function(j){
+  lg = lapply(names(samples_list[[j]]),function(i){
+    ll = normalizeCountsTissueSpecific(counts_list[[j]][[i]],
+                                  nf_list = tissue_nf_list[[j]][[i]], 
+                                  tissues = tissues)
+    
+    ll
+  })
+  names(lg) = names(samples_list[[j]]);
+  lg
+})
+names(tissue_norm_list) <- names(samples_list)
+
+germsoma_norm_list <- lapply(names(samples_list), function(j){
+  lg = lapply(names(samples_list[[j]]),function(i) {
+  normalizeCountsTissueSpecific(counts_list[[j]][[i]],
+                                nf_list = germsoma_nf_list[[j]][[i]], 
+                                tissues = germsoma)
+})
+  names(lg) = names(samples_list[[j]])
+  lg
+})
+names(germsoma_norm_list) <- names(samples_list)
+
+```
+
+
+## PCA
+
+```{r}
+pca_results <- lapply(names(samples_list), function(j){ 
+  x = ns_merge_matrix_list(norm_list[[j]])
+  x <- x[rowMeans(x >= 5)  >= 0.95, ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+  gp_pca <- ggplot(scores_df, aes(x=PC1, y=PC2,color=Group,sample=Group)) +
+    geom_point(size = 2) +
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "top")
+  list( gp_pca = gp_pca, scores_df = scores_df, loadings_df = loadings_df, vp = vp)
+
+})
+names(pca_results) <- names(samples_list)
+
+for (x in names(pca_results)) plot(pca_results[[x]]$gp_pca)
+```
+```{r}
+tissue_pca_results <- lapply(names(samples_list), function(j){
+  x = ns_merge_matrix_list(norm_list[[j]])
+  x <- x[rowMeans(x >= 5)  >= 0.95, ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+gp_pca <- ggplot(scores_df, aes(PC1, PC2,color=Group,pch=Group,label=ifelse(Basename %in% c("P102_B7","P99_A5"),Basename,""))) +
+    geom_point(size = 2) + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "top") + geom_text_repel()
+  list( gp_pca = gp_pca, scores_df = scores_df, loadings_df = loadings_df, vp = vp)
+})
+ 
+names(tissue_pca_results) <- names(samples_list)
+
+for (x in names(tissue_pca_results)) plot(tissue_pca_results[[x]]$gp_pca)
+#UV_d8_33 C3_d3_50 
+#"P102_B7" "P99_A5"
+
+```
+```{r}
+somatic_tissue_pca_results <- lapply(names(samples_list), function(j){
+  x = ns_merge_matrix_list(norm_list[[j]])
+  x = x[rownames(v) %in% names(tissues[tissues!="germ_line"]),]
+  x <- x[rowMeans(x >= 5)  >= 0.95, ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+gp_pca <- ggplot(scores_df, aes(PC1, PC2,color=Group,pch=Group,label=ifelse(Basename %in% c("P102_B7","P99_A5"),Basename,""))) +
+    geom_point(size = 2) + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "top") + geom_text_repel()
+  list( gp_pca = gp_pca, scores_df = scores_df, loadings_df = loadings_df, vp = vp)
+})
+ 
+names(somatic_tissue_pca_results) <- names(samples_list)
+
+for (x in names(somatic_tissue_pca_results)) plot(somatic_tissue_pca_results[[x]]$gp_pca)
+
+
+```
+
+```{r}
+tissues_levels = unique(tissues)
+```
+
+```{r}
+rm(sw, bc, ts)
+gc()
+```
+
+
+
+
+## Size factors
+```{r,fig.width=10,fig.height=5}
+#look at technical factors fit across all groups simultaneously. Note that for CB4037, the technical factors are much larger than N2 expecially on day 1.  This is because glp-1 animals have smaller overall transcriptomes, so spike-ins contribute a lower proportion overall of the mrna + spike-in = total RNA content.  In other words, *larger* individuals have *smaller* technical factors.
+lapply(names(tf_comparitive_list),function(x){
+  mat = data.table(Sample = names(tf_comparitive_list[[x]]),value = tf_comparitive_list[[x]])
+  
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+  gp = ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Technical Factor (each group seperately)") + geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) 
+  #plot(gp);
+})
+```
+
+```{r,fig.width=10,fig.height=5}
+#look at normalization factors and technical factors FOR THE WHOLE ANIMAL--ALL TISSUES--across all covariate groups 
+#these scale factors are calculated correctly and the values we want to use.
+lapply(names(nf_comparitive_list),function(x){
+  nf = data.frame(Sample = names(nf_comparitive_list[[x]]), value= nf_comparitive_list[[x]],type = "Normalization factor")
+  tf = data.frame(Sample = names(tf_comparitive_list[[x]]), value= tf_comparitive_list[[x]], type = "Technical factor")
+  sf = data.frame(Sample = names(sf_comparitive_list[[x]]), value= sf_comparitive_list[[x]], type = "Scale factor")
+  
+  mat = rbind(nf,tf,sf);
+  
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+  
+  gp = ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Factor")+geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) + facet_wrap(~type)
+})
+```
+
+```{r,fig.width=10,fig.height=5}
+#look at normalization factors fit across all covariate groups and technical factors fit across each group separately
+lapply(names(nf_comparitive_list),function(x){
+  nf = data.frame(Sample = names(nf_comparitive_list[[x]]), value= nf_comparitive_list[[x]],type = "Normalization factor")
+  tf = rbindlist(lapply(names(tf_list[[x]]),function(y)data.frame(Sample = names(tf_list[[x]][[y]]), value= tf_list[[x]][[y]], type = "Technical factor")))
+ 
+  mat = rbind(nf,tf);
+  
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+
+  gp = ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Technical Factor (each group separately)")+geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) + facet_wrap(~type)
+})
+```
+```{r,fig.width=10,fig.height=5}
+#compare tissue-specific normalization factors
+#This isn't complete--we need to correct using technical factors which we do next
+lapply(names(tissue_nf_comparative_list),function(x){
+  mat = Reduce(cbind,tissue_nf_comparative_list[[x]])
+  colnames(mat) = names(tissue_nf_comparative_list[[x]]);
+  mat = melt(mat)
+  colnames(mat) = c("Sample","Tissue","value");
+  names(mat) = colnames(mat)
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+
+  print(aggregate(value~Group+Tissue,mat,median))
+  gp= ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Tissue Norm Factor (whole population)")+geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) + facet_wrap(~Tissue)
+})
+```
+
+```{r,fig.width=10,fig.height=5}
+#compare tissue-specific scale factors  This is the right way to do it!
+lapply(names(tissue_sf_comparative_list),function(x){
+  mat = Reduce(cbind,tissue_sf_comparative_list[[x]])
+  colnames(mat) = names(tissue_sf_comparative_list[[x]]);
+  mat = melt(mat)
+  colnames(mat) = c("Sample","Tissue","value");
+  names(mat) = colnames(mat)
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+
+  print(aggregate(value~Group+Tissue,mat,median))
+  gp= ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Tissue Scale Factor (whole population)")+ geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) + facet_wrap(~Tissue)
+})
+```
+
+```{r,fig.width=10,fig.height=5}
+#compare tissue-specific scale factors  This is the right way to do it!
+#this time we use a more conservative list of germline genes
+lapply(names(tissue_sf_comparative_list_conservative_tissue),function(x){
+  mat = Reduce(cbind,tissue_sf_comparative_list_conservative_tissue[[x]])
+  colnames(mat) = names(tissue_sf_comparative_list_conservative_tissue[[x]]);
+  mat = melt(mat)
+  colnames(mat) = c("Sample","Tissue","value");
+  names(mat) = colnames(mat)
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+
+  print(aggregate(value~Group+Tissue,mat,median))
+  gp= ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Tissue Scale Factor (whole population)")+ geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) + facet_wrap(~Tissue)
+})
+```
+```{r,fig.width=4,fig.height=3}
+#compare tissue-specific scale factors  This is the right way to do it!
+#this time we use a more conservative list of germline genes
+lapply(names(tissue_sf_comparative_list_conservative_tissue),function(x){
+  mat = Reduce(cbind,tissue_sf_comparative_list_conservative_tissue[[x]])
+  colnames(mat) = names(tissue_sf_comparative_list_conservative_tissue[[x]]);
+  mat = melt(mat)
+  colnames(mat) = c("Sample","Tissue","value");
+  names(mat) = colnames(mat)
+  
+  sf = data.frame(Sample = names(sf_comparitive_list[[x]]), value= sf_comparitive_list[[x]])
+  sf$Tissue = "Whole Body"
+
+  mat = rbind(mat,sf)
+  
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+  
+    
+ #rename resp_disp values to "group1" or "group2"
+strain_levels = as.character(unique(mat$Strain));
+day_levels = as.character(unique(mat$Day));
+temperature_levels = as.character(unique(mat$Temperature));
+food_levels = as.character(unique(mat$Food));
+
+comp_levels = NULL;
+if (length(strain_levels) == 2){
+  comp_levels = strain_levels;
+    col_prefix = "Strain"; 
+}
+if (length(day_levels) == 2){
+  comp_levels = day_levels;
+    col_prefix = "Day"
+}
+if (length(temperature_levels) == 2){
+  comp_levels = temperature_levels;
+    col_prefix = "Temperature"
+}
+if (length(food_levels) == 2){
+  comp_levels = food_levels;
+  col_prefix = "Food"
+}
+if (is.null(comp_levels))
+  return(NULL);
+
+ model = models$ControlGroup1[models$Name == x];
+ control = which(comp_levels == model)
+ if (control != 1)
+   comp_levels = rev(comp_levels);
+ level_colors = c("black","#E2522F")
+ level_labels = comp_levels;
+  names(level_colors) = comp_levels
+  names(level_labels) = comp_levels
+  
+  mat$Tissue = factor(mat$Tissue)
+  mat$Tissue = relevel(mat$Tissue,"Whole Body")
+  
+  mat_norm_to_control = rbindlist(lapply(unique(mat$Tissue),function(x){
+        tmp = mat[mat$Tissue==x,]
+        mn = median(tmp$value[tmp[,col_prefix]==comp_levels[1]])
+        tmp$value = tmp$value/mn;
+        tmp;
+  }))
+  mat[,col_prefix] = factor(mat[,col_prefix],levels=comp_levels)
+
+  
+
+  col = sym(col_prefix);
+  gp1 = ggplot(mat_norm_to_control,aes(y=value,x=Tissue,fill=!!col,color=!!col))+
+    ggdist::stat_gradientinterval(width=.5,position = "dodge") + 
+    geom_hline(yintercept=1,col="gray",lty=2)+
+    xlab("Co-expression Group")+ylab("Size") +ggtitle(x) + 
+    scale_y_continuous(trans="log2", breaks = c(1/256,1/128,1/64,1/32,1/16,1/8,1/4, 1/2,1,2, 4,8,16), labels = c("1/256","1/128","1/64","1/32","1/16","1/8","1/4","1/2", "1", "2","4","8","16"))+
+    scale_fill_manual(name="Group",values=level_colors, aesthetics = c("fill","color"),labels=level_labels,na.value = "pink")+
+    #scale_fill_discrete(name="Group",labels=level_labels,values=level_colors) #+ labs(fill="Group")+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+    
+  
+})
+```
+
+    
+```{r,fig.width=10,fig.height=5}
+#compare tissue-specific scale factors built with group-specific technical factors
+#This is the wrong way to calculate, because we want to normalize each tissue size to the whole-animal size
+#*across* the population.  This isn't confounded like the whole-animal analysis we did before.
+lapply(names(tissue_sf_comparative_list2),function(x){
+  mat = Reduce(cbind,tissue_sf_comparative_list2[[x]])
+  colnames(mat) = names(tissue_sf_comparative_list2[[x]]);
+  mat = melt(mat)
+  colnames(mat) = c("Sample","Tissue","value");
+  names(mat) = colnames(mat)
+  mat = merge(mat,annots[as.character(mat$Sample),.(Sample,Strain,Temperature,Day,Food,Group)],by="Sample")
+
+  print(aggregate(value~Group+Tissue,mat,median))
+  print(aggregate(value~Group+Tissue,mat,min))
+  gp= ggplot(mat,aes(x=log2(value),y=Group,fill=Group)) + xlab("log2 Tissue Scale Factor (whole population)")+ geom_density_ridges(stat = "binline",bins=20,bandwidth = 0.001, alpha = .7,scale = 6,lwd=.5) + facet_wrap(~Tissue)
+})
+```
+
+
+```{r}
+all_tissue_correlations = NULL
+all_tissue_correlation_data = NULL
+gp_sf_pairs <- lapply(names(samples_list), function(grp){
+  lg = lapply(names(samples_list[[grp]]),function(i) {
+    
+    samples <- samples_list[[grp]][[i]]
+    data <- simplify2array(tissue_sf_list_conservative_tissue[[grp]][[i]])
+    data <- apply(data, 2, function(x) exp(log(x) - median(log(x))))
+    
+    limits <- exp(max(abs(range(log(data)))))
+    limits <- c(1/limits, limits)
+    
+    rownames(data) <- samples
+    colnames(data) <- gsub("_", "", colnames(data))
+    colnames(data) <- stringr::str_to_title(colnames(data))
+    tissuenames <- colnames(data)
+    data <- as.data.table(data)
+    data[, Sample := samples]
+    
+    mlt <- as.data.table(melt(data, id.vars = "Sample", value.name = "SizeFactor", variable.name = "Tissue"))
+    
+    pairs <- rbindlist(lapply(seq_len(length(tissuenames)), function(j) {
+      rbindlist(lapply((j+1):length(tissuenames), function(i) {
+        data.table(Sample = data$Sample, Tissue1 = tissuenames[i], Tissue2 = tissuenames[j])
+      }))
+    }))
+    pairs[, Tissue1 := factor(Tissue1, levels = tissuenames)]
+    pairs[, Tissue2 := factor(Tissue2, levels = tissuenames)]
+    # pairs <- CJ(Sample = data$Sample, Tissue1 = tissuenames, Tissue2 = tissuenames)
+    pairs <- pairs[Tissue1 != Tissue2]
+    pairs <- merge(pairs, mlt[, .(Sample, Tissue1 = Tissue, SizeFactor1 = SizeFactor)], 
+                   by = c("Sample", "Tissue1"), allow.cartesian = TRUE)
+    pairs <- merge(pairs, mlt[, .(Sample, Tissue2 = Tissue, SizeFactor2 = SizeFactor)], 
+                   by = c("Sample", "Tissue2"), allow.cartesian = TRUE)
+    pairs$group = grp;
+    pairs$subgroup = i;
+    all_tissue_correlation_data <<- all_tissue_correlation_data
+    all_tissue_correlation_data <<- rbind(pairs,all_tissue_correlation_data)
+    
+    corr <- pairs[, .(Correlation = cor(SizeFactor1, SizeFactor2, method = "s")),
+                  by = .(Tissue1, Tissue2)]
+    corr$group=grp;
+    corr$subgroup = i;
+    all_tissue_correlations <<- all_tissue_correlations
+    all_tissue_correlations <<- rbind(corr,all_tissue_correlations);
+    corr[, Correlation := paste0(round(100 * Correlation, 1), "%")]
+    label <- data.table(Tissue1 = tissuenames, Tissue2 = tissuenames, Tissue = tissuenames)
+    
+    identity_line <- pairs[, .(X = c(1/4, 4), 
+                               Y = c(1/4, 4)),
+                           by = .(Tissue1, Tissue2)]
+
+   # sml = pairs$SizeFactor1 == min(pairs$SizeFactor1);
+    #print(paste(grp,i,paste0(pairs[sml]$Sample," ")))
+    gp = ggplot(pairs, aes(SizeFactor1, SizeFactor2))  +
+      geom_line(aes(X, Y), identity_line) +
+      geom_text(aes(0.3, 4, label = Correlation), data = corr, size = 4) + 
+      facet_grid(Tissue1 ~ Tissue2, drop = FALSE) +
+      geom_text(aes(x = 1, y = 1, label = Tissue), data = label, size = 5) + 
+      geom_smooth(method = "lm", color = "purple", se = FALSE, formula = y ~ x) +
+      geom_point(size=.7, alpha = .5) +
+      # geom_text(aes(x = 1, y = 1, label = Correlation), data = corr, size = 5) + 
+      scale_x_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+      scale_y_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+      xlab("Tissue Specific Size Factors") +
+      ylab("Tissue Specific Size Factors") + ggtitle(paste(grp,i)) +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            strip.text = element_text(size = 8)) +
+      theme(
+        strip.background = element_blank(),
+        strip.text = element_blank())
+    gp;
+  })
+    names(lg) = names(samples_list[[grp]])
+    lg 
+})
+names(gp_sf_pairs) <- names(samples_list)
+```
+
+
+```{r, fig.width=9, fig.height=8}
+gp_sf_pairs
+```
+```{r,fig.width=12,fig.height=12}
+all_effects_all_groups = NULL
+for (grp in names(samples_list)){
+  crm = all_tissue_correlation_data[group == grp,]
+  crm$Tissue1 = as.character(crm$Tissue1)
+  crm$Tissue2 = as.character(crm$Tissue2)
+
+  tissue_pairs = unique(crm[,.(Tissue1,Tissue2)])
+  all_effects = NULL
+  for (i in 1:(dim(tissue_pairs)[1])){
+      cr = crm[Tissue1==tissue_pairs[i,1] & Tissue2==tissue_pairs[i,2],]
+      cr$subgroup = factor(cr$subgroup)
+      cr$subgroup = relevel(cr$subgroup,ref=as.character(cr$subgroup[1]))
+      res = glm(SizeFactor2~SizeFactor1+SizeFactor1:subgroup,cr, family=gaussian("log"))
+     # if (grp=="glp1_d1") stop()
+      resid = residuals(res)
+      sf = cr$SizeFactor1
+     # plot(sf,resid)
+      sm = loess(resid~sf)
+      new_x = seq(min(sf),max(sf),length.out=100)
+     # lines(new_x,predict(sm,newdata=data.frame(sf=new_x)),col="red")
+      stats = data.frame(group=grp, sizefactor_effect = summary(res)$coefficients[2,1],sizefactor_pval = summary(res)$coefficients[2,4],intervention_effect = summary(res)$coefficients[3,1],intervention_pvalue=summary(res)$coefficients[3,4], comp = paste(levels(cr$subgroup),collapse=" vs "),Tissue1=tissue_pairs[i,1],Tissue2=tissue_pairs[i,2])
+      all_effects = rbind(stats,all_effects)
+    
+  }
+  all_effects_all_groups = rbind(all_effects,all_effects_all_groups);
+  identity_line <- crm[, .(X = c(1/4, 4), 
+                           Y = c(1/4, 4)),
+                       by = .(Tissue1, Tissue2)]
+  
+    limits <- exp(max(abs(range(log(crm$SizeFactor1))),abs(range(log(crm$SizeFactor2)))))
+    limits <- c(1/limits, limits)
+    
+   ggp =ggplot(crm, aes(SizeFactor1, SizeFactor2))  +
+      geom_line(aes(X, Y), identity_line) +
+   #   geom_text(aes(0.3, 4, label = paste("p=",round(intervention_pvalue,3))), data = all_effects, size = 4) + 
+      facet_grid(Tissue1 ~ Tissue2, drop = FALSE) +
+      #geom_text(aes(x = 1, y = 1, label = Tissue), data = label, size = 5) + 
+      geom_smooth(aes(color=subgroup),method = "lm", se = FALSE, formula = y ~ x) +
+      geom_point(aes(color=subgroup),size=.7, alpha = .5) +
+      # geom_text(aes(x = 1, y = 1, label = Correlation), data = corr, size = 5) + 
+      scale_x_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+      scale_y_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+      xlab("Tissue Specific Size Factors") +
+      ylab("Tissue Specific Size Factors") + ggtitle(grp) +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            strip.text = element_text(size = 8))# +
+     # theme(
+     #   strip.background = element_blank(),
+     #   strip.text = element_blank())
+   plot(ggp)
+}
+```
+
+```{r}
+#same thing but with a more conservative tissue-specific gene  list
+all_tissue_correlations_conservative_genelist = NULL
+gp_sf_pairs_conservative_genelist <- lapply(names(samples_list), function(grp){
+  lg = lapply(names(samples_list[[grp]]),function(i) {
+    
+    samples <- samples_list[[grp]][[i]]
+    data <- simplify2array(tissue_sf_list_conservative_tissue[[grp]][[i]])
+    data <- apply(data, 2, function(x) exp(log(x) - median(log(x))))
+    
+    limits <- exp(max(abs(range(log(data)))))
+    limits <- c(1/limits, limits)
+    
+    rownames(data) <- samples
+    colnames(data) <- gsub("_", "", colnames(data))
+    colnames(data) <- stringr::str_to_title(colnames(data))
+    tissuenames <- colnames(data)
+    data <- as.data.table(data)
+    data[, Sample := samples]
+    
+    mlt <- as.data.table(melt(data, id.vars = "Sample", value.name = "SizeFactor", variable.name = "Tissue"))
+    
+    pairs <- rbindlist(lapply(seq_len(length(tissuenames)), function(j) {
+      rbindlist(lapply((j+1):length(tissuenames), function(i) {
+        data.table(Sample = data$Sample, Tissue1 = tissuenames[i], Tissue2 = tissuenames[j])
+      }))
+    }))
+    pairs[, Tissue1 := factor(Tissue1, levels = tissuenames)]
+    pairs[, Tissue2 := factor(Tissue2, levels = tissuenames)]
+    # pairs <- CJ(Sample = data$Sample, Tissue1 = tissuenames, Tissue2 = tissuenames)
+    pairs <- pairs[Tissue1 != Tissue2]
+    pairs <- merge(pairs, mlt[, .(Sample, Tissue1 = Tissue, SizeFactor1 = SizeFactor)], 
+                   by = c("Sample", "Tissue1"), allow.cartesian = TRUE)
+    pairs <- merge(pairs, mlt[, .(Sample, Tissue2 = Tissue, SizeFactor2 = SizeFactor)], 
+                   by = c("Sample", "Tissue2"), allow.cartesian = TRUE)
+    
+    corr <- pairs[, .(Correlation = cor(SizeFactor1, SizeFactor2, method = "s")),
+                  by = .(Tissue1, Tissue2)]
+    corr$group=grp;
+    corr$subgroup = i;
+    all_tissue_correlations_conservative_genelist <<- all_tissue_correlations_conservative_genelist
+    all_tissue_correlations_conservative_genelist <<- rbind(corr,all_tissue_correlations_conservative_genelist);
+    corr[, Correlation := paste0(round(100 * Correlation, 1), "%")]
+    label <- data.table(Tissue1 = tissuenames, Tissue2 = tissuenames, Tissue = tissuenames)
+    
+    identity_line <- pairs[, .(X = c(1/4, 4), 
+                               Y = c(1/4, 4)),
+                           by = .(Tissue1, Tissue2)]
+   # sml = pairs$SizeFactor1 == min(pairs$SizeFactor1);
+    #print(paste(grp,i,paste0(pairs[sml]$Sample," ")))
+    ggplot(pairs, aes(SizeFactor1, SizeFactor2))  +
+      geom_line(aes(X, Y), identity_line) +
+      geom_text(aes(0.3, 4, label = Correlation), data = corr, size = 4) + 
+      facet_grid(Tissue1 ~ Tissue2, drop = FALSE) +
+      geom_text(aes(x = 1, y = 1, label = Tissue), data = label, size = 5) + 
+      geom_smooth(method = "lm", color = "purple", se = FALSE, formula = y ~ x) +
+      geom_point(size=.7, alpha = .5) +
+      # geom_text(aes(x = 1, y = 1, label = Correlation), data = corr, size = 5) + 
+      scale_x_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+      scale_y_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+      xlab("Tissue Specific Size Factors") +
+      ylab("Tissue Specific Size Factors") + ggtitle(paste(grp,i)) +
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            strip.text = element_text(size = 8)) +
+      theme(
+        strip.background = element_blank(),
+        strip.text = element_blank())
+  })
+  names(lg) = names(samples_list[[grp]])
+  lg 
+})
+names(gp_sf_pairs_conservative_genelist) <- names(samples_list)
+```
+
+
+```{r, fig.width=9, fig.height=8}
+gp_sf_pairs_conservative_genelist
+```
+
+```{r}
+#compare correlations across conditions
+grp <- as.data.frame(all_tissue_correlations);
+grp$foo <- grp$group;
+for(group in unique(grp$group)){
+  g <- grp[which(grp$foo == group),]
+  plot( ggplot(g,aes(x=subgroup,y=Correlation,color=subgroup))+geom_point()+ theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1))+facet_grid(Tissue1 ~ Tissue2,scales = "free_x") + ggtitle(group))
+}
+```
+
+```{r}
+if (0){
+  ggsave(filename = paste0("../figures/main_figure_4/tissue_specific_rnai_size_factors_", "n2_d8", ".pdf"), 
+         plot = gp_sf_pairs$n2_d8,
+         width = 9, height = 8)
+  
+  ggsave(filename = paste0("../figures/sup_figure_7/tissue_specific_rnai_size_factors_", "daf2_d8", ".pdf"),
+         plot = gp_sf_pairs$daf2_d8,
+         width = 9, height = 8)
+  
+  ggsave(filename = paste0("../figures/sup_figure_4/tissue_specific_rnai_size_factors_", "n2_d1", ".pdf"),
+         plot = gp_sf_pairs$n2_d1,
+         width = 9, height = 8)
+  
+  
+  ggsave(filename = paste0("../figures/sup_figure_7/tissue_specific_rnai_size_factors_", "daf2_d1", ".pdf"),
+         plot = gp_sf_pairs$daf2_d1,
+         width = 9, height = 8)
+}
+```
+
+## Graph
+
+```{r}
+sf_graphs <- lapply(names(samples_list), function(grp){
+  lg = lapply(names(samples_list[[grp]]),function(i) {
+  
+  data <- simplify2array(tissue_sf_list[[grp]][[i]])
+  data <- apply(data, 2, function(x) exp(log(x) - median(log(x))))
+  
+  rownames(data) <- samples_list[[grp]][[i]]
+  colnames(data) <- gsub("_", "", colnames(data))
+  colnames(data) <- stringr::str_to_title(colnames(data))
+  tissuenames <- colnames(data)
+  
+  data <- cor(data, method = "s")
+  
+  g <- graph_from_adjacency_matrix(data, mode = "undirected", weighted = TRUE, diag = FALSE)
+  E(g)$scaled_weight <- 1/((E(g)$weight- min(E(g)$weight)+.1)/(max(E(g)$weight)-min(E(g)$weight)))
+
+  g})
+  names(lg) = names(samples_list[[grp]])
+  lg
+})
+names(sf_graphs) <- names(samples_list)
+```
+
+```{r, fig.width=9, fig.height=9}
+for (grp in names(sf_graphs)) {
+  for (gn in names(sf_graphs[[grp]])) {
+    g = sf_graphs[[grp]][[gn]]
+  par_default <- par()
+  par(mar = c(0, 0, 0, 0))
+  plot(g,
+       layout = graphlayouts::layout_with_stress(g,weights = E(g)$scaled_weight),
+       vertex.label.color = "white",
+       vertex.color = tissue_colors,
+       edge.label.color = "black",
+       vertex.label.cex=.9, 
+       edge.label=round(100*E(g)$weight,1),
+       vertex.shape="circle",
+       vertex.size = 55,
+       edge.width=10*1/E(g)$scaled_weight)
+  title(paste(grp,gn))
+  par(par_default)
+  }
+}
+```
+
+```{r}
+par_default <- par()
+par(mar = c(0, 0, 0, 0))
+
+pdf("../figures/main_figure_4/tissue_specific_rnai_size_factors_graph_n2_d8.pdf", width = 9, height = 9)
+plot(sf_graphs$n2_d8,
+     layout = graphlayouts::layout_with_stress(g,weights = E(g)$scaled_weight),
+     vertex.label.color = "white",
+     vertex.color = tissue_colors,
+     edge.label.color = "black",
+     edge.label=round(E(g)$weight,2),
+     vertex.label.cex=.9, 
+     vertex.shape="circle",
+     vertex.size = 55,
+     edge.width=10*1/E(sf_graphs$n2_d8)$scaled_weight)
+dev.off()
+
+par(par_default)
+```
+
+## Overdispersion
+
+```{r}
+disp_tissue <- lapply(names(samples_list), function(i) {
+  
+  x <- counts_list[[i]]
+  
+  sub_annots <- annots[colnames(x), on = "Sample"]
+ # sub_annots[, BiologicalReplicate := droplevels(BiologicalReplicate)]
+  
+  if (length(unique(sub_annots$BiologicalReplicate)) == 1) {
+    form <- ~ 1
+  } else {
+    form <- ~ BiologicalReplicate
+  }
+  
+  joint_dds <- suppressMessages(runDESeq(counts = x[rownames(x) %in% names(tissues), ],
+                                         annots = sub_annots, 
+                                         formula = form, 
+                                         nf = nf_list[[i]],
+                                         nb_test = FALSE))
+  joint_disp_df <- data.table(GeneName = rownames(joint_dds), StandardDisp = DESeq2::dispersions(joint_dds))
+  
+  tissue_disp <- lapply(unique(tissues), function(tissue) {
+    genes <- unique(names(tissues)[tissues == tissue])
+    dds <- suppressMessages(runDESeq(counts = x[rownames(x) %in% genes, ],
+                                     annots = sub_annots, 
+                                     nf = tissue_nf_list[[i]][[tissue]], 
+                                     formula = form, 
+                                     nb_test = FALSE))
+    setNames(DESeq2::dispersions(dds), rownames(dds))
+  })
+  tissue_disp <- unlist(tissue_disp)
+  tissue_disp_df <- data.table(GeneName = names(tissue_disp), TissueDisp = tissue_disp)
+  merge(tissue_disp_df, joint_disp_df, by = "GeneName")
+})
+names(disp_tissue) <- names(samples_list)
+```
+
+```{r}
+gp_disp_tissue <- lapply(disp_tissue, function(ggdf) {
+  ggdf <- merge(ggdf, tissues_df, by = "GeneName")
+  ggdf[, Tissue := stringr::str_to_title(gsub("_", " ", Tissue))]
+  
+  ggplot(ggdf, aes(TissueDisp, StandardDisp)) +
+    geom_point(aes(color = Tissue), alpha = .7) +
+    scale_color_manual(name = NULL, values = as.character(tissue_colors)) + 
+    geom_smooth() +
+    scale_x_log10() +
+    scale_y_log10() +
+    geom_abline() +
+    xlab("Overdispersion\nTissue Specific Normalization") +
+    ylab("Overdispersion\nStandard Normalization Factor") +
+    theme(legend.position = "top")
+})
+gp_disp_tissue
+```
+
+```{r}
+ggsave(paste0("../figures/sup_figure_4/tissue_specific_rnai_dispersion_", "n2_d8", ".pdf"), 
+       gp_disp_tissue$n2_d8, width = 7, height = 6)
+```
+
+## Correlation matrices
+
+```{r}
+tissues_list <- tapply(names(tissues), tissues, function(x) x)
+names(tissues_list) <- stringr::str_replace(names(tissues_list), "_", " ")
+names(tissues_list) <- Hmisc::capitalize(names(tissues_list))
+
+sel_genes_list <- lapply(names(counts_list), function(y)lapply(counts_list[[y]],function(x) 
+  intersect(names(which(rowMeans(x) >= 30)), names(tissues)))
+names(sel_genes_list) = names(counts_list)
+
+rho_list <- lapply(names(samples_list), function(y){
+  lg = lapply(names(samples_list[[y]]),function(i)cor(t(norm_list[[y]][[i]][sel_genes_list[[y]][[i]], ]), method = "s"))
+  names(lg) = names(samples_list[[y]]);
+})
+names(rho_list) <- names(samples_list)
+##fix below
+tissue_rho_list <- lapply(names(samples_list), function(y){
+  function(i) 
+  cor(t(tissue_norm_list[[i]][sel_genes_list[[i]], ]), method = "s"))
+names(tissue_rho_list) <- names(samples_list)
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(rho_list$n2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_standard_normalization_heatmap_n2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(rho_list$daf2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_standard_normalization_heatmap_daf2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(tissue_rho_list$n2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_normalization_heatmap_n2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(tissue_rho_list$daf2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_normalization_heatmap_daf2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+## Simulation
+
+```{r}
+mu_hat <- log(rowMeans(germsoma_norm_list$n2_d8))
+mu_hat <- mu_hat[mu_hat > log(30)]
+ngenes <- 100
+
+Sigma_epsilon <- diag(ngenes)
+Sigma_epsilon[lower.tri(Sigma_epsilon)] <- rnorm(sum(lower.tri(Sigma_epsilon)), 0, 0.001)
+Sigma_epsilon[upper.tri(Sigma_epsilon)] <- t(Sigma_epsilon[lower.tri(Sigma_epsilon)])
+
+sim <- doSim(ngenes = ngenes, 
+             nsamples = 1000,
+             mu_mean = mean(mu_hat),
+             mu_sd = sd(mu_hat),
+             Sigma_epsilon = Sigma_epsilon, 
+             Sigma_omega = cor(simplify2array(germsoma_sf_list$n2_d8)[colnames(germsoma_norm_list$n2_d8), ]))
+
+sim$tissues_list <- list(`Germ line` = paste0("Gene", which(sim$p == 1)), 
+                         Soma = paste0("Gene", which(sim$p == 0)))
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(cor(t(sim$norm1), method = "s"), split_list = sim$tissues_list, 
+                                  colors = germsoma_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_standard_normalization_heatmap_simulation.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(cor(t(sim$norm2), method = "s"), split_list = sim$tissues_list, 
+                                  colors = germsoma_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_tissue_normalization_heatmap_simulation.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+

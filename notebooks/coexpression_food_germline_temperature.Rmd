@@ -1,0 +1,2017 @@
+---
+title: "Gene Variability"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+#library(BASiCS)
+library(dendextend)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+require(scales)
+library(RColorBrewer)
+library(gridExtra)
+theme_set(theme_cowplot())
+
+source("../scripts/notebooks_helpers/gene_variability.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/basics.R")
+source("../scripts/helpers/clustering.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/notebooks_helpers/gene_network.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-4 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+cluster_colors <- c("firebrick", "sienna1", "cornflowerblue", "darkorchid", "black")
+```
+
+## Load data
+
+### Gene names
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+### Set up model comparison structures to guide analysis
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+
+#model_names = c("d8_glp1","d1_glp1","d8_UV","d1_UV","d_UV","d8_20v25C","d1_20v25C","n2_sw","daf2_sw","d1_sw","d8_sw","d_25C","n2_series_all")
+#make a list of which samples match up to each subgroup (biological covariate group)
+```
+#load counts
+```{r}
+sw <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+  annotations = sw$annots;
+  samples_list = lapply(model_names,function(group){
+    print(group)
+    cur_annots = sw$annots[eval(parse(text=models$Subset[models$Name == group])),]
+    subgroup_vals = as.character(as.data.frame(cur_annots)[,models$BiologicalCovariates[models$Name == group]])
+   # browser()
+    subgroups = unique(subgroup_vals)
+    res = lapply(subgroups,function(subgroup){
+        cur_annots$Sample[subgroup_vals == subgroup]
+    }) 
+    names(res) = subgroups
+    res
+  })
+  names(samples_list) = model_names;
+if (0){#load raw counts
+  # counts_list <- sapply(samples_list, function(samples) sw$counts[, samples])
+  counts_list <- lapply(names(samples_list),function(x){
+      res = lapply(names(samples_list[[x]]),function(y){
+          sw$counts[, colnames(sw$counts)%in% samples_list[[x]][[y]]]
+      })
+      names(res) = names(samples_list[[x]])
+      res;
+  })
+  names(counts_list) = names(samples_list)
+  rm(sw)
+}else{#load batch-corrected counts
+  rm(sw)
+  bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds") 
+  counts_list <- lapply(model_names,function(x){
+      res = lapply(names(samples_list[[x]]),function(y){
+ 
+         bc$batch_counts_list[[x]][, colnames(bc$batch_counts_list[[x]])%in% samples_list[[x]][[y]]]
+    })
+    names(res) = names(samples_list[[x]])
+    res;
+  })
+  names(counts_list) = model_names
+  rm(bc)
+}
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+#normalize each tissue indepenently
+tissue_norm_list <- lapply(model_names, function(group) {
+      ret = lapply(counts_list[[group]],function(x){
+        k <- normalizationFactorTissueSpecific(x, tissues,annotations[Sample %in% colnames(x)]$Group)
+        ret = normalizeCountsTissueSpecific(x, k, tissues)
+        ret;
+      })
+      names(ret) = names(counts_list[[group]])
+      ret;
+})
+names(tissue_norm_list) = model_names;
+```
+
+
+#filter counts to genes expressed at a minimum level in both covariate groups
+```{r}
+min_mu = 20
+# select genes with high mean
+intersect_genes <-lapply(tissue_norm_list, function(x) Reduce(intersect,lapply(x,rownames)))
+names(intersect_genes) = names(tissue_norm_list)
+
+mu_list <- lapply(names(tissue_norm_list), function(group) lapply(names(tissue_norm_list[[group]]),function(subgroup){ 
+  apply(tissue_norm_list[[group]][[subgroup]][intersect_genes[[group]], ], 1, mean)}))
+names(mu_list) = names(tissue_norm_list)
+
+select_genes <- lapply(mu_list,function(x)names(which(rowMeans(simplify2array(x)) > min_mu)))
+names(select_genes)= names(tissue_norm_list)
+
+filter_tissue_norm_list <- lapply(names(tissue_norm_list), function(group){
+    ret = lapply(names(tissue_norm_list[[group]]),function(subgroup)tissue_norm_list[[group]][[subgroup]][select_genes[[group]], ])
+    names(ret) = names(tissue_norm_list[[group]])
+    ret;
+    })
+names(filter_tissue_norm_list)= names(tissue_norm_list)
+
+```
+
+#calculate correlation matricies
+```{r}
+filter_tissue_rho_list <- lapply(filter_tissue_norm_list, function(x) lapply(x,function(y)cor(t(y), method = "s")))
+names(filter_tissue_rho_list)= names(filter_tissue_norm_list)
+
+filter_tissue_combined_rho_list <- lapply(filter_tissue_norm_list, function(x){ 
+                                          y = do.call("cbind",x);
+                                          cor(t(y), method = "s")})
+names(filter_tissue_combined_rho_list)= names(filter_tissue_norm_list)
+```
+
+#Plot each heatmap
+```{r}
+if (0){
+source("../scripts/helpers/heatmap.r")
+lapply(names(filter_tissue_rho_list),function(group)lapply(names(filter_tissue_rho_list[[group]]),function(subgroup){
+
+  rho = filter_tissue_rho_list[[group]][[subgroup]]
+  setkey(tissues_df,GeneName)
+  cur_tissue = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+  names(cur_tissue) = unique(tissues)
+    gp <- plotSplitCorrelationHeatmap(rho, 
+                                      cur_tissue, 
+                                      colors = tissue_colors,
+                                      name = paste(group,subgroup))
+
+    draw(gp)
+}))
+}
+
+```
+
+
+
+```{r}
+gene_variability_da = fread("../data/gene_variability/intervention_variance_changes.csv.gz")
+model_to_use = "n2_sw"
+p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model_to_use,"_shared_tech.csv.gz"))  
+if (!("Food" %in% names(p))) p[,Food:=""]
+if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+p$model = model_to_use
+params_single_df = p
+  
+
+```
+
+```{r}
+aging_da = gene_variability_da[model==model_to_use]
+#genes_that_dont_change_mean = aging_da[var_effect==".",GeneName]
+genes_to_use = intersect(aging_da$GeneName,params_single_df$GeneName)
+
+gp1_counts = counts_list[["d8_glp1"]] 
+gp1_norm_counts = lapply(gp1_counts,function(x){
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+
+gp1_shuffled_norm_counts = lapply((gp1_counts),function(x){
+      for (i in 1:nrow(x))
+        x[i,] = x[i,sample(1:ncol(x),ncol(x))]  
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+names(gp1_shuffled_norm_counts) = paste0(names(gp1_shuffled_norm_counts),"_shuffled")
+gp1_norm_counts = c(gp1_norm_counts,gp1_shuffled_norm_counts)
+glp1_norm_counts = gp1_norm_counts
+
+if (0){
+names(gp1_norm_counts) = names(gp1_counts)
+glp1_norm_counts[["sim"]] = as.matrix(rbindlist(lapply(genes_to_use,function(g){
+  dat = params_single_df[GeneName==g & Day==8,]
+  data.frame(t(rnbinom(n=500,mu=2^dat$LogMean,size=1/2^(dat$LogDisp))))
+})))
+rownames(glp1_norm_counts[["sim"]]) = genes_to_use
+}
+
+min_mu = 20
+# select genes with high mean
+gn = function(x,y){print(paste(x,y));intersect(rownames(x),rownames(y))}
+intersect_genes = rownames(glp1_norm_counts[[1]])
+for (i in 1:length(glp1_norm_counts))
+  intersect_genes = intersect(intersect_genes,rownames(glp1_norm_counts[[i]]))
+
+mu_list <- sapply(names(glp1_norm_counts),function(subgroup){ 
+  apply(glp1_norm_counts[[subgroup]][intersect_genes, ], 1, mean)
+})
+colnames(mu_list) = names(glp1_norm_counts)
+
+select_genes <- rownames(mu_list)[apply(mu_list,1,function(x)mean(x) > min_mu)]
+
+glp1_filter_norm_list  = lapply(names(glp1_norm_counts),function(subgroup)glp1_norm_counts[[subgroup]][select_genes, ])
+names(glp1_filter_norm_list) = names(glp1_norm_counts)
+
+
+glp1_cor = lapply(glp1_filter_norm_list,function(x){
+ #sim_tmp = do.call("cbind",x);
+  cor(t(x), method = "s")
+})
+
+names(glp1_cor) = names(glp1_filter_norm_list)
+
+```
+```{r}
+genes_to_use_2 = intersect(genes_to_use,select_genes)
+
+  setkey(aging_da,GeneName)
+all_dat = rbindlist(lapply(names(glp1_cor),function(grp){
+  g = glp1_cor[[grp]][genes_to_use_2,genes_to_use_2];
+  g[diag(g)] = NA;
+  cv_focused = as.data.table(melt(g))
+  cv_focused = cv_focused[!is.na(value)]
+  cv_focused$change_1 = aging_da[as.character(cv_focused$Var1),var_effect,]
+  cv_focused$change_2 = aging_da[as.character(cv_focused$Var2),var_effect,]
+  cv_focused$grp = grp
+  cv_focused[sample(1:nrow(cv_focused),nrow(cv_focused)/100),]
+}))
+
+all_dat[,change_type := ifelse(change_1=="." & change_2==".","neither",ifelse(change_1!="." & change_2!=".","one","both"))]
+
+tp = all_dat[change_1=="." & change_2==".",][sample(1:nrow(all_dat),1000000),]
+tp[,label := factor(ifelse(grp=="QZ0","wild type",ifelse(grp=="CB4037","glp-1(e2141)",
+                    ifelse(grp=="QZ0_shuffled","random matrix (wt)",
+                    ifelse(grp=="CB4037_shuffled","random matrix (glp1)",NA))))
+                    ,
+                    levels=c("wild type","glp-1(e2141)","random matrix (wt)","random matrix (glp1)"))]
+colors = c("wild type"="#F8766D","glp-1(e2141)"="#00BA38","random matrix (wt)"="black","random matrix (glp1)"="dark gray")
+lty = c(`wild type`="solid",`glp-1(e2141)`="solid",`random matrix (wt)`="solid",`random matrix (glp1)`="dash")
+lty = c(`wild type`=1,`glp-1(e2141)`=1,`random matrix (wt)`=1,`random matrix (glp1)`=2)
+ggplot(tp[grp != "QZ0_shuffled",],aes(x=value,color=label,fill=label))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(-1,1)+geom_vline(xintercept=0,lwd=1,col="dark gray",lty=2)+xlab("Corrleation between gene-pairs")+scale_color_manual(values=colors)+scale_linetype_manual(values=lty)
+ggsave("../figures/02/glp1_correlation_effect.pdf",width=5,height=3)
+ggplot(tp,aes(x=abs(value),color=label,fill=label,linetype=label))+stat_ecdf(lwd=1) + xlim(0,1)+xlab("Correlation Magnitude\nbetween gene-pairs")+scale_color_manual(values=colors)+scale_linetype_manual(values=lty)
+ggsave("../figures/02/glp1_correlation_effect_inset.pdf",width=5,height=3)
+#ggplot(tp,aes(x=abs(value),color=grp,fill=grp))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(0,1)
+
+```
+
+```{r}
+gp1_counts = counts_list[["d8_sw"]] 
+gp1_norm_counts = lapply(gp1_counts,function(x){
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+
+gp1_shuffled_norm_counts = lapply((gp1_counts),function(x){
+      for (i in 1:nrow(x))
+        x[i,] = x[i,sample(1:ncol(x),ncol(x))]  
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+names(gp1_shuffled_norm_counts) = paste0(names(gp1_shuffled_norm_counts),"_shuffled")
+gp1_norm_counts = c(gp1_norm_counts,gp1_shuffled_norm_counts)
+glp1_norm_counts = gp1_norm_counts
+
+if (0){
+names(gp1_norm_counts) = names(gp1_counts)
+glp1_norm_counts[["sim"]] = as.matrix(rbindlist(lapply(genes_to_use,function(g){
+  dat = params_single_df[GeneName==g & Day==8,]
+  data.frame(t(rnbinom(n=500,mu=2^dat$LogMean,size=1/2^(dat$LogDisp))))
+})))
+rownames(glp1_norm_counts[["sim"]]) = genes_to_use
+}
+
+min_mu = 20
+# select genes with high mean
+gn = function(x,y){print(paste(x,y));intersect(rownames(x),rownames(y))}
+intersect_genes = rownames(glp1_norm_counts[[1]])
+for (i in 1:length(glp1_norm_counts))
+  intersect_genes = intersect(intersect_genes,rownames(glp1_norm_counts[[i]]))
+
+mu_list <- sapply(names(glp1_norm_counts),function(subgroup){ 
+  apply(glp1_norm_counts[[subgroup]][intersect_genes, ], 1, mean)
+})
+colnames(mu_list) = names(glp1_norm_counts)
+
+select_genes <- rownames(mu_list)[apply(mu_list,1,function(x)mean(x) > min_mu)]
+
+glp1_filter_norm_list  = lapply(names(glp1_norm_counts),function(subgroup)glp1_norm_counts[[subgroup]][select_genes, ])
+names(glp1_filter_norm_list) = names(glp1_norm_counts)
+
+
+glp1_cor = lapply(glp1_filter_norm_list,function(x){
+ #sim_tmp = do.call("cbind",x);
+  cor(t(x), method = "s")
+})
+
+names(glp1_cor) = names(glp1_filter_norm_list)
+aging_da = gene_variability_da[model==model_to_use]
+#genes_that_dont_change_mean = aging_da[var_effect==".",GeneName]
+genes_to_use = intersect(aging_da$GeneName,params_single_df$GeneName)
+genes_to_use_2 = intersect(genes_to_use,select_genes)
+
+  setkey(aging_da,GeneName)
+all_dat = rbindlist(lapply(names(glp1_cor),function(grp){
+  g = glp1_cor[[grp]][genes_to_use_2,genes_to_use_2];
+  g[diag(g)] = NA;
+  cv_focused = as.data.table(melt(g))
+  cv_focused = cv_focused[!is.na(value)]
+  cv_focused$change_1 = aging_da[as.character(cv_focused$Var1),var_effect,]
+  cv_focused$change_2 = aging_da[as.character(cv_focused$Var2),var_effect,]
+  cv_focused$grp = grp
+  cv_focused[sample(1:nrow(cv_focused),nrow(cv_focused)/100),]
+}))
+
+all_dat[,change_type := ifelse(change_1=="." & change_2==".","neither",ifelse(change_1!="." & change_2!=".","one","both"))]
+
+tp = all_dat[change_1=="." & change_2==".",][sample(1:nrow(all_dat),1000000),]
+tp[,label := factor(ifelse(grp=="QZ0","wild type",ifelse(grp=="QZ120","daf-2(e1368)",
+                    ifelse(grp=="QZ0_shuffled","random matrix (wt)",
+                    ifelse(grp=="QZ120_shuffled","random matrix (daf-2)",NA))))
+                    ,
+                    levels=c("wild type","daf-2(e1368)","random matrix (wt)","random matrix (daf-2)"))]
+colors = c("wild type"="#F8766D","daf-2(e1368)"="#00BA38","random matrix (wt)"="black","random matrix (daf-2)"="dark gray")
+lty = c(`wild type`="solid",`daf-2(e1368)`="solid",`random matrix (wt)`="solid",`random matrix (daf-2)`="dash")
+lty = c(`wild type`=1,`daf-2(e1368)`=1,`random matrix (wt)`=1,`random matrix (daf-2)`=2)
+ggplot(tp,aes(x=value,color=label,fill=label))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(-1,1)+geom_vline(xintercept=0,lwd=1,col="dark gray",lty=2)+xlab("Corrleation between gene-pairs")+scale_color_manual(values=colors)+scale_linetype_manual(values=lty)+scale_fill_manual(values=colors)
+#ggsave("../figures/02/glp1_correlation_effect.pdf",width=5,height=3)
+ggplot(tp,aes(x=abs(value),color=label,fill=label,linetype=label))+stat_ecdf(lwd=1) + xlim(0,1)+xlab("Correlation Magnitude\nbetween gene-pairs")+scale_color_manual(values=colors)+scale_fill_manual(values=colors)+scale_linetype_manual(values=lty)
+#ggsave("../figures/02/glp1_correlation_effect_inset.pdf",width=5,height=3)
+#ggplot(tp,aes(x=abs(value),color=grp,fill=grp))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(0,1)
+
+```
+#plot PCAs of each group
+```{r}
+to_plot = names(counts_list)
+to_plot = to_plot[!to_plot %in% c("n2_series_all","d8_HT115","d1_n2","d8_n2","n2_sw")]
+to_plot = "d1_sw"
+lapply(to_plot,function(model){ 
+    gp1_counts = counts_list[[model]] 
+     print(paste(model,paste(dim(gp1_counts),collapse=",")))
+    gp1_norm_counts = lapply(gp1_counts,function(x){
+          nf = normalizationFactor(x)
+          normalizeCounts(x,nf)
+    }) 
+    names(gp1_norm_counts)= names(gp1_counts)
+    lapply( names(gp1_norm_counts),function(grp){
+     
+      x = gp1_norm_counts[[grp]];
+      abundant_genes = names(which(rowMeans(x)>25))
+      x <- x[abundant_genes, ]
+      #x <- x[apply(x,1,function(x)!any(x < 30)), ]
+        pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+      
+      scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+      scores_df <- merge(scores_df, annotations[colnames(x)], by = "Sample")
+
+      
+      loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+      
+      vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+      
+      ggplot(scores_df, aes(PC1, PC2,label=Sample)) +
+        geom_point(size = 2) +
+        scale_y_log10() + 
+        xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+        ylab(paste0("Principal Component 2 (", vp[2], "%)")) + 
+        geom_text_repel() + 
+        theme(legend.position = "top") + ggtitle(paste(model,grp))
+    })
+  })
+  
+``` 
+    
+    
+```{r}
+library(rms)
+library(ns.survival.code)
+to_plot = names(counts_list)
+plot_all = F;
+make_suppl_figure = !plot_all;
+if (plot_all){
+to_plot = to_plot[!to_plot %in% c("n2_series_all","d8_HT115")]
+}else{
+to_plot = c("d1_sw","d8_sw","d1_20v25C","d8_20v25C","d1_UV","d8_UV","d8_glp1","n2_sw")
+subfigures = list()
+}
+cov_stats = lapply(to_plot,function(model){
+   
+    gp1_counts = counts_list[[model]] 
+     print(paste(model,paste(dim(gp1_counts),collapse=",")))
+    gp1_norm_counts = lapply(gp1_counts,function(x){
+          nf = normalizationFactor(x)
+          normalizeCounts(x,nf)
+    })
+    
+    gp1_shuffled_norm_counts = lapply((gp1_counts),function(x){
+          for (i in 1:nrow(x))
+            x[i,] = x[i,sample(1:ncol(x),ncol(x))]  
+          nf = normalizationFactor(x)
+          normalizeCounts(x,nf)
+    })
+    names(gp1_shuffled_norm_counts) = paste0(names(gp1_shuffled_norm_counts),"_shuffled")
+    gp1_norm_counts = c(gp1_norm_counts,gp1_shuffled_norm_counts)
+    glp1_norm_counts = gp1_norm_counts
+    
+    if (0){
+    names(gp1_norm_counts) = names(gp1_counts)
+    glp1_norm_counts[["sim"]] = as.matrix(rbindlist(lapply(genes_to_use,function(g){
+      dat = params_single_df[GeneName==g & Day==8,]
+      data.frame(t(rnbinom(n=500,mu=2^dat$LogMean,size=1/2^(dat$LogDisp))))
+    })))
+    rownames(glp1_norm_counts[["sim"]]) = genes_to_use
+    }
+    
+    min_mu = 20
+    # select genes with high mean
+    gn = function(x,y){print(paste(x,y));intersect(rownames(x),rownames(y))}
+    intersect_genes = rownames(glp1_norm_counts[[1]])
+    for (i in 1:length(glp1_norm_counts))
+      intersect_genes = intersect(intersect_genes,rownames(glp1_norm_counts[[i]]))
+    
+    mu_list <- sapply(names(glp1_norm_counts),function(subgroup){ 
+      apply(glp1_norm_counts[[subgroup]][intersect_genes, ], 1, mean)
+    })
+    colnames(mu_list) = names(glp1_norm_counts)
+    
+    select_genes <- rownames(mu_list)[apply(mu_list,1,function(x)mean(x) > min_mu)]
+    
+    glp1_filter_norm_list  = lapply(names(glp1_norm_counts),function(subgroup)glp1_norm_counts[[subgroup]][select_genes, ])
+    names(glp1_filter_norm_list) = names(glp1_norm_counts)
+    
+    if (0){
+    glp1_cor = lapply(glp1_filter_norm_list,function(x){
+     #sim_tmp = do.call("cbind",x);
+      cor(t(x), method = "s")
+    })
+    
+    names(glp1_cor) = names(glp1_filter_norm_list)
+    aging_da = gene_variability_da[model==model_to_use]
+    #genes_that_dont_change_mean = aging_da[var_effect==".",GeneName]
+    genes_to_use = intersect(aging_da$GeneName,params_single_df$GeneName)
+    genes_to_use_2 = intersect(genes_to_use,select_genes)
+    
+      setkey(aging_da,GeneName)
+    all_dat = rbindlist(lapply(names(glp1_cor),function(grp){
+      g = glp1_cor[[grp]][genes_to_use_2,genes_to_use_2];
+      g[diag(g)] = NA;
+      cv_focused = as.data.table(melt(g))
+      cv_focused = cv_focused[!is.na(value)]
+      cv_focused$change_1 = aging_da[as.character(cv_focused$Var1),var_effect,]
+      cv_focused$change_2 = aging_da[as.character(cv_focused$Var2),var_effect,]
+      cv_focused$grp = grp
+      cv_focused[sample(1:nrow(cv_focused),nrow(cv_focused)/100),]
+    }))
+    }
+    aging_da = gene_variability_da[model==model_to_use]
+    #genes_that_dont_change_mean = aging_da[var_effect==".",GeneName]
+    genes_to_use = intersect(aging_da$GeneName,params_single_df$GeneName)
+    genes_to_use_2 = intersect(genes_to_use,select_genes)
+    
+    all_dat = rbindlist(lapply(names(glp1_filter_norm_list),function(grp){
+      m = cor(t(glp1_filter_norm_list[[grp]][genes_to_use_2,]), method = "s")
+      #take a random 1% of all correlations, otherwise the calculation gets too slow.
+      x=sample.int(n=nrow(m)*ncol(m),size=nrow(m)*ncol(m)/1000,replace=F)-1
+      print(length(x))
+      x_i = x%%nrow(m)+1
+      x_j = floor(x/nrow(m))+1
+      not_diago = x_i != x_j#remove diagonal
+      x= x[not_diago] 
+      x_i= x_i[not_diago] 
+      x_j= x_j[not_diago] 
+      data.frame(value=m[x],Var1=factor(rownames(m)[x_i],levels=genes_to_use_2),Var2=factor(colnames(m)[x_j],levels=genes_to_use_2),grp=rep(grp,length(x)))
+    }))
+    setkey(aging_da,GeneName)
+    all_dat$change_1 = aging_da[as.character(all_dat$Var1),var_effect,]
+    all_dat$change_2 = aging_da[as.character(all_dat$Var2),var_effect,]
+    
+    all_dat[,change_type := factor(ifelse(change_1=="." & change_2==".","neither",ifelse(change_1!="." & change_2!=".","one","both")),levels=c("neither","one","both"))]
+    
+    tp = all_dat[change_1=="." & change_2==".",][sample.int(nrow(all_dat),size=min(nrow(all_dat),1000000)),]
+    grps = unique(all_dat$grp)
+    colors = c("#F8766D","#00BA38","black","dark gray")
+    names(colors) = grps;
+    lty = c("solid","solid","solid","dash")
+    lty = c(1,1,2,2)
+    names(lty) = grps
+    if (plot_all){
+    ggplot(tp,aes(x=value,color=grp,fill=grp))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(-1,1)+geom_vline(xintercept=0,lwd=1,col="dark gray",lty=2)+xlab("Corrleation between gene-pairs")+scale_color_manual(values=colors)+scale_linetype_manual(values=lty)+scale_fill_manual(values=colors)
+    ggsave(paste0("../figures/04/cov_plots/",model,"correlation_effect.pdf"),width=5,height=3)
+    }
+    gp = ggplot(tp,aes(x=abs(value),color=grp,fill=grp,linetype=grp))+stat_ecdf(lwd=1) + xlim(0,1)+xlab("Correlation Magnitude\nbetween gene-pairs")+scale_color_manual(values=colors)+scale_fill_manual(values=colors)+scale_linetype_manual(values=lty)
+    if (plot_all){
+      plot(res)
+      ggsave(paste0("../figures/04/cov_plots/",model,"_correlation_effect_inset.pdf"),width=5,height=3)
+    }else{
+      print("Saving to subfigures")
+     subfigures[[model]] <<- gp; 
+    }
+    print("Calculating stats")
+    res = aggregate(abs(value)~grp,tp,mean)
+    names(res)[2] = "mean"
+    res2 = aggregate(abs(value)~grp,tp,median)
+    names(res2)[2] = "median"
+    res3 = aggregate(abs(value)~grp,tp,sd)
+    names(res3)[2] = "sd"
+    res4 = aggregate(abs(value)~grp,tp,length)
+    names(res4)[2] = "N"
+    r = merge(res,res2,by="grp")
+    r = merge(r,res3,by="grp")
+    r = merge(r,res4,by="grp")
+    r$model = model
+   
+    tp$grp_f = factor(tp$grp,levels = names(gp1_norm_counts))
+    tp$abs_val = abs(tp$val)
+    dd = tp[!is.na(tp$abs_val) & tp$abs_val!=0,]
+    nl_res = ns_single_bj_group(Surv(dd$abs_val)~dd$grp_f,reference_group = names(gp1_norm_counts)[1])$coefficients
+    nl_res$ref_level=names(gp1_norm_counts)[1]
+    nl_res$ref_level_group="intervention"
+    nl_res$model = model;
+    nl_res_2 = ns_single_bj_group(Surv(dd$abs_val)~dd$grp_f,reference_group = names(gp1_norm_counts)[3])$coefficients
+    nl_res_2$ref_level=names(gp1_norm_counts)[3]
+    nl_res_2$ref_level_group="shuffle"
+    nl_res_2$model = model;
+    
+    list(nl_res = rbind(nl_res,nl_res_2), means = r)
+})
+names(cov_stats) = to_plot
+```
+```{r,fig.width=12,fig.height=6}
+
+if (make_suppl_figure){
+  ggpubr::ggarrange(plotlist=subfigures[c("n2_sw","d8_glp1","d1_sw","d8_sw","d1_20v25C","d8_20v25C","d1_UV","d8_UV")],nrow=2,ncol=4,legend="none")
+    ggsave("../figures/04/S_effect_on_cov.pdf",width=12,height=4)
+    ggpubr::ggarrange(plotlist=subfigures[c("n2_sw","d8_glp1","d1_sw","d8_sw","d1_20v25C","d8_20v25C","d1_UV","d8_UV")],nrow=4,ncol=2)
+    ggsave("../figures/04/S_effect_on_cov_legends.pdf",width=8,height=8)
+}
+```
+
+```{r}
+saveRDS(cov_stats,"tmp.Rds")
+```
+```{r}
+cov_stats_flat = data.table(rbindlist(lapply(names(cov_stats),function(grp){
+  data.frame(cov_stats[[grp]]$nl_res)
+})))
+
+just_effect = cov_stats_flat[!is.nan(p) &
+                               !grepl("shuffled",bj_group ) &  ref_level_group != "shuffle",]
+pretty_labels = data.frame(matrix(c("d8_glp1", "glp-1(e2141)" ,    
+                           "d1_glp1", "glp-1(e2141)",
+                           "d8_UV", "UV-inactivated food",
+                           "d1_UV" , "UV-inactivated food",
+                           "d_UV" ,"UV-inactivated food",
+                           "d8_20v25C" , "25C",
+                           "d1_20v25C" , "25C",
+                           "n2_sw", "wild-type",
+                          "daf2_sw", "daf-2(e1368)",
+                          "d1_sw", "daf-2(e1368)",
+                          "d8_sw" , "daf-2(e1368)",
+                          "d_25C" ,  "25C"),ncol=2,byrow=T))
+names(pretty_labels) = c("model","label")
+pretty_labels$age = factor(c("old","young","old","young","age","old","young","age","old","young","age","age","young","old","age"),
+                           levels=c("young","old","age"))
+pretty_labels$group_factor = factor(pretty_labels$label,levels=c("wild-type","daf-2(e1368)","glp-1(e2141)","UV-inactivated food","25C"))
+
+dat=merge(just_effect,pretty_labels,by="model")
+to_reverse = c("d1_UV","d1_20v25C","d8_UV","n2_sw")
+for (i in to_reverse){
+ w = dat$model == i
+ dat[w]$coefficient = -dat[w]$coefficient;
+ tmp = dat[w]$lower
+ dat[w]$lower = -dat[w]$upper
+ dat[w]$upper = -tmp
+ dat[w]$ref_level = paste0("!",dat[w]$ref_level)
+}
+                          
+ggplot(dat,aes(group_factor,exp(coefficient)))+
+  geom_point() +
+  theme(axis.text.x = element_text(angle=45, hjust=1,vjust=1)) + 
+  geom_hline(yintercept=1,col="dark gray",lty=2) + 
+  geom_errorbar(aes(ymin=exp(lower),ymax=exp(upper)),width=0) + 
+  scale_y_continuous(trans="log",breaks=c(seq(.25,1,by=.25),1.5,2,3,4))+
+  facet_grid(~age,scale="free_x")+xlab("")+ylab("Effect on covariance")
+  ggsave("../figures/04/effect_on_overall_gene_covariance.pdf",width=8,height=4)
+```
+
+```{r}
+ggplot(r,aes(grp,`abs(value).mean`))+geom_point()+geom_errorbar(aes(ymin=`abs(value).mean`-`abs(value).sd`,ymax=`abs(value).mean`+`abs(value).sd`))
+```
+
+```{r}
+model = "n2_series_all"
+ref = "1"
+to_compare = names(counts_list[[model]])
+to_compare = to_compare[to_compare!=ref]
+lapply(to_compare,function(day){
+gp1_counts = counts_list[[model]][c(ref,day)]
+gp1_norm_counts = lapply(gp1_counts,function(x){
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+
+gp1_shuffled_norm_counts = lapply((gp1_counts),function(x){
+      for (i in 1:nrow(x))
+        x[i,] = x[i,sample(1:ncol(x),ncol(x))]  
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+names(gp1_shuffled_norm_counts) = paste0(names(gp1_shuffled_norm_counts),"_shuffled")
+gp1_norm_counts = c(gp1_norm_counts,gp1_shuffled_norm_counts)
+glp1_norm_counts = gp1_norm_counts
+
+if (0){
+names(gp1_norm_counts) = names(gp1_counts)
+glp1_norm_counts[["sim"]] = as.matrix(rbindlist(lapply(genes_to_use,function(g){
+  dat = params_single_df[GeneName==g & Day==8,]
+  data.frame(t(rnbinom(n=500,mu=2^dat$LogMean,size=1/2^(dat$LogDisp))))
+})))
+rownames(glp1_norm_counts[["sim"]]) = genes_to_use
+}
+
+min_mu = 20
+# select genes with high mean
+gn = function(x,y){print(paste(x,y));intersect(rownames(x),rownames(y))}
+intersect_genes = rownames(glp1_norm_counts[[1]])
+for (i in 1:length(glp1_norm_counts))
+  intersect_genes = intersect(intersect_genes,rownames(glp1_norm_counts[[i]]))
+
+mu_list <- sapply(names(glp1_norm_counts),function(subgroup){ 
+  apply(glp1_norm_counts[[subgroup]][intersect_genes, ], 1, mean)
+})
+colnames(mu_list) = names(glp1_norm_counts)
+
+select_genes <- rownames(mu_list)[apply(mu_list,1,function(x)mean(x) > min_mu)]
+
+glp1_filter_norm_list  = lapply(names(glp1_norm_counts),function(subgroup)glp1_norm_counts[[subgroup]][select_genes, ])
+names(glp1_filter_norm_list) = names(glp1_norm_counts)
+
+
+glp1_cor = lapply(glp1_filter_norm_list,function(x){
+ #sim_tmp = do.call("cbind",x);
+  cor(t(x), method = "s")
+})
+
+names(glp1_cor) = names(glp1_filter_norm_list)
+aging_da = gene_variability_da[model==model_to_use]
+#genes_that_dont_change_mean = aging_da[var_effect==".",GeneName]
+genes_to_use = intersect(aging_da$GeneName,params_single_df$GeneName)
+genes_to_use_2 = intersect(genes_to_use,select_genes)
+
+  setkey(aging_da,GeneName)
+all_dat = rbindlist(lapply(names(glp1_cor),function(grp){
+  g = glp1_cor[[grp]][genes_to_use_2,genes_to_use_2];
+  g[diag(g)] = NA;
+  cv_focused = as.data.table(melt(g))
+  cv_focused = cv_focused[!is.na(value)]
+  cv_focused$change_1 = aging_da[as.character(cv_focused$Var1),var_effect,]
+  cv_focused$change_2 = aging_da[as.character(cv_focused$Var2),var_effect,]
+  cv_focused$grp = grp
+  cv_focused[sample(1:nrow(cv_focused),nrow(cv_focused)/100),]
+}))
+
+all_dat[,change_type := ifelse(change_1=="." & change_2==".","neither",ifelse(change_1!="." & change_2!=".","one","both"))]
+
+tp = all_dat[change_1=="." & change_2==".",][sample(1:nrow(all_dat),1000000),]
+grps = unique(all_dat$grp)
+colors = c("#F8766D","#00BA38","black","dark gray")
+names(colors) = grps;
+lty = c("solid","solid","solid","dash")
+lty = c(1,1,2,2)
+names(lty) = grps
+ggplot(tp,aes(x=value,color=grp,fill=grp))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(-1,1)+geom_vline(xintercept=0,lwd=1,col="dark gray",lty=2)+xlab("Corrleation between gene-pairs")+scale_color_manual(values=colors)+scale_linetype_manual(values=lty)+scale_fill_manual(values=colors)
+ggsave(paste0("../figures/04/cov_plots/",model,"_d",day,"_correlation_effect.pdf"),width=5,height=3)
+ggplot(tp,aes(x=abs(value),color=grp,fill=grp,linetype=grp))+stat_ecdf(lwd=1) + xlim(0,1)+xlab("Correlation Magnitude\nbetween gene-pairs")+scale_color_manual(values=colors)+scale_fill_manual(values=colors)+scale_linetype_manual(values=lty)
+ggsave(paste0("../figures/04/cov_plots/",model,"_d",day,"_correlation_effect_inset.pdf"),width=5,height=3)
+
+})
+```
+```{r}
+gp1_counts = counts_list[["d8_20v25C"]] 
+gp1_norm_counts = lapply(gp1_counts,function(x){
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+
+gp1_shuffled_norm_counts = lapply((gp1_counts),function(x){
+      for (i in 1:nrow(x))
+        x[i,] = x[i,sample(1:ncol(x),ncol(x))]  
+      nf = normalizationFactor(x)
+      normalizeCounts(x,nf)
+})
+names(gp1_shuffled_norm_counts) = paste0(names(gp1_shuffled_norm_counts),"_shuffled")
+gp1_norm_counts = c(gp1_norm_counts,gp1_shuffled_norm_counts)
+glp1_norm_counts = gp1_norm_counts
+
+if (0){
+names(gp1_norm_counts) = names(gp1_counts)
+glp1_norm_counts[["sim"]] = as.matrix(rbindlist(lapply(genes_to_use,function(g){
+  dat = params_single_df[GeneName==g & Day==8,]
+  data.frame(t(rnbinom(n=500,mu=2^dat$LogMean,size=1/2^(dat$LogDisp))))
+})))
+rownames(glp1_norm_counts[["sim"]]) = genes_to_use
+}
+
+min_mu = 20
+# select genes with high mean
+gn = function(x,y){print(paste(x,y));intersect(rownames(x),rownames(y))}
+intersect_genes = rownames(glp1_norm_counts[[1]])
+for (i in 1:length(glp1_norm_counts))
+  intersect_genes = intersect(intersect_genes,rownames(glp1_norm_counts[[i]]))
+
+mu_list <- sapply(names(glp1_norm_counts),function(subgroup){ 
+  apply(glp1_norm_counts[[subgroup]][intersect_genes, ], 1, mean)
+})
+colnames(mu_list) = names(glp1_norm_counts)
+
+select_genes <- rownames(mu_list)[apply(mu_list,1,function(x)mean(x) > min_mu)]
+
+glp1_filter_norm_list  = lapply(names(glp1_norm_counts),function(subgroup)glp1_norm_counts[[subgroup]][select_genes, ])
+names(glp1_filter_norm_list) = names(glp1_norm_counts)
+
+
+glp1_cor = lapply(glp1_filter_norm_list,function(x){
+ #sim_tmp = do.call("cbind",x);
+  cor(t(x), method = "s")
+})
+
+names(glp1_cor) = names(glp1_filter_norm_list)
+aging_da = gene_variability_da[model==model_to_use]
+#genes_that_dont_change_mean = aging_da[var_effect==".",GeneName]
+genes_to_use = intersect(aging_da$GeneName,params_single_df$GeneName)
+genes_to_use_2 = intersect(genes_to_use,select_genes)
+
+  setkey(aging_da,GeneName)
+all_dat = rbindlist(lapply(names(glp1_cor),function(grp){
+  g = glp1_cor[[grp]][genes_to_use_2,genes_to_use_2];
+  g[diag(g)] = NA;
+  cv_focused = as.data.table(melt(g))
+  cv_focused = cv_focused[!is.na(value)]
+  cv_focused$change_1 = aging_da[as.character(cv_focused$Var1),var_effect,]
+  cv_focused$change_2 = aging_da[as.character(cv_focused$Var2),var_effect,]
+  cv_focused$grp = grp
+  cv_focused[sample(1:nrow(cv_focused),nrow(cv_focused)/100),]
+}))
+
+all_dat[,change_type := ifelse(change_1=="." & change_2==".","neither",ifelse(change_1!="." & change_2!=".","one","both"))]
+
+tp = all_dat#[change_1=="." & change_2==".",]
+
+colors = c("20"="#F8766D","25"="#00BA38","20_shuffled"="black","25_shuffled"="dark gray")
+lty = c(`20`="solid",`25`="solid",`20_shuffled`="solid",`25_shuffled`="dash")
+lty = c(`20`=1,`25`=1,`20_shuffled`=1,`25_shuffled`=2)
+ggplot(tp,aes(x=value,color=grp,fill=grp))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(-1,1)+geom_vline(xintercept=0,lwd=1,col="dark gray",lty=2)+xlab("Corrleation between gene-pairs")+scale_color_manual(values=colors)+scale_linetype_manual(values=lty)+scale_fill_manual(values=colors)
+#ggsave("../figures/02/glp1_correlation_effect.pdf",width=5,height=3)
+ggplot(tp,aes(x=abs(value),color=grp,fill=grp,linetype=grp))+stat_ecdf(lwd=1) + xlim(0,1)+xlab("Correlation Magnitude\nbetween gene-pairs")+scale_color_manual(values=colors)+scale_fill_manual(values=colors)+scale_linetype_manual(values=lty)
+#ggsave("../figures/02/glp1_correlation_effect_inset.pdf",width=5,height=3)
+#ggplot(tp,aes(x=abs(value),color=grp,fill=grp))+geom_density(alpha=.1,adjust =1,lwd=1) + xlim(0,1)
+res = dcast(tp,Var1+Var2~grp,value.var="value")
+ggplot(res,aes(`20`,`25`))+geom_point() + geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  geom_hline(yintercept=0,lty=2,col="dark gray")+
+  geom_vline(xintercept=0,lty=2,col="dark gray") + geom_smooth(method="loess",se=F)
+ggplot(res,aes(`20`,`25`))+geom_hex() + geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+  geom_hline(yintercept=0,lty=2,col="dark gray")+
+  geom_vline(xintercept=0,lty=2,col="dark gray") + geom_smooth(method="loess",se=F)
+cr = cor(res$`20`,res$`25`,method='s',use="complete.obs")
+```
+
+#Plot effect of intervention on correlations as heatmap
+```{r,fig.height=4,fig.width=12}
+if(0){
+source("../scripts/helpers/heatmap.r")
+lapply(names(filter_tissue_rho_list),function(group){
+  subgroups = (names(filter_tissue_rho_list[[group]]))
+  if (length(subgroups) > 2)
+  subgroups = subgroups[subgroups != "3" & subgroups != "11"]
+  
+  rho_1 = filter_tissue_rho_list[[group]][[subgroups[1]]] 
+  rho_2 = filter_tissue_rho_list[[group]][[subgroups[2]]] 
+  
+  setkey(tissues_df,GeneName)
+  cur_tissue = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+  names(cur_tissue) = unique(tissues)
+   gp = plotSplitCorrelationDiffHeatmap(rho_1,rho_2,
+                                      cur_tissue, 
+                                      colors = tissue_colors,
+                                      name1 = subgroups[[1]],
+                                      name2 = subgroups[[2]])
+    draw(gp,row_title = group,column_title = group)
+    
+    gp = plotSplitCorrelationDiffHeatmap(rho_2,rho_1,
+                                      cur_tissue, 
+                                      colors = tissue_colors,
+                                      name1 = subgroups[[2]],
+                                      name2 = subgroups[[1]])
+    draw(gp,row_title = group,column_title = group)
+})
+}
+
+```
+
+
+
+#Run ICA and do community detection
+```{r,fig.height=4,fig.width=12}
+  library(igraph)
+
+calc_ica_and_pca = F;
+
+makeGraph <- function(rho, theta, beta = 2) {
+  adj <- abs(rho)^beta
+  adj[upper.tri(adj, diag = TRUE)] <- 0
+  adj[adj < theta] <- 0
+  gr <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE, weighted = TRUE)
+}
+
+library(JADE)
+library(MineICA)
+
+n_ica = 3
+
+to_fit = names(filter_tissue_norm_list);
+ica_res = lapply(to_fit,function(group){
+  subgroup_names = c(names(filter_tissue_norm_list[[group]]),"all");
+  if (length(subgroup_names)>3)
+    subgroup_names = subgroup_names[subgroup_names != "3" & subgroup_names != "11"]
+    res= lapply(subgroup_names,function(subgroup){
+    
+
+    
+    
+    if (subgroup != "all"){
+      dat1 = filter_tissue_norm_list[[group]][[subgroup]]
+      covar = filter_tissue_rho_list[[group]][[subgroup]]
+    }else{
+      dat1 = do.call("cbind",filter_tissue_norm_list[[group]])
+      covar = filter_tissue_combined_rho_list[[group]]
+    }    
+      
+      
+     print(paste(group,": Fitting on",subgroup))
+     flush.console()
+    g = makeGraph(covar, theta = 0.3, beta = 2)
+   # comun <<- cluster_infomap(g, e.weights = E(g)$weight, nb.trials = 200L)
+    comun <- cluster_leiden (g, objective_function ="modularity",weights = E(g)$weight,n_iterations=300,resolution_parameter=.5)
+    s = sizes(comun);
+    s = s[s>5]
+    if (length(s)==0) stop("All communities were too small")
+    s = s[order(s,decreasing=T)]
+    community_genes = lapply(names(s),function(x){
+      comun$names[comun$membership == x]
+    })
+    names(community_genes) = as.character(1:length(community_genes))
+    
+    if(!calc_ica_and_pca){
+        return(list(community_genes=community_genes));
+    }else{
+        dat1_scaled_log = t(scale(t(log(dat1+1)),scale=T)) #ztransform each gene
+        
+        pca = prcomp(t(dat1_scaled_log),scale=T)
+        #frac_var_pca = pca$sdev^2/sum(pca$sdev^2)
+        
+        res_ts = runICA(X=dat1_scaled_log,nbComp=n_ica, method = "JADE", maxit=100000, tol = 10^-8)
+        
+        #calculate mixing matrix for each subgroup 
+        other_subgroups = subgroup_names[subgroup_names!="all"]
+        other_ts =lapply(other_subgroups,function(subgroup2){
+          dat2 = filter_tissue_norm_list[[group]][[subgroup2]]
+          dat2_scaled_log = t(scale(t(log(dat2+1)),scale=T)) #ztransform each gene
+          (t(dat2_scaled_log) %*% res_ts$S)/dim(res_ts$S)[1]
+        });
+        names(other_ts) = other_subgroups;
+        #calculating coefficient of variation of the population in respect to each IC
+        var_exp_IC = lapply(other_subgroups,function(subgroup2){
+          apply(other_ts[[subgroup2]],2,FUN=function(x)sd(x)/abs(mean(x)))
+        });
+        names(var_exp_IC) = other_subgroups;
+        
+        var_exp_pca = lapply(other_subgroups,function(subgroup2){
+          dat2 = filter_tissue_norm_list[[group]][[subgroup2]]
+          dat2_scaled_log = t(scale(t(log(dat2+1)),scale=T)) #ztransform each gene
+          #browser()
+            x2=as.matrix(t(dat2_scaled_log)) %*% pca$rotation
+            pr.var2=apply(x2,2,sd)^2
+            sder = pr.var2/sum(pr.var2)
+            sder
+        });
+        names(var_exp_pca) = other_subgroups;
+        
+        
+      
+        
+        #get the genes contributing to each IC
+        n_genes = floor(.25*nrow(res_ts$S))
+        IC_genes = apply(res_ts$S,2,rn = rownames(res_ts$S),FUN=function(x,rn)rn[order(abs(x),decreasing=T)[1:n_genes]])
+        pca_genes = apply(pca$rotation,2,rn = rownames(pca$rotation),FUN=function(x,rn)rn[order(abs(x),decreasing=T)[1:n_genes]])
+        
+        
+       # other_ts[[subgroup]] = res_ts$A;
+       # colnames(other_ts[[subgroup]]) = colnames(other_ts[[1]])
+        return(list(mixing_matricies = other_ts,ica_spec = res_ts,var_exp_IC=var_exp_IC,IC_genes=IC_genes,pca=pca,pca_genes=pca_genes,var_exp_pca=var_exp_pca,community_genes=community_genes));
+    }
+  })
+  names(res) = subgroup_names
+  res
+})
+names(ica_res) = to_fit
+```
+```{r}
+#look at ICA results
+if(0){
+gp = lapply(names(ica_res),function(group){
+   lapply(names(ica_res[[group]]),function(subgroup){
+     res = rbindlist(lapply(names(ica_res[[group]][[subgroup]]$mixing_matricies),function(sub2){
+        res = melt(ica_res[[group]][[subgroup]]$mixing_matricies[[sub2]])
+        names(res) = c("Sample","IC","value")
+        res$subgroup = sub2;
+        res;
+     }))
+     res$value = res$value/max(abs(res$value))
+     ggplot(res,aes(x=value,colour=subgroup))+stat_ecdf()+facet_wrap(~IC,scales="free") + ggtitle(paste(group,"with ICAs estimated from",subgroup)) 
+   })
+})
+
+for(i in 1:length(gp)){
+  for(j in 1:length(gp[[i]]))
+    plot(gp[[i]][[j]])
+}
+}
+
+```
+```{r}
+if(0){
+#look at variance of the population in respect to each IC
+gp = lapply(names(ica_res),function(group){
+   lapply(names(ica_res[[group]]),function(subgroup){
+     res = rbindlist(lapply(names(ica_res[[group]][[subgroup]]$var_exp_IC),function(sub2){
+        res = data.frame(v=ica_res[[group]][[subgroup]]$var_exp_IC[[sub2]],
+                         ic=names(ica_res[[group]][[subgroup]]$var_exp_IC[[sub2]]))
+        res$subgroup = sub2;
+        res;
+     }))
+     ggplot(res,aes(x=ic,y=v,colour=subgroup))+geom_point()+ggtitle(paste(group,"with ICAs estimated from",subgroup)) 
+   })
+})
+
+for(i in 1:length(gp)){
+  for(j in 1:length(gp[[i]]))
+    plot(gp[[i]][[j]])
+}}
+
+```
+```{r,fig.height=4,fig.width=12}
+#look at variance of the population in respect to each PC
+gp = lapply(names(ica_res),function(group){
+   res = rbindlist(lapply(names(ica_res[[group]]),function(subgroup){
+     res = rbindlist(lapply(names(ica_res[[group]][[subgroup]]$var_exp_pca),function(sub2){
+       
+        res = data.frame(v=ica_res[[group]][[subgroup]]$var_exp_pca[[sub2]],
+                         ic=names(ica_res[[group]][[subgroup]]$var_exp_pca[[sub2]]))
+        res$ic = as.integer(substring(res$ic,3,5))
+        res$subgroup = sub2;
+        res;
+     }))
+     res$fitted_subgroup = subgroup;
+     res
+   }))
+    
+     ggplot(res[res$ic < 5,],aes(x=ic,y=v,colour=subgroup))+geom_point() +geom_line() + facet_wrap(~paste("PC estimated using",fitted_subgroup))+ggtitle(group)+ylim(c(0,.5))
+})
+
+for(i in 1:length(gp)){
+    plot(gp[[i]])
+}
+
+```
+
+```{r}
+if(0){
+#look at covariance of the population in respect to each IC
+gp = lapply(names(ica_res),function(group){
+   lapply(names(ica_res[[group]]),function(subgroup){
+     
+       correls = rbindlist(lapply(names(ica_res[[group]][[subgroup]]$mixing_matricies),function(sub2){
+         rbindlist(lapply(1:ncol(ica_res[[group]][[subgroup]]$IC_genes),function(x){
+             genes= ica_res[[group]][[subgroup]]$IC_genes[,x]
+            # print(paste(group,subgroup,sub2))
+             if (sub2 == "all"){
+                #browser()
+                   correl = filter_tissue_combined_rho_list[[group]][genes,genes]
+             }else correl = filter_tissue_rho_list[[group]][[sub2]][genes,genes]
+             res = data.frame(correl=as.numeric(correl[lower.tri(correl)]))
+        
+             res$IC=x
+             res$subgroup = sub2;
+             res
+         }))
+       }))
+     
+     ggplot(correls,aes(x=abs(correl),colour=subgroup))+stat_ecdf()+facet_wrap(~paste("IC",IC))+ggtitle(paste(group,"with ICAs estimated from",subgroup)) + xlab("Co-Expression") + ylab("CDF") 
+   })
+})
+
+for(i in 1:length(gp)){
+  for(j in 1:length(gp[[i]]))
+    plot(gp[[i]][[j]])
+}
+}
+
+```
+
+
+```{r,fig.width=7.fig.height=3}
+if(0){
+#look at covariance of the population in respect to each IC
+gp = list();
+correl_stats = rbindlist(lapply(names(ica_res),function(group){
+   correls = rbindlist(lapply(names(ica_res[[group]]),function(subgroup){
+       correls = rbindlist(lapply(names(ica_res[[group]][[subgroup]]$mixing_matricies),function(sub2){
+         rbindlist(lapply(1:3,function(x){
+             genes= ica_res[[group]][[subgroup]]$pca_genes[,x]
+            # print(paste(group,subgroup,sub2))
+             if (sub2 == "all"){
+                #browser()
+                   correl = filter_tissue_combined_rho_list[[group]][genes,genes]
+             }else correl = filter_tissue_rho_list[[group]][[sub2]][genes,genes]
+             res = data.frame(correl=as.numeric(correl[lower.tri(correl)]))
+        
+             res$IC=x
+             res$subgroup = sub2;
+             res$fit_subgroup = subgroup
+             res
+         }))
+       }))
+   }))
+   stats = rbindlist(lapply(unique(correls$IC),function(IC){
+        dat = correls[correls$IC == IC,];
+        rbindlist(lapply(unique(dat$fit_subgroup),function(sub2){
+          dat2 = dat[correls$fit_subgroup == sub2,];
+          if (any(is.infinite(dat2$correl)))
+            browser()
+          dat2$subgroup = factor(dat2$subgroup)
+          fit = lm(abs(correl)~subgroup,dat2)
+          fit_c = summary(fit)
+          cf = data.frame(Est = coef(fit_c)[2,"Estimate"],
+                          pvalue=coef(fit_c)[2,"Pr(>|t|)"],
+                          comp=paste(rev(levels(dat2$subgroup)),collapse=" vs"),
+                          fit_subgroup=sub2,
+                          IC=IC,
+                          group=group)
+       }))
+   }))
+          
+     gp[[group]] <<-ggplot(correls,aes(abs(correl),colour=subgroup))+stat_ecdf()+facet_wrap(~IC+paste("PCA Est. on ",fit_subgroup)) + xlab("PC")+ylab("Co-Expression") + ylab("CDF") +ggtitle(group)
+     stats;
+}))
+
+for(i in 1:length(gp)){
+    plot(gp[[i]])
+}
+}
+```
+
+
+```{r,fig.width=16,fig.height=5}
+#look at covariance of the population in respect to each community group
+gp = list();
+community_gene_correlations = list();
+to_fit = names(ica_res);
+community_gene_correlation_stats = rbindlist(lapply(to_fit,function(group){
+   subgroups_fit = names(ica_res[[group]]);
+   subgroups_to_characterize = subgroups_fit[subgroups_fit!="all"]
+   subgroups_fit = subgroups_fit[subgroups_fit!="all"] #Get rid of all
+   correls = rbindlist(lapply(subgroups_fit,function(subgroup){
+    
+       genes_in_any_community = do.call("c",lapply(names(ica_res[[group]][[subgroup]]$community_genes),function(x)ica_res[[group]][[subgroup]]$community_genes[[x]]))
+       
+       correls = rbindlist(lapply(names(ica_res[[group]][[subgroup]]$community_genes),function(community_name){
+         genes_in_community = ica_res[[group]][[subgroup]]$community_genes[[community_name]];
+         res = rbindlist(lapply(subgroups_to_characterize,function(subgroup_2){
+           
+             if (subgroup_2 == "all"){
+                   correl_community = filter_tissue_combined_rho_list[[group]][genes_in_community,genes_in_community]
+                   correl_all = filter_tissue_combined_rho_list[[group]][genes_in_community,]
+             }else{ 
+                  correl_community = filter_tissue_rho_list[[group]][[subgroup_2]][genes_in_community,genes_in_community] 
+                  correl_all = filter_tissue_rho_list[[group]][[subgroup_2]][genes_in_community,]
+             }
+         
+             
+             correl_community = rowSums(abs(correl_community))/ncol(correl_community)
+             correl_all = rowSums(abs(correl_all))/ncol(correl_all)
+             
+             res = data.frame(GeneName = genes_in_community, correl_community=correl_community,correl_all=correl_all)
+        
+             res$community=community_name
+             res$subgroup = subgroup_2;
+             res$fit_subgroup = subgroup
+             res
+         }))
+         res;
+       }))
+   }))
+   
+   
+   #estimate fold change in correlation across subgroups for each community
+   stats = rbindlist(lapply(unique(correls$community),function(cur_community){
+        dat = correls[correls$community == cur_community,];
+ 
+        rbindlist(lapply(unique(dat$fit_subgroup),function(sub2){
+          dat2 = dat[dat$fit_subgroup == sub2,];
+          if (any(is.infinite(dat2$correl_community)))
+            browser()
+          dat2$subgroup = factor(dat2$subgroup)
+          fit_community = glm(correl_community~subgroup,dat2,family=gaussian(link="log"))
+          fit_community_s = summary(fit_community)
+          fit_all = glm(correl_all~subgroup,dat2,family=gaussian(link="log"))
+          fit_all_s = summary(fit_all)
+          cf = data.frame(community_est = exp(coef(fit_community_s)[2,"Estimate"]),
+                          community_stderr =exp(coef(fit_community_s)[2,"Std. Error"]),
+                          community_pvalue=coef(fit_community_s)[2,"Pr(>|t|)"],
+                          community_intercept = exp(coef(fit_community_s)[1,"Estimate"]),
+                          community_intercept_stderr =exp(coef(fit_community_s)[1,"Std. Error"]),
+                          community_group_1_mean = mean(dat2$correl_community[dat2$subgroup == levels(dat2$subgroup)[1]]),
+                          community_group_2_mean = mean(dat2$correl_community[dat2$subgroup == levels(dat2$subgroup)[2]]),
+                          all_est = exp(coef(fit_all_s)[2,"Estimate"]),
+                          all_stderr =exp(coef(fit_all_s)[2,"Std. Error"]),
+                          all_pvalue=coef(fit_all_s)[2,"Pr(>|t|)"],
+                          all_intercept = exp(coef(fit_community_s)[1,"Estimate"]),
+                          all_intercept_stderr =exp(coef(fit_community_s)[1,"Std. Error"]),
+                          all_group_1_mean = mean(dat2$correl_all[dat2$subgroup == dat2$subgroup[1]]),
+                          all_group_2_mean = mean(dat2$correl_all[dat2$subgroup == dat2$subgroup[2]]),
+                          group_1=levels(dat2$subgroup)[1],
+                          group_2=levels(dat2$subgroup)[2],
+                          gene_N=length(which(dat2$subgroup == levels(dat2$subgroup)[1])),
+                          fit_subgroup=sub2,
+                          community=cur_community,
+                          group=group)
+       }))
+   }))
+    #assign names in descending order of gene membership
+    stats = stats[order(stats$gene_N,decreasing=T),]
+    stats$coexp_group_name =  apply(stats,1,function(x)paste(x[["fit_subgroup"]],x[["community"]]))
+    stats$coexp_group_name = factor( stats$coexp_group_name,levels= stats$coexp_group_name)
+    stats$coexp_group_ID = paste0("G",as.integer(stats$coexp_group_name))
+    
+    correls$coexp_group_name = apply(correls,1,function(x)paste(x[["fit_subgroup"]],x[["community"]]))
+    correls$coexp_group_name = factor(correls$coexp_group_name,levels=as.character(stats$coexp_group_name))
+    correls$coexp_group_ID = paste0("G",as.integer(correls$coexp_group_name))
+    
+    #convert to characters so we can combine tables without problem
+    stats$coexp_group_name = as.character(stats$coexp_group_name );
+    correls$coexp_group_name = as.character(correls$coexp_group_name );
+    
+    community_gene_correlations[[group]] <<- correls;
+    stats;
+}))
+names(community_gene_correlations) = to_fit;
+community_memberships = rbindlist(lapply(names(community_gene_correlations),function(x){
+  dat = community_gene_correlations[[x]]
+
+  dat$group = x;
+  unique(dat[,.(GeneName,fit_subgroup ,community,coexp_group_name ,coexp_group_ID,group)])
+}))
+
+#write.csv(community_memberships,"../data/gene_network/intervention_communities.csv")
+```
+
+
+```{r,fig.width=16,fig.height=10}
+#plot rough graphs showing the change in corherence of each covariate in each fit
+for(grp in names(community_gene_correlations)){
+  stats = community_gene_correlation_stats[community_gene_correlation_stats$group ==grp]
+  correls_long <- melt(community_gene_correlations[[grp]],measure.vars=c("correl_community","correl_all"))
+  
+  gp1 = ggplot(correls_long,aes(y=value,x=community,fill=paste(subgroup,variable)))+geom_boxplot(outlier.shape = NA)+facet_wrap(~paste("PCA Est. on ",fit_subgroup)) + xlab("PC")+ylab("Co-Expression") +ggtitle(grp)
+  
+  gp2 = ggplot(stats,aes(y=community_est,x=community))+geom_point()+geom_errorbar(aes(ymin=community_est/community_stderr,ymax=community_est*community_stderr), width = 0.2)+ 
+    geom_hline(yintercept=1,lty=2,col="gray")+facet_wrap(~paste("PCA Est. on ",fit_subgroup),scales ="free_y") + xlab("Community")+ylab("Effect on Co-expression")+
+      scale_y_continuous(trans = "log10",breaks = c(.25,.5,.75,1,1.25,1.5,2,3,4,5)
+    )
+  
+    grid.arrange(gp1, gp2, nrow = 2)
+}
+
+```
+```{r,fig.width=8,fig.height=8}
+#plot nice graphs of each group
+for(grp in names(community_gene_correlations)){
+  stats = community_gene_correlation_stats[group ==grp & fit_subgroup != "all",]
+  correls_long <- melt(community_gene_correlations[[grp]],measure.vars=c("correl_community","correl_all"))
+  correls_long = correls_long[ correls_long$fit_subgroup != "all",]
+
+  #order by effect size
+  stats = stats[order(stats$community_est),]
+  stats$coexp_group_name = factor(stats$coexp_group_name,levels=stats$coexp_group_name)
+  stats$coexp_group_ID = factor( stats$coexp_group_ID,levels= stats$coexp_group_ID)
+  
+  correls_long$coexp_group_name = factor(correls_long$coexp_group_name,levels=as.character(stats$coexp_group_name))
+  correls_long$coexp_group_ID = factor(correls_long$coexp_group_ID,levels= as.character(stats$coexp_group_ID))
+  
+  
+  correls_long$levels_to_plot = apply(correls_long,1,function(x)paste(x[["subgroup"]],x[["variable"]]))
+  #make colors
+  subgroups = unique(correls_long$subgroup)
+  variables = c("correl_community","correl_all")
+  levels_to_plot= c(paste(subgroups[1],variables[1]),
+                    paste(subgroups[2],variables[1]),
+                    paste(subgroups[1],variables[2]),
+                    paste(subgroups[2],variables[2]));
+  level_colors = c("black","#E2522F","gray","pink")
+  names(level_colors) = levels_to_plot
+  level_labels = c(paste(subgroups[1]),paste(subgroups[2]),paste(subgroups[1],"(baseline)"),paste(subgroups[2],"(baseline)"))
+  names(level_labels) = levels_to_plot;
+  
+  # gp1 = ggplot(correls_long,aes(y=value,x=coexp_group_ID,fill=levels_to_plot))+geom_boxplot(outlier.shape = NA) + xlab("Co-expression Group")+ylab("Coherence") +ggtitle(grp) + scale_colour_manual(values=level_colors, aesthetics = c("fill"));
+  
+  gp1 = ggplot(correls_long,aes(y=value,x=coexp_group_ID,fill=levels_to_plot,color=levels_to_plot))+
+    ggdist::stat_gradientinterval(width=.3) + 
+    xlab("Co-expression Group")+ylab("Coherence") +ggtitle(grp) + 
+    scale_colour_manual(name="Subject",values=level_colors, aesthetics = c("fill","color"),labels=level_labels)+
+   # scale_fill_discrete(name="Group",labels=level_labels) #+ labs(fill="Group")+
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  
+  
+  gp2 = ggplot(stats)+geom_point(aes(y=community_est,x=coexp_group_ID),color=level_colors[1])+
+                      geom_errorbar(aes(y=community_est,x=coexp_group_ID,ymin=community_est/community_stderr,ymax=community_est*community_stderr), width = 0.2,color=level_colors[1])+
+                      geom_hline(yintercept=1,lty=2,col="gray")+ xlab("Co-expression Group")+ylab("Change in Coherence")+ 
+                        scale_y_continuous(trans = "log10",breaks = c(.25,.5,.75,1,2,3,4,5)) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  
+  gp3 = ggplot(stats)+ geom_text_repel(aes(y=community_est,x=gene_N,label=as.character(coexp_group_ID)),nudge_x=ifelse(stats$gene_N < median(stats$gene_N),-1,1),col="#AAAAAA")+
+                      geom_point(aes(y=community_est,x=gene_N),color=level_colors[1])+
+                      geom_errorbar(aes(y=community_est,x=gene_N,ymin=community_est/community_stderr,ymax=community_est*community_stderr), width = 0.2,color=level_colors[1])+
+                      geom_hline(yintercept=1,lty=2,col="gray")+ xlab("Co-expression Group Size")+ylab("Change in Coherence")+
+                        scale_y_continuous(trans = "log10",breaks = c(.25,.5,.75,1,2,3,4,5))+xlim(c(0,max(stats$gene_N)+2))
+  r <- rectGrob(gp=gpar(fill="white"))
+ 
+  lay <- rbind(c(1,1),
+              c(2,3))
+  grid.arrange(gp1, gp2, gp3, layout_matrix = lay)
+}
+
+```
+
+```{r}
+ #make list of most interesting communities changed by all genotypes
+correl_stats = community_gene_correlation_stats[order(abs(community_gene_correlation_stats$community_est),decreasing =T),]
+hist(abs(correl_stats$community_est))
+high_sig_correl_stats = correl_stats[abs(log(correl_stats$community_est))>=log(2) & fit_subgroup!="all",]
+to_output=unique(high_sig_correl_stats[,c("group","fit_subgroup","community","coexp_group_name","coexp_group_ID")])
+genes_in_significantly_changed_coexpression_groups = rbindlist(lapply(1:nrow(to_output),function(i){
+  res = data.frame(GeneName=ica_res[[to_output$group[i]]][[to_output$fit_subgroup[i]]]$community_genes[[to_output$community[i]]])
+  res$group = to_output$group[i]
+  res$fit_subgroup = to_output$fit_subgroup[i]
+  res$community = to_output$community[i]
+  res$coexp_group_name = to_output$coexp_group_name[i]
+   res$coexp_group_ID = to_output$coexp_group_ID[i]
+  res
+}))
+setkey(geneid,GeneName);
+genes_in_significantly_changed_coexpression_groups$GeneSymbol = geneid[genes_in_significantly_changed_coexpression_groups$GeneName,"GeneSymbol"]
+write.csv(genes_in_significantly_changed_coexpression_groups,"../data/differential_analysis/intervention_effects_on_covariance/intervention_gene_groups.csv")
+
+```
+
+
+
+```{r,fig.width=10,fig.height=10}
+#look for similarities among covarying genes in each group
+jaccard <- function(a, b) {
+  intersection = length(intersect(a, b))
+  union = length(a) + length(b) - intersection
+  return (intersection/union)
+}
+
+
+grp_col = c("group","coexp_group_ID")
+r = as.data.frame(genes_in_significantly_changed_coexpression_groups)
+groups_all = unique(r[grp_col])
+
+r = r[r$group %in% groups_all$group,]
+r$grp = apply(r,1,function(x)paste(x[grp_col],collapse=" "))
+groups = apply(groups_all,1,function(x)paste(x,collapse=" "))
+N = length(groups)
+ji = matrix(NA,nrow=N,ncol=N)
+ji_flat = data.frame(ji=rep(NA,N*N),group_1=rep("",N*N),C_1=rep("",N*N),group_2=rep("",N*N),C_2=rep("",N*N))
+
+for(i in 1:N)
+  for(j in 1:N){
+    if (i==j){ji[i,j] = 1; next;}
+   ji[i,j] = jaccard(r[r$grp == groups[i],"GeneName"],r[r$grp == groups[j],"GeneName"])
+   ji_flat[(i-1)*N+j,"ji"] = ji[i,j];
+   ji_flat[(i-1)*N+j,c("group_1","C_1","group_2","C_2")] = 
+     c(groups_all[i,],groups_all[j,])
+  }
+rownames(ji) = groups
+colnames(ji) = groups
+
+Heatmap(ji, cell_fun = function(j, i, x, y, w, h, col) { # add text to each grid
+        grid.text(round(ji[i, j],2), x, y,gp = gpar(col="white"))
+    })
+ji_flat = ji_flat[!is.na(ji_flat$ji),]
+ji_flat$grp2_lab = apply(ji_flat,1,function(x)paste0(x[["group_2"]]," ",x[["C_2"]]))
+ggplot(ji_flat,aes(x=group_1,y=ji,color=C_1))+geom_boxplot()+geom_text_repel(aes(label=ifelse(ji>.25,grp2_lab,"")))+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+  
+
+```
+
+```{r}
+#RUN gene enrichment
+
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+
+```{r}
+
+source("../scripts/helpers/enrichment_analysis.R")
+grp_col = c("group","fit_subgroup","community")
+gene_and_group_data = as.data.frame(genes_in_significantly_changed_coexpression_groups)
+groups_all = unique(gene_and_group_data[grp_col])
+gene_and_group_data$grp = apply(gene_and_group_data,1,function(x)paste(x[grp_col],collapse=" "))
+setkey(tissues_df,GeneName);
+gene_and_group_data$tissue = tissues_df[gene_and_group_data$GeneName,Tissue]
+groups = apply(groups_all,1,function(x)paste(x,collapse=" "))
+
+enrich_community<- lapply(names(gene_annotations), function(database) {
+  res = lapply(groups,function(cur_grp){
+    group = groups_all[which(groups == cur_grp),1]
+    cur_gene_and_group_data = gene_and_group_data[gene_and_group_data$grp == cur_grp,]
+    
+    #all members together
+    communities = unique(cur_gene_and_group_data$community);
+    genes = lapply(communities,function(x)cur_gene_and_group_data$GeneName[cur_gene_and_group_data$community == x])
+    names(genes) = as.character(communities)
+    enrichment_across_all_tissues = fisherEnrichment(gene_annotations[[database]], 
+                     genes,
+                     "Annotation", 
+                     universe = rownames(filter_tissue_combined_rho_list[[group]]))
+    
+    tissues_to_study = unique(gene_and_group_data$tissue)
+    enrichment_by_tissue = lapply(tissues_to_study,function(tis){
+      genes = lapply(communities,function(x)cur_gene_and_group_data$GeneName[cur_gene_and_group_data$community == x & cur_gene_and_group_data$tissue == tis])
+      names(genes) = as.character(communities)
+      fisherEnrichment(gene_annotations[[database]], 
+                     genes,
+                     "Annotation", 
+                     universe = rownames(filter_tissue_combined_rho_list[[group]]))
+    })
+    names(enrichment_by_tissue) = tissues_to_study
+    enrichment_by_tissue[["all"]] = enrichment_across_all_tissues;
+
+    enrichment_by_tissue
+  })
+  names(res) = groups;
+  res
+})
+names(enrich_community) <- names(gene_annotations)
+```
+
+
+```{r,fig.width=16,fig.height=16}
+source("../scripts/helpers/enrichment_analysis.R")
+
+ gp_enrich_community_data = rbindlist(lapply(groups,function(grp){ 
+   print(grp)
+   flush.console()
+   group_name = substring(grp,1,gregexpr(" ",grp)[[1]][1]-1)
+   tissues = names(enrich_community[[1]][[grp]]);
+    res = rbindlist(lapply(tissues,function(tis){
+     rbindlist(lapply(names(gene_annotations), function(database) {
+        results = enrich_community[[database]][[grp]][[tis]]$qvalue;
+        if(ncol(results) > 1) browser()
+        results = data.frame(category = rownames(results),qval=results[,1]) 
+        results$tissue=tis;
+        results$database=database;
+        results$coexp_group = grp;
+        results$group = group_name
+        results = results[results$qval<.05,]
+        results;
+      }))
+    }))
+ }))
+write.csv(gp_enrich_community_data,"../data/differential_analysis/intervention_effects_on_covariance/intervention_gene_group_enrichment.csv")
+```
+
+```{r,fig.width=15,fig.height=5}
+#load differential_expression_data
+da <- rbindlist(lapply(names(ica_res), function(filename) {
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename,".csv.gz"))
+ 
+  prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+  prefix = substring(names(df)[3],0,prefix_N-2)
+  names(df)[3:6] = paste0(substring(names(df)[3:6],prefix_N),"_mean")
+ 
+  df$comparison = prefix;
+  df$group = filename;
+  print(paste(filename,nrow(df),ncol(df)))
+  df_mean = df[, .(GeneName,GeneSymbol,log2FoldChange_mean,pvalue_mean,padj_mean,comparison,group)]
+  
+  df <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+  prefix_N = gregexpr("logFold",names(df)[7])[[1]][[1]];
+  prefix = substring(names(df)[7],0,prefix_N-2)
+  names(df)[7:10] = paste0(substring(names(df)[7:10],prefix_N),"_overdispersion")
+  df_overdispersion = df[, .(GeneName,logFoldChange_overdispersion,pvalue_overdispersion,padj_overdispersion)]
+  merge(df_mean,df_overdispersion,by="GeneName")
+}))
+```
+
+```{r}
+r = as.data.frame(genes_in_each_group)
+
+grp_col = c("group","community")
+groups_all = unique(r[grp_col])
+r$grp = apply(r,1,function(x)paste(x[grp_col],collapse=" "))
+groups = apply(groups_all,1,function(x)paste(x,collapse=" "))
+
+gp = lapply(groups,function(grp){
+    cur_group = groups_all[which(groups == grp),1]
+    da_cur = da[group == cur_group, .(GeneName,log2FoldChange,pvalue,padj,comparison)]
+  
+    da_cur$gene_present_in_covariation_list = da_cur$GeneName %in% r[r$grp==grp,"GeneName"]
+    #da_cur$pvalue = ifelse(log10(da_cur$pvalue) < -50,10^-50,da_cur$pvalue)
+    da_cur$sig=da_cur$padj<.01 & abs(da_cur$log2FoldChange) > 2
+    gp1= ggplot(da_cur,aes(log2FoldChange,-log10(padj))) + geom_point() + facet_wrap(~gene_present_in_covariation_list) +geom_hline(yintercept=-log10(.01))+ggtitle(paste(grp,paste(unique(da_cur$comparison),collapse=" ")))
+    
+    gp2 = ggplot(da_cur,aes(x=gene_present_in_covariation_list,fill=sig))+geom_bar(position="fill")+xlab("Genes Sig and 2-fold changed")
+    grid.arrange(gp1, gp2, nrow = 1)
+})
+names(gp) = groups
+  
+
+for(i in 1:length(gp)){
+    plot(gp[[i]])
+  }
+}
+
+```
+
+
+```{r,fig.width=7,fig.height=2.5}
+library("cowplot")
+library("ggplotify")
+
+for(grp in names(community_gene_correlations)){
+   stats = community_gene_correlation_stats[community_gene_correlation_stats$group ==grp,]
+   stats = stats[abs(log(stats$community_est)) > log(2) & stats$community_pvalue < .01 & fit_subgroup != "all",];
+   if (nrow(stats) == 0)
+     next;
+   #communities = unique(stats$community)
+   correls = community_gene_correlations[[grp]]
+   correl_comps = rbindlist(lapply(unique(stats$coexp_group_ID),function(cur_coexp_group_ID){
+        c1 = correls[correls$coexp_group_ID == cur_coexp_group_ID,];
+         res = dcast(c1,GeneName~subgroup, value.var = "correl_community");
+         res$coexp_group_ID = cur_coexp_group_ID
+         res;
+    }))
+   subgroups = unique(correls$subgroup);
+   da_cur = da[group == grp,]
+   
+   #chose the reference group in the correlation change analysis to match the reference group in the differential analysis
+   comp_str = da_cur$comparison[1] #we can do this because the comparison string lists the reference group second
+   subgroup_1_loc = regexpr(gsub(" ",".",subgroups[1]),comp_str);
+   subgroup_2_loc = regexpr(gsub(" ",".",subgroups[2]),comp_str)
+   if (subgroup_1_loc == -1 || subgroup_2_loc == -1)
+     stop("Could not find subgroups in da comparison")
+   if (subgroup_1_loc > subgroup_2_loc){
+       names(correl_comps)[names(correl_comps) == subgroups[1]] = "control_correlation";
+       names(correl_comps)[names(correl_comps) == subgroups[2]] = "intervention_correlation";
+    }else{ 
+      names(correl_comps)[names(correl_comps) == subgroups[1]] = "intervention_correlation";
+      names(correl_comps)[names(correl_comps) == subgroups[2]] = "control_correlation";
+    }
+  correl_comps$fold_change_correlation = correl_comps$intervention_correlation/correl_comps$control_correlation;
+  setkey(tissues_df,GeneName);
+  correl_comps$tissue = tissues_df[correl_comps$GeneName,Tissue]
+  
+  dat = merge(correl_comps,da_cur,by="GeneName")
+
+
+  gps = list();
+  coexp_ids = unique(dat$coexp_group_ID)
+ for (cur_coexpr in 1:length(coexp_ids)){
+   dat2 = dat[dat$coexp_group_ID==coexp_ids[[cur_coexpr]],]
+  # dat2$padj_mean[is.na(dat2$padj_mean)] = dat2$pvalue_mean[is.na(dat2$padj_mean)]
+  # dat2$padj_overdispersion[is.na(dat2$padj_overdispersion)] = dat2$pvalue_overdispersion[is.na(dat2$padj_overdispersion)]
+   
+   a = 
+     ggplot(dat2,aes(x=log2FoldChange_mean,
+                     y=log2(fold_change_correlation),
+                   #  fill=tissue,
+                     color=tissue,
+                     shape=as.factor(is.na(padj_mean) | padj_mean<.01)))+geom_point() +
+     geom_vline(xintercept=0,lty=2,col="gray") + 
+     geom_hline(yintercept=0,lty=2,col="gray") +
+     xlab("Population Mean (Fold Change)")+ 
+     ylab("Co-expression (Fold Change)") + 
+     scale_shape_manual(values = c(21,19))+
+     scale_colour_manual(values=tissue_colors, aesthetics = c("fill","color")) +
+     theme(legend.position = "none",plot.title = element_text(size=12),axis.title = element_text(size=12)) +
+     ggtitle(paste(grp,coexp_ids[cur_coexpr],comp_str));
+   
+   b = 
+     ggplot(dat2,aes(x=logFoldChange_overdispersion,
+                        y=log2(fold_change_correlation),
+                   #  fill=tissue,
+                     color=tissue,
+                     shape=as.factor(is.na(padj_mean) | padj_mean<.01)))+geom_point() + 
+     geom_vline(xintercept=0,lty=2,col="gray") + 
+     geom_hline(yintercept=0,lty=2,col="gray") + 
+     xlab("Overdispersion (Fold Change)")+
+     ylab("")+#Fold Change in Correlation") +
+     scale_shape_manual(values = c(21,19))+
+     scale_colour_manual(values=tissue_colors, aesthetics = c("fill","color")) +
+     theme(legend.position = "none",plot.title = element_text(size=12),axis.title = element_text(size=12))+ ggtitle(" ")
+   
+    leg_source =  ggplot(dat2,aes(x=logFoldChange_overdispersion,
+                        y=log2(fold_change_correlation),fill=tissue,color=tissue))+geom_point(pch=21) + 
+    scale_colour_manual(values=tissue_colors, aesthetics = c("fill","color")) 
+     
+    c=as.grob(cowplot::get_legend(leg_source))
+    grid.arrange(a,b,c, ncol = 3)
+  
+ }
+ 
+}
+
+
+```
+
+```{r}
+community_gene_correlation_stats[community_gene_correlation_stats$group =="grp"d8_glp1,]
+```
+
+```{r,fig.width=15,fig.height=5}
+source("../scripts/helpers/heatmap.r")
+#plot correlation matrix with co-expression groups overlaid (no separation of groups)
+gp = lapply(names(ica_res)[1],function(group){
+   lapply(names(ica_res[[group]]),function(subgroup){
+     
+     print(paste(group,subgroup))
+     i = 1;
+     gene_groups = rbindlist(lapply(ica_res[[group]][[subgroup]]$community_genes,function(x){
+             res = data.frame(GeneName = x)
+             res$group = i;
+             i <<- i+1
+             res
+     }))
+      subgroups = (names(filter_tissue_rho_list[[group]]))
+      if (subgroups[[1]] != subgroup)
+        subgroups = rev(subgroups);
+      if (length(subgroups) > 2)
+      subgroups = subgroups[subgroups != "3"]
+      
+      rho_1 = filter_tissue_rho_list[[group]][[subgroups[1]]] 
+      rho_2 = filter_tissue_rho_list[[group]][[subgroups[2]]] 
+      
+      #assign genes to uniuqe group and plot
+      gene_labels = rep(0,nrow(rho_1)); 
+      #if gene appears in multiple ICs then assign it to the one with the smallest label
+      val = aggregate(group~GeneName,gene_groups,FUN=min)
+      
+      names(val) = c("GeneName","group")
+      matches = match(rownames(rho_1),val$GeneName)
+        # browser()
+      gene_labels[!is.na(matches)] = val$group[matches[!is.na(matches)]]
+     # browser()
+    #browser()
+    #  gene_labels[gene_labels==2] = 1
+      #browser()
+      setkey(tissues_df,GeneName)
+      cur_tissue = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+      names(cur_tissue) = unique(tissues)
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,rho_2,
+                                          split_list=cur_tissue, 
+                                          show_dendrogram=F,
+                                          split_colors = tissue_colors,
+                                          name1 = subgroups[[1]],
+                                          name2 = subgroups[[2]],
+                                          gene_labels_1=gene_labels,
+                                          separate_plots=T)
+        draw(gp,row_title = group,column_title = paste(group,"fit on",subgroup))
+      
+   })
+})
+
+#for(i in 1:length(gp)){
+#  for(j in 1:length(gp[[i]]))
+ #   plot(gp[[i]][[j]])
+#}
+
+```
+
+
+```{r,fig.width=10,fig.height=8}
+plot_genes_outside_groups = F
+source("../scripts/helpers/heatmap.r")
+#plot correlation matrix with communities highlight overlaid
+library(RColorBrewer)
+to_plot = names(ica_res);
+gp = lapply(to_plot,function(group){
+  subgroups = names(ica_res[[group]])
+     print(group)
+    if (length(subgroups) > 3)
+      subgroups = subgroups[subgroups != "3" & subgroups != "11"]
+      
+     subgroups = subgroups[subgroups != "all"]
+     subgroup_to_plot = subgroups[subgroups != "all"]
+      
+      #we now load the genes in each coexpression group across the two subgroups fit
+      coexpression_groups_for_each_gene = lapply(subgroups,function(cur_fit_subgroup){
+        crls = community_gene_correlations[[group]]
+        crls = crls[crls$fit_subgroup == cur_fit_subgroup,]
+        gene_groups = rbindlist(lapply(unique(crls$coexp_group_ID),function(x){
+                   res = data.frame(GeneName = crls$GeneName[crls$coexp_group_ID == x])
+                   res$group = x
+                   res
+                   }))
+          
+          
+        rho_1 = filter_tissue_rho_list[[group]][[subgroups[1]]] 
+        if (!plot_genes_outside_groups){
+          genes_to_plot = rownames(rho_1) %in% community_gene_correlations[[group]]$GeneName;
+          
+          rho_1 = rho_1[genes_to_plot,genes_to_plot]
+        }
+        
+        #Genes can appear in multiple groups.  We assign multi-mapped genes to the largest group of which they are a member (the lowest group ID) 
+        gene_labels = rep("NG",nrow(rho_1)); 
+       # if(!("GeneName" %in% names(gene_groups)))browser()
+        val = aggregate(group~GeneName,gene_groups,FUN=function(x)min(as.integer(substring(x,2,4))))
+        names(val) = c("GeneName","group")
+        val$group = paste0("G",val$group)
+        matches = match(rownames(rho_1),val$GeneName)
+            # browser()
+        gene_labels[!is.na(matches)] = val$group[matches[!is.na(matches)]]
+        gene_labels;
+      })
+      names(coexpression_groups_for_each_gene) = subgroups;
+   
+ 
+      
+      rho_1 = filter_tissue_rho_list[[group]][[subgroup_to_plot[1]]] 
+      rho_2 = filter_tissue_rho_list[[group]][[subgroup_to_plot[2]]] 
+      
+     
+        if (!plot_genes_outside_groups){
+          genes_to_plot = rownames(rho_1) %in% community_gene_correlations[[group]]$GeneName;
+          rho_1 = rho_1[genes_to_plot,genes_to_plot]
+          rho_2 = rho_2[genes_to_plot,genes_to_plot]
+        }
+      
+      
+      if (is.null(rho_1) || is.null(rho_2)) browser()
+      
+      #prepare list with which to split heatmaps into co-expression groups
+      gene_split = lapply(subgroups,function(subgroup){
+        res = lapply(unique(coexpression_groups_for_each_gene[[subgroup]]),function(x){rownames(rho_1)[coexpression_groups_for_each_gene[[subgroup]]==x]})
+        names(res) = unique(coexpression_groups_for_each_gene[[subgroup]]);
+        res
+        })
+      names(gene_split) = subgroups;
+      
+      setkey(tissues_df,GeneName)
+      tissue_split = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+      names(tissue_split) = unique(tissues)
+   
+       #prepare colors--we want each coexpression group to get its own color across the two subgroups fit
+       colors = c(brewer.pal(12,"Paired"),brewer.pal(12,"Set3"))
+       colors = c(colors,colors)
+
+       colors = colors[1:(length(gene_split[[subgroup_to_plot[[1]]]])+length(gene_split[[subgroup_to_plot[[2]]]]))]
+       subgroup_1_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[1]]]]),2,4)
+       subgroup_2_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[2]]]]),2,4)
+       
+       subgroup_1_coexpression_groups = as.integer(subgroup_1_coexpression_groups[subgroup_1_coexpression_groups!="G"])
+       subgroup_2_coexpression_groups = as.integer(subgroup_2_coexpression_groups[subgroup_2_coexpression_groups!="G"])
+       
+       if ("NG" %in% c(names(gene_split[[subgroup_to_plot[[1]]]]),names(gene_split[[subgroup_to_plot[[2]]]]))){
+        colors_1 = c("black",colors[subgroup_1_coexpression_groups])
+        colors_2 = c("black",colors[subgroup_2_coexpression_groups])
+       }else{
+        colors_1 = c(colors[subgroup_1_coexpression_groups])
+        colors_2 = c(colors[subgroup_2_coexpression_groups])
+      }
+    
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                          gene_labels_1=coexpression_groups_for_each_gene[[subgroup_to_plot[[1]]]],
+                                          gene_labels_2=coexpression_groups_for_each_gene[[subgroup_to_plot[[2]]]],
+                                          #split_list_1=tissue_split, 
+                                          #split_list_2=tissue_split, 
+                                          #split_colors_1 = tissue_colors,
+                                          #split_colors_2 = tissue_colors,
+                                          split_list_1=gene_split[[subgroup_to_plot[[1]]]],
+                                          split_list_2=gene_split[[subgroup_to_plot[[2]]]],
+                                          split_colors_1 = colors_1,
+                                          split_colors_2 = colors_2,
+                                          show_dendrogram=F,
+                                          separate_plots=F,)
+       
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+      
+   })
+
+
+
+```
+
+```{r}
+groups = list("20C Wildtype across replicates" = c("d8_20v25C","n2_sw"),
+              "glp1_d8 vs nw_s2_d1" = c("d8_glp1","n2_sw"))
+subgroups = list("20C Wildtype across replicates"=c("20","8"),
+                 "glp1_d8 vs nw_s2_d1" = c("CB4037","1"))
+lapply(names(groups),function(group){
+ rho_1 = filter_tissue_rho_list[[groups[[group]][[1]]]][[subgroups[[group]][1]]] 
+  rho_2 = filter_tissue_rho_list[[groups[[group]][[2]]]][[subgroups[[group]][2]]] 
+  genes_1 = rownames(rho_1)
+  genes_2 = rownames(rho_2)
+  genes_in_common = intersect(genes_1,genes_2)
+  rho_1 = rho_1[genes_in_common,genes_in_common]
+  rho_2 = rho_2[genes_in_common,genes_in_common]
+  
+  setkey(tissues_df,GeneName)
+  cur_tissue = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+  names(cur_tissue) = unique(tissues)
+   gp = plotSplitCorrelationDiffHeatmap(rho_1,rho_2,
+                                      cur_tissue, 
+                                      colors = tissue_colors,
+                                      name1 = subgroups[[group]][1],
+                                      name2 = subgroups[[group]][2])
+    draw(gp,row_title = group,column_title = group)
+    
+    gp = plotSplitCorrelationDiffHeatmap(rho_2,rho_1,
+                                      cur_tissue, 
+                                      colors = tissue_colors,
+                                      name1 = subgroups[[group]][2],
+                                      name2 = subgroups[[group]][1])
+    draw(gp,row_title = group,column_title = group)
+})
+```
+```{r}
+#gp = lapply(names(ica_res)[1],function(group){
+subgroup_contents = list()
+for (group in names(ica_res)){
+  subgroups = names(ica_res[[group]])
+     print(group)
+    if (length(subgroups) > 3)
+      subgroups = subgroups[subgroups != "3" & subgroups != "11"]
+      
+     subgroups = subgroups[subgroups != "all"]
+     subgroup_to_plot = subgroups[subgroups != "all"]
+      
+      setkey(tissues_df,GeneName);
+      #we now load the genes in each coexpression group across the two subgroups fit
+     
+      
+      
+        crls = community_gene_correlations[[group]]
+        gene_groups = rbindlist(lapply(unique(crls$coexp_group_ID),function(x){
+                   res = data.frame(GeneName = unique(crls$GeneName[crls$coexp_group_ID == x]))
+                   res$group = x
+                   res
+                   }))
+       gene_groups$tissue = tissues_df[gene_groups$GeneName,Tissue]
+        lvls = unique(gene_groups$group)
+      lvls_int = as.integer(substring(lvls,2,4))
+   
+      gene_groups$group = factor(gene_groups$group,levels=lvls[order(lvls_int)])
+      
+      plot(ggplot(gene_groups,aes(x=group,fill=tissue))+geom_bar()+ylab("Gene Count") + ggtitle(group) + xlab("Co-expression group"))
+      setkey(geneid,GeneName);
+      gene_groups$GeneSymbol = geneid[gene_groups$GeneName,GeneSymbol]
+      
+      subgroup_contents[[group]] = lapply(unique(gene_groups$group),function(cur_group){
+        gg = gene_groups[gene_groups$group == cur_group,]
+        
+        do.call("paste0",lapply(unique(gg$tissue ),function(tis){
+          gg2 = gg[gg$tissue == tis,]
+          genes = gg2$GeneName
+          genes[gg2$GeneSymbol != ""] = gg2$GeneSymbol[gg2$GeneSymbol != ""]
+          paste0("***",tis,"***",paste(genes,collapse=", "),"     ")
+      }))})
+      names(subgroup_contents[[group]]) = unique(gene_groups$group);
+      
+      
+      
+}       
+```
+
+```{r,fig.width=6,fig.height=6}
+library(igraph)
+library(qgraph)
+#plot co-expression groups!
+make_graph_for_plotting = function(cov_mat){
+  #for nice plotting, we discard magnitude of correlations
+  weight_mat = apply(cov_mat,1,FUN=function(x)ifelse(abs(x)>.5,sign(x),0))
+  graph_from_adjacency_matrix(adjmatrix=weight_mat,weighted=T, mode="undirected",diag=F)
+}
+
+for (group in names(ica_res)){
+  subgroups = names(ica_res[[group]])
+     print(group)
+    if (length(subgroups) > 3)
+      subgroups = subgroups[subgroups != "3" & subgroups != "11"]
+      
+     subgroups = subgroups[subgroups != "all"]
+     subgroup_to_plot = subgroups[subgroups != "all"]
+      
+      setkey(tissues_df,GeneName);
+      #we now load the genes in each coexpression group across the two subgroups fit
+     
+      
+      
+        crls = community_gene_correlations[[group]]
+        gene_groups = data.table(rbindlist(lapply(unique(crls$coexp_group_ID),function(x){
+                   res = data.frame(GeneName = unique(crls$GeneName[crls$coexp_group_ID == x]))
+                   
+                   res$fit_subgroup = crls$fit_subgroup[1];
+                   res$group = x
+                   res
+                   })))
+        cg = unique(gene_groups$group);
+        gp = lapply(cg,function(cur_coexpr_group){
+          #assign genes in multiple groups to the single largest group
+          val = aggregate(group~GeneName+fit_subgroup,gene_groups[group == cur_coexpr_group],FUN=function(x)min(as.integer(substring(x,2,4))))
+          val$group = paste0("G",val$group)
+          gene_group_to_plot = val 
+          
+         gene_group_to_plot$tissue = tissues_df[gene_group_to_plot$GeneName,Tissue]
+         setkey(geneid,GeneName)
+         gene_group_to_plot$GeneSymbol = geneid[gene_group_to_plot$GeneName,GeneSymbol]
+         gene_group_to_plot$tissue = factor(gene_group_to_plot$tissue)
+         
+        lvls = unique(gene_group_to_plot$group)
+        lvls_int = as.integer(substring(lvls,2,4))
+        fit_subgroups = unique(names(filter_tissue_rho_list[[group]]))
+        fit_subgroups = fit_subgroups[fit_subgroups!="all"]
+   
+        cur_fit_subgroup = unique(gene_group_to_plot$fit_subgroup)
+        if (length(cur_fit_subgroup) > 1) stop("each community should arise from only a single fit subgroup!")
+      
+        #layout_cov_mat =  filter_tissue_rho_list[[group]][[cur_fit_subgroup]]
+        #layout_cov_mat = cov_mat[gene_groups$GeneName,gene_groups$GeneName]
+        #for nice plotting, we discard magnitude of correlations
+        #layout_weight_mat = apply(cov_mat,1,FUN=function(x)ifelse(abs(x)>.5,sign(x),0))
+        
+        #layout_graph = graph_from_adjacency_matrix(adjmatrix=weight_mat,weighted=T, mode="undirected",diag=F)
+        layout_graph = make_graph_for_plotting(filter_tissue_rho_list[[group]][[cur_fit_subgroup]][gene_group_to_plot$GeneName,gene_group_to_plot$GeneName])
+       
+        cur_tissues = unique(gene_group_to_plot$tissue);
+        tissue_pos = data.frame(tissue=cur_tissues,angle = seq(0,2*pi,length.out=(length(cur_tissues)+1))[1:length(cur_tissues)])
+        radius = 4.5
+        label_radius = 1.7
+        tissue_radius = 1.5;
+        tissue_pos$x = radius*cos(tissue_pos$angle)
+        tissue_pos$y = radius*sin(tissue_pos$angle)
+        tissue_pos$label_x=label_radius*cos(tissue_pos$angle);
+        tissue_pos$label_y=label_radius*sin(tissue_pos$angle)
+       #calculate layouts, centering each tissue around the position specified
+       #in tissue_pos
+        multi_tissue_layout = data.table(rbindlist((lapply(cur_tissues,function(x){
+          tissue_genes = unique(gene_group_to_plot$GeneName[gene_group_to_plot$tissue==x]);
+          tissue_subgraph = induced_subgraph(layout_graph,tissue_genes)
+          new_center = matrix(unlist(tissue_pos[tissue_pos$tissue==x,c("x","y")]),ncol=2)
+          
+          lt = layout.fruchterman.reingold(tissue_subgraph,weights=1+E(tissue_subgraph)$weight/2)
+          
+          #scale all points to between -tissue_radius and tissue_radius
+          if (class(lt) != "numeric" && nrow(lt)>1){
+            lt = apply(lt,2,function(x){(x-mean(x))/diff(rev(range(x)))*2*tissue_radius})
+            l = t(apply(lt,1,function(y){y+new_center}))
+          }else{
+            l = new_center;
+          }
+          l = data.frame(l)
+          l$GeneName = tissue_genes
+          l
+        }))))
+        setkey(multi_tissue_layout,GeneName)
+        final_layout = as.matrix(multi_tissue_layout[names(V(layout_graph)),.(X1,X2)])
+      
+        tiss_graph = make_clusters(layout_graph,as.integer(gene_group_to_plot$tissue))
+        subgroups = fit_subgroups;
+        for (cur_subgroup in subgroups){
+          edge_graph = make_graph_for_plotting(filter_tissue_rho_list[[group]][[cur_subgroup]][gene_group_to_plot$GeneName,gene_group_to_plot$GeneName])
+         # browser()
+          plot(tiss_graph,edge_graph,
+               layout=final_layout,
+               vertex.label=NA, col="white",vertex.border="black", vertex.size=6,
+               edge.color=ifelse(E(edge_graph)$weight>0,rgb(.3,.3,.3,.25),rgb(0,0,1,.25)),
+               #vertex.label=gene_group_to_plot$Gene Symbol,
+               edge.width=1,edge.lty=1,curved=T,margin=.5,mark.col=tissue_colors[levels(gene_group_to_plot$tissue)],mark.border="black")
+          title(paste(group,cur_coexpr_group,cur_subgroup))
+          for (i in 1:nrow(tissue_pos)){
+           text(tissue_pos$label_x[i],tissue_pos$label_y[i],tissue_pos$tissue[i])  
+          }
+        }
+    })
+
+}       
+```
+
+#Plot effect of intervention on correlations as scatter plot (doesn't work well)
+```{r,fig.height=4,fig.width=12}
+source("../scripts/helpers/heatmap.r")
+
+
+gp = lapply(names(filter_tissue_rho_list),function(group){
+  subgroups = (names(filter_tissue_rho_list[[group]]))
+  
+  rho_1 = filter_tissue_rho_list[[group]][[subgroups[1]]] 
+  rho_2 = filter_tissue_rho_list[[group]][[subgroups[2]]] 
+  
+  rho_1 = sign(rho_1)*rho_1^2
+  rho_2 = sign(rho_2)*rho_2^2
+
+  comp_name = matrix("",nrow=nrow(rho_1),ncol=ncol(rho_1))
+  for (i in 1:nrow(rho_1))
+      comp_name[i,j] = paste(rownames(rho_1)[i],rownames(rho_1))
+  
+  comp_df = data.frame(rho_1 = as.vector(rho_1[upper.tri(rho_1)]),
+                       rho_2 = as.vector(rho_2[upper.tri(rho_2)]),
+                       comp = as.vector(comp_name[upper.tri(comp_name)]))
+  
+  setkey(tissues_df,GeneName)
+  cur_tissue = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+  names(cur_tissue) = unique(tissues)
+  ggplot(comp_df,aes(rho_1,rho_2)) + geom_point_rast(alpha=.2) +xlab(subgroups[[1]]) + ylab(subgroups[[2]]);
+})
+for (i in 1:length(gp))
+  plot(gp[[i]])
+
+```
+#load community info
+```{r}
+extractCorVector <- function(rho, genes) {
+  out <- rho[rownames(rho) %in% genes, colnames(rho) %in% genes]
+  row_genenames = matrix(rownames(out),nrow=nrow(out),ncol=ncol(out))
+  col_genenames = matrix(colnames(out),nrow=nrow(out),ncol=ncol(out),byrow=T)
+  data.frame(cor=as.vector(out[lower.tri(out)]),
+             GeneName_1=as.vector(row_genenames[lower.tri(row_genenames)]),
+             GeneName_2=as.vector(col_genenames[lower.tri(col_genenames)]))
+}
+
+community_data_day_8 <- readRDS("../data/gene_network/gene_network_d8.rds")
+communities = community_data_day_8[["tissue_communities"]]
+communities_flat = rbindlist(lapply(names(communities),function(x){
+                                        df = data.frame(GeneName = communities[[x]])
+                                        df$Community = x;
+                                        df;
+                                      }))
+communities_flat$Community_num = as.integer(substring(communities_flat$Community,10,11))
+```
+```{r}
+gp = lapply(names(filter_tissue_rho_list),function(group){
+   subgroups = names(filter_tissue_rho_list[[group]])
+  
+  rho_1 = extractCorVector(filter_tissue_rho_list[[group]][[subgroups[1]]],unique(communities_flat$GeneName))
+  rho_2 = extractCorVector(filter_tissue_rho_list[[group]][[subgroups[2]]],unique(communities_flat$GeneName))
+  rhos = merge(rho_1,rho_2,by=c("GeneName_1","GeneName_2"),suffixes=c("1","2"))
+  rhos = merge(rhos,communities_flat[,.(GeneName,Community)],by.x="GeneName_1",by.y="GeneName")
+  rhos = merge(rhos,communities_flat[,.(GeneName,Community)],by.x="GeneName_2",by.y="GeneName",suffixes=c("1","2"))
+  rhos_int = rhos[rhos$Community1 == rhos$Community2,]
+  
+  rho_1$group = subgroups[[1]]
+  rho_2$group = subgroups[[2]]
+  rhos_conc = rbind(rho_1,rho_2)
+  rhos_conc = merge(rhos_conc,communities_flat[,.(GeneName,Community)],by.x="GeneName_1",by.y="GeneName")
+  rhos_conc = merge(rhos_conc,communities_flat[,.(GeneName,Community)],by.x="GeneName_2",by.y="GeneName",suffixes=c("1","2"))
+  rhos_conc_int = rhos_conc[rhos$Community1 == rhos_conc$Community2,]
+  plot(ggplot(rhos_conc_int,aes(fill=group,color=group)) + geom_histogram(aes(cor,stat(density))) +geom_vline(xintercept=0,lty=2,color="gray")+ facet_wrap(~Community1)+ggtitle(group))
+    plot(ggplot(rhos_conc_int,aes(fill=group,color=group)) + stat_ecdf(aes(cor),geom = "step") +geom_vline(xintercept=0,lty=2,color="gray")+ facet_wrap(~Community1)+ggtitle(group))
+})
+```
+

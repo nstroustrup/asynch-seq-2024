@@ -1,0 +1,4091 @@
+---
+title: "Gene Variability"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+if (!require("BiocManager", quietly = TRUE)){
+  install.packages("BiocManager")
+  BiocManager::install(version = "3.18")
+  BiocManager::install(c("ComplexHeatmap", "scran"))
+}
+
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+#library(BASiCS)
+library(dendextend)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+require(scales)
+library(RColorBrewer)
+library(stringr)
+library(boot)
+library(pbapply)
+theme_set(theme_cowplot())
+
+source("../scripts/notebooks_helpers/gene_variability.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/basics.R")
+source("../scripts/helpers/clustering.R")
+source("../scripts/helpers/preprocess.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-4 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+cluster_colors <- c("firebrick", "sienna1", "cornflowerblue", "darkorchid", "black")
+```
+
+## Load data
+
+### Gene names
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+tissue_labels = c("germ_line" = "germ line",hypodermis = "hypodermis",intestine = "intestine/pharynx",muscle = "muscle", neurons="neurons")
+```
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+
+```
+
+### Counts
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+model_names = c("n2_series_all","d8_sw","d1_sw","n2_sw","d_glp1","d8_glp1");
+
+#model_names = c("d_glp1_m");
+#model_names = c("d8_20v25C")
+#model_names = c("ts_d_25C");
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+counts =lapply(model_names, function(x){
+                                  r = bc$batch_counts_list[[x]]
+                                  r[,colnames(r) %in% data$annots$Sample]
+                                 })
+names(counts) = model_names
+erccs =lapply(model_names, function(x){
+                                  r = data$ercc
+                                  r[,colnames(r) %in% colnames(counts[[x]])]
+                                 })
+names(erccs) = model_names
+mRNAs =lapply(model_names, function(x){
+                                  r = data$counts
+                                  r[,colnames(r) %in% colnames(counts[[x]])]
+                                 })
+names(mRNAs) = model_names
+
+setkey(data$annots,Sample)
+annot_list <- lapply(model_names,function(x){
+                  r = data$annots[colnames(counts[[x]]),]
+                  r$model = x;
+                  r
+                })
+names(annot_list) = model_names
+annots <- unique(rbindlist(annot_list))
+setkey(annots, Sample)
+annots[, Strain := droplevels(Strain)]
+annots[, Genotype := droplevels(Genotype)]
+annots[, Day := droplevels(Day)]
+annots[, Group := droplevels(Group)]
+
+#standard whole-animal normalization--doesn't use ERCCs
+nf <- lapply(model_names,function(x){print(x);
+  normalizationFactor(counts[[x]], groups = annots[annots$model==x,][colnames(counts[[x]]),Group])})
+names(nf) = model_names;
+
+norm <- lapply(model_names,function(x){normalizeCounts(counts[[x]], nf[[x]])})
+names(norm) = model_names;
+
+rm(data, bc)
+```
+#caculate sample sizes
+```{r}
+res = rbindlist(lapply(names(annot_list),function(grp){
+  dat = annot_list[[grp]];
+ res = as.data.table(aggregate(Sample~Strain+Day+Pooled+BiologicalReplicate,dat[Exclude==F,],length))
+ res$grp = grp
+ res[order(res$Day),]
+}))
+res
+#lapply(res,function(x)sum(x$Sample))
+write.csv(res[grp=="n2_series_all",],"../data/sample_sizes_ts.csv")
+```
+
+```{r}
+if(0){
+dat = norm[["n2_series"]]
+cur_annots = annots[model=="n2_series",]
+#find genes whose expression was above 5 counts in all animals on at least one day of adulthood
+good_on_each_day  = sapply(unique(cur_annots$Day),function(cur_day){
+  apply(dat[,cur_annots[Day==cur_day,Sample]],1,function(x) !any(x<5))
+})
+genes_to_use = apply(good_on_each_day,1,any)
+dat = log(dat[genes_to_use,])
+good_on_each_day  = sapply(unique(cur_annots$Day),function(cur_day){
+   d = cur_annots[Day==cur_day,Sample]
+   d-apply(d,1,mean)
+}
+
+```
+
+```{r}
+if (recalc_corr){
+		corr_m = matrix(NA,nrow=ncol(dat),ncol=ncol(dat))
+		rownames(corr_m) = colnames(corr_m) = colnames(dat)
+		for (i in 1:ncol(dat)){
+			for (j in i:ncol(dat)){
+				corr_m[i,j] = corr_m[j,i] = cor(dat[,i],dat[,j], method = "p")
+			}
+		}
+}
+
+```
+```{r}
+ngroups=10
+ scaling_group_colors = c("black",brewer.pal(ngroups-1,"Dark2"),"gray","dark gray","pink")
+  	clustered_dat =hclust(as.dist((1-(corr_m))), method = "complete")
+  	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+  	RNAi_scaling_groups = cutree(clustered_dat,k=ngroups)
+  	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+```
+
+
+```{r}
+if(0){
+binned = matrix(NA,nrow=nrow(dat),ncol=ncol(dat))
+colnames(binned) = colnames(dat)
+for (i in 1:nrow(dat)){
+  x = dat[i,]
+  rng = quantile(x,c(0,.5,1))
+  rng[length(rng)]=rng[length(rng)]+1
+  rng[1]=rng[1]-1
+  binned[i,] = cut(x,breaks=rng)
+}
+res = prcomp(t(binned))
+tmp  = sapply(unique(cur_annots$Day),function(cur_day){
+  me
+  ncol(unique(binned[,cur_annots[Day==cur_day,Sample]],MARGIN=2))
+})
+}
+
+```
+
+```{r}
+
+
+#load set of genes that are present in embryos and blastomeres. 
+embryo_dat <- as.data.frame(fread("../data/tissue_unique_genes/present_in_embryos.csv.gz",header=T,skip=1))
+embryo_dat_summary = data.table(Wormbase=embryo_dat$Wormbase,total=rowSums(embryo_dat[,3:ncol(embryo_dat)]))
+embryo_abundance_cutoff = 50
+blastomere_dat <- as.data.frame(fread("../data/tissue_unique_genes/present_in_blastomeres.csv.gz",skip=1))
+blastomere_dat_summary = data.table(Wormbase=blastomere_dat$Wormbase,total=rowSums(blastomere_dat[,3:ncol(embryo_dat)]))
+blastomere_abundance_cutoff = .5
+setkey(blastomere_dat_summary,Wormbase)
+setkey(embryo_dat_summary,Wormbase)
+tissues_df$in_blastomere = blastomere_dat_summary[tissues_df$GeneName,total]>blastomere_abundance_cutoff
+tissues_df$in_embryo = embryo_dat_summary[tissues_df$GeneName,total]>embryo_abundance_cutoff
+nonembryonic_genes = tissues_df[in_embryo==F,GeneName]
+table(tissues[nonembryonic_genes])
+
+special_subset = tissues_df$GeneName[!grepl("vit",tissues_df$GeneSymbol)]
+
+germline_soma = tissues
+germline_soma[germline_soma != "germ_line"] <- "soma"
+
+tissue_nfs = lapply(model_names, function(x){
+    tissue_nf <- normalizationFactorTissueSpecific(mRNAs[[x]], groups = annot_list[[x]]$Group, tissues = tissues)
+    simplify2array(tissue_nf)
+})
+names(tissue_nfs) = model_names
+
+tissue_no_embryo_nfs = lapply(model_names, function(x){  
+    counts_to_use = mRNAs[[x]][nonembryonic_genes,]
+    tissue_nf <- normalizationFactorTissueSpecific(counts_to_use, groups = annot_list[[x]]$Group, tissues = tissues[nonembryonic_genes])
+    simplify2array(tissue_nf)
+})
+
+tissue_subset_nfs = lapply(model_names, function(x){  
+    counts_to_use = mRNAs[[x]][nonembryonic_genes,]
+    tissue_nf <- normalizationFactorTissueSpecific(counts_to_use, groups = annot_list[[x]]$Group, tissues = tissues[nonembryonic_genes])
+    simplify2array(tissue_nf)
+})
+
+
+names(tissue_no_embryo_nfs) = model_names
+
+germline_soma_nfs = lapply(model_names, function(x){
+    tissue_nf <- normalizationFactorTissueSpecific(mRNAs[[x]], groups = annot_list[[x]]$Group, tissues = germline_soma)
+    simplify2array(tissue_nf)
+})
+names(germline_soma_nfs) = model_names
+
+germline_soma_no_embryo_nfs = lapply(model_names, function(x){
+    counts_to_use = mRNAs[[x]][nonembryonic_genes,]
+    tissue_nf <- normalizationFactorTissueSpecific(counts_to_use, annot_list[[x]]$Group, tissues = germline_soma[nonembryonic_genes])
+    simplify2array(tissue_nf)
+})
+names(germline_soma_no_embryo_nfs) = model_names
+
+ercc_nfs = lapply(model_names, function(x){
+    normalizationFactor(erccs[[x]], groups = annot_list[[x]]$Group)
+})
+names(ercc_nfs) = model_names
+
+tissue_sfs <- lapply(model_names, function(x){
+  print(x)
+  sweep(tissue_nfs[[x]], 1, ercc_nfs[[x]], "/")
+})
+names(tissue_sfs) = model_names
+
+tissue_no_embryo_sfs <- lapply(model_names, function(x){
+  print(x)
+  sweep(tissue_no_embryo_nfs[[x]], 1, ercc_nfs[[x]], "/")
+})
+names(tissue_no_embryo_sfs) = model_names
+
+germline_soma_sfs <- lapply(model_names, function(x){
+  sweep(germline_soma_nfs[[x]], 1, ercc_nfs[[x]], "/")
+})
+names(germline_soma_sfs) = model_names
+
+germline_soma_no_embryo_sfs <- lapply(model_names, function(x){
+  sweep(germline_soma_no_embryo_nfs[[x]], 1, ercc_nfs[[x]], "/")
+})
+names(germline_soma_no_embryo_sfs) = model_names
+
+```
+```{r,fig.width=12,fig.height=4}
+r = data.table(tissue_sfs[["n2_series_all"]])
+r$Sample = rownames(tissue_sfs[["n2_series_all"]])
+ann = annot_list[["n2_series_all"]]
+dat = merge(r,ann,by="Sample")
+dat = dat[grepl("TS_",Sample),]
+unique_tissues = colnames(tissue_sfs[["n2_series_all"]])
+res = rbindlist(lapply(unique(ann$Day),function(day){
+  rbindlist(lapply(unique_tissues,function(t1){
+     rbindlist(lapply(unique_tissues,function(t2){
+       if (t1 == t2) return(NULL)
+      data.table(day=day,tissue_1 = t1, tissue_2 = t2, corr = cor(dat[Sample %in% annots[Day == day,Sample],get(t1)],dat[Sample %in% annots[Day == day,Sample],get(t2)],method="s"))
+    }))
+  }))
+}))
+res$t1 = factor(res$tissue_1)
+res$t2 = factor(res$tissue_2)
+res[,comp := paste(tissue_1,tissue_2)]
+res[,type := ifelse(grepl("germ",comp),"germline-soma","soma-soma")]
+res$day = as.integer(as.character(res$day))
+to_plot = res[as.integer(t1)<as.integer(t2),]
+a = ggplot(to_plot,aes(day,corr,color=comp,shape=type)) + geom_point(size=2) + geom_line() + scale_x_continuous(breaks=c(1,2,4,6,8,10,12))+xlab("Day of Adulthood")+ylab("Correlation between Size Factors")
+
+res_sum = aggregate(corr~type+day,to_plot,mean)
+names(res_sum)[3] = "mean"
+res_sum2 = aggregate(corr~type+day,to_plot,function(x)sd(x)/sqrt(length(x)))
+names(res_sum2)[3] = "sderr"
+res_sum3 = merge(res_sum,res_sum2,by=c("day","type"))
+b = ggplot(res_sum3,aes(day,mean,color=type,shape=type)) + geom_point(size=2) + geom_line() + geom_errorbar(aes(ymin=mean-sderr,ymax=mean+sderr))+ scale_x_continuous(breaks=c(1,2,4,6,8,10,12))+xlab("Day of Adulthood")+ylab("Correlation between Size Factors")
+ggpubr::ggarrange(a,b,ncol=2,nrow=1)
+ggsave("../figures/R2R/tissue_correlation_timeseries.png",width=12,height=4)
+
+```
+
+
+```{r,fig.width=4,fig.height=4}
+library(lemon)
+for (dat_type in 1:2){
+  if (dat_type == 1){
+    res = tissue_sfs[["n2_series_all"]]
+  }else{
+    res = tissue_no_embryo_sfs[["n2_series_all"]]
+  }
+
+res2 = melt(res[grepl("TS_QZ0",rownames(res)),])
+names(res2) = c("Sample","tissue","sf")
+setkey(annots,Sample)
+res2$day = as.integer(as.character(annot_list[["n2_series_all"]][as.character(res2$Sample),Day]))
+day1_mean_per_tissue = data.table(aggregate(sf~tissue,res2[res2$day==1,],median))
+setkey(day1_mean_per_tissue,tissue);
+res2$sf_n = sapply(1:nrow(res2),FUN=function(x)res2$sf[x]/day1_mean_per_tissue[as.character(res2$tissue[x]),sf])
+
+res2_summary = aggregate(sf_n~tissue+day,res2,function(x)quantile(x,c(.025,.5,.975)))
+res2_summary$m = res2_summary$sf_n[,2]
+res2_summary$l = res2_summary$sf_n[,1]
+res2_summary$u = res2_summary$sf_n[,3]
+
+mn = function(data,x){
+  mean(data$sf_n[x]);
+  
+}
+
+res2 = data.table(res2)
+res2_summary = rbindlist(lapply(unique(res2$tissue),function(cur_tissue){
+   
+ rbindlist(lapply(unique(res2$day),function(cur_day){
+  dat= res2[tissue==cur_tissue & day == cur_day,];
+  boot.res = boot(dat,mn,R=2000)
+  boot_ci_d12 = boot.ci(boot.out = boot.res,type = 'perc')
+  res = data.table(t(mn(dat,1:nrow(dat))))
+  res = cbind(res,data.table(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     tissue = cur_tissue))
+ }))
+}))
+names(res2_summary)[1] = "m"
+
+
+jitter_x = 0.4
+#0-order interpolation confidence intervals around each point to contain jitter
+res2_summary$center = F
+res2_summary = rbindlist(lapply(1:nrow(res2_summary),function(i){
+  r = rbind(res2_summary[i,],
+            res2_summary[i,],
+            res2_summary[i,])
+  r[1,]$day = r[1,]$day - jitter_x;
+  r[3,]$day = r[3,]$day + jitter_x;
+  r[2,]$center = T
+  data.table(r)
+}))
+
+gp = ggplot(res2,aes(x=day,y=sf_n)) + 
+  geom_hline(yintercept=1,lty=1,col="gray")+
+  geom_point(position = position_jitter(w = jitter_x, h = 0),size=1)+
+  geom_line(data=res2_summary[center==T,],aes(y=m,color=tissue_labels[tissue]),lty=1,lwd=1)+
+  geom_ribbon(aes(x=day,ymin = l, ymax = u,fill=tissue_labels[tissue]), data=res2_summary[ifelse(center==T,day >= 1 & day <= 12,day<1 | day>12),],alpha = 0.3,inherit.aes = FALSE)+
+  scale_x_continuous(breaks=c(1,2,4,6,8,10,12)) +
+  scale_y_continuous(breaks=c(2^(-3:4)),labels=c("1/8","1/4","1/2","1","2","4","8","16")) +
+  coord_trans(y="log2")+
+  facet_rep_wrap(~tissue_labels[as.character(tissue)],scales="fixed",repeat.tick.labels = T) +
+  theme(strip.background =element_rect(fill="white"),legend.position="none",strip.text = element_text(colour = 'black')) +
+ xlab("Age (days)")+
+
+ylab(expression(Tissue~lambda,(relative~to~day~1)))
+  plot(gp)
+}
+
+  if (dat_type == 1){
+   ggsave("../figures/02/S_tissue_size_vs_time.pdf",width=6,height=6)
+  }else{
+   ggsave("../figures/02/S_tissue_size_vs_time_no_embryo.pdf",width=6,height=6)
+  }
+
+#library(ggridges)
+#ggplot(res2,aes(y=day,x=sf_n,group=day)) + geom_density_ridges(scale=1)+ 
+ # facet_wrap(~tissue,scale="free_x")
+```
+
+#plot soma vs germline changes with age
+```{r,fig.width=8,fig.height=8}
+for (dat_type in 1:2){
+plot_means = F
+ if (dat_type == 1){
+    res = germline_soma_sfs[["n2_series_all"]]
+  }else{
+    res = germline_soma_no_embryo_sfs[["n2_series_all"]]
+  }
+#res$Sample = rownames(res)
+res2 = melt(res[grepl("TS_QZ0",rownames(res)),])
+names(res2) = c("Sample","tissue","sf")
+setkey(annots,Sample)
+res2$day = as.integer(as.character(annot_list[["n2_series_all"]][as.character(res2$Sample),Day]))
+day1_mean_per_tissue = data.table(aggregate(sf~tissue,res2[res2$day==1,],median))
+setkey(day1_mean_per_tissue,tissue);
+res2$sf_n = sapply(1:nrow(res2),FUN=function(x)res2$sf[x]/day1_mean_per_tissue[as.character(res2$tissue[x]),sf])
+
+if (!plot_means){
+#calculate medians of each day
+res2_summary = aggregate(sf_n~tissue+day,res2,function(x)quantile(x,c(.05,.5,.95)))
+res2_summary$m = res2_summary$sf_n[,2]
+res2_summary$l = res2_summary$sf_n[,1]
+res2_summary$u = res2_summary$sf_n[,3]
+}else{
+#mean
+res2_summary = aggregate(sf_n~tissue+day,res2,function(x)mean(x))
+res2_summary$m = res2_summary$sf_n
+res2_summary$u = res2_summary$sf_n
+res2_summary$l = res2_summary$sf_n
+}
+ggplot(res2,aes(x=day,y=sf_n)) + geom_hline(yintercept=1,lty=1,col="gray")+geom_point(cex=.8,position = position_jitter(w = 0.4, h = 0))+
+  geom_line(data=res2_summary,aes(y=m),col="red",lty=1,lwd=1)+
+  geom_ribbon(aes(x=day,ymin = l, ymax = u), data=res2_summary,alpha = 0.1,inherit.aes = FALSE,bg="red")+
+  scale_x_continuous(breaks=c(2,4,6,8,10,12)) +
+  scale_y_continuous(breaks=c(2^(-4:4))) +
+  coord_trans(y="log2")+
+  facet_wrap(~tissue,scale="free_x")
+
+library(ggridges)
+ggplot(res2,aes(y=day,x=sf_n,group=day)) + geom_density_ridges(scale=1)+ 
+  facet_wrap(~tissue,scale="free_x")
+
+if(plot_means){
+#calculate CI on medians on each day
+mn = function(data,x){
+  r = mean(data$sf_n[x])
+  names(r) = "mean";
+  r
+}
+}else{
+ mn = function(data,x){
+  r = median(data$sf_n[x])
+  names(r) = "median";
+  r
+} 
+}
+library(boot)
+cis = rbindlist(lapply(unique(res2$day),function(cur_day){
+  rbindlist(lapply(unique(res2$tissue),function(cur_tissue){
+    dat = res2[res2$day == cur_day & res2$tissue == cur_tissue,]
+    boot_res_d12 = boot(dat,mn,R=2000)
+    boot_ci_d12 = boot.ci(boot.out = boot_res_d12,type = 'perc')
+    res = data.frame(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     tissue = cur_tissue)
+  }))
+}))
+cis_wide_l = dcast(cis,day~tissue,value.var = "l")
+cis_wide_u = dcast(cis,day~tissue,value.var = "u")
+cis_wide = merge(cis_wide_l,cis_wide_u,by="day",suffixes=c(".95_ci_l",".95_ci_u"))
+
+
+
+#put everything into a wide orientation
+res_wide = dcast(res2,Sample~tissue,value.var = "sf_n")
+res_wide$day = as.integer(as.character(annot_list[["n2_series_all"]][as.character(res_wide$Sample),Day]))
+res_wide = res_wide[order(res_wide$day),]
+res_wide_sum_a = dcast(res2_summary,day~tissue,value.var = "m")
+res_wide_sum_b = dcast(res2_summary,day~tissue,value.var = "u")
+res_wide_sum_c = dcast(res2_summary,day~tissue,value.var = "l")
+res_wide_sum=merge(res_wide_sum_b,res_wide_sum_c, by="day",suffixes=c(".u",".l"))
+res_wide_sum=merge(res_wide_sum_a,res_wide_sum, by="day")
+res_wide_sum = merge(res_wide_sum,cis_wide,by="day")
+res_wide_sum = res_wide_sum[order(res_wide_sum$day),]
+
+
+
+germ_soma_all = ggplot(res_wide,aes(x=soma,y=germ_line,color=day,label=day)) +
+  geom_rect(data=res_wide_sum,aes(fill=day,ymin=germ_line.95_ci_l, ymax=germ_line.95_ci_u,xmin=soma.95_ci_l, xmax=soma.95_ci_u),color=NA,alpha=.2)+
+  geom_abline(intercept=0,slope=1,col="gray",linewidth=1)  +
+  geom_vline(xintercept=1,col="gray",linewidth=1,linetype ='solid')  +
+  geom_hline(yintercept=1,col="gray",linewidth=1,linetype ='solid')  +
+  scale_x_continuous(trans='log2',breaks=c(2^(-3:4)),labels=c("1/8","1/4","1/2","1","2","4","8","16"))+
+  scale_y_continuous(trans='log2',breaks=c(2^(-3:4)),labels=c("1/8","1/4","1/2","1","2","4","8","16"))+
+  #plot path linking means of each day
+  geom_point()+ 
+  geom_path(data=res_wide_sum,aes(x=soma,y=germ_line),color="white",linewidth=6, lineend = "round") +
+  geom_path(data=res_wide_sum,aes(x=soma,y=germ_line),color="black",linewidth=5, lineend = "round") +
+  geom_path(data=res_wide_sum,aes(x=soma,y=germ_line),linewidth=4, lineend = "round") +
+  #geom_point(data=res_wide_sum,size=2)+  
+  scale_colour_gradientn(colours=c("black", "light blue","red"),values=c(0,.5,1))+ 
+  scale_fill_gradientn(colours=c("black", "light blue","red"),values=c(0,.5,1))+ 
+  xlab("Somatic Transcriptome Size\n(relative to day 1)") +
+  ylab("Germline Transcriptome Size\n(relative to day 1)")  + theme(legend.position=c(0.05,.8))
+plot(germ_soma_all)
+#
+  # geom_label_repel(data=res_wide_sum,cex=4) 
+ if (dat_type == 1){
+   ggsave("../figures/02/soma_vs_germline.pdf",width=8,height=8)
+  }else{
+    ggsave("../figures/02/S_soma_vs_germline_no_embryo.pdf",width=6,height=6)
+  }
+dat = glm(sf~tissue,res2[res2$day==12,],family=gaussian(link="log"))
+
+d12 = res2[res2$day==12,]
+}
+
+
+```
+### Load Gene variability data
+```{r,fig.width=8,fig.height=8}
+
+mn = function(data,x){
+  r = cor(data$germ_line[x],data$soma[x],method="p")
+  lm_res = lm(germ_line~soma,data=data[x,])
+  rsq = summary(lm_res)$r.squared
+  res = c(r,rsq)
+  names(res) = c("cor","rsq")
+  res;
+}
+
+cors = rbindlist(lapply(unique(res_wide$day),function(cur_day){
+  dat = res_wide[res_wide$day==cur_day,]
+  est = data.frame(t(mn(dat,1:nrow(dat))))
+  est$day = cur_day
+  est$soma = max(res_wide$soma)
+  est$germ_line = max(res_wide$germ_line)
+
+  boot_res = boot(dat,mn,R=2000);
+ 
+  boot_ci = boot.ci(boot.out = boot_res,type = 'perc',index=c(1))
+  est$cor_l = boot_ci$percent[4];
+  est$cor_u = boot_ci$percent[5]
+  boot_ci = boot.ci(boot.out = boot_res,type = 'perc',index=c(2))
+  est$rsq_l = boot_ci$percent[4];
+  est$rsq_u = boot_ci$percent[5];
+ 
+  est
+}))
+
+gp = ggplot(res_wide[res_wide$day %in% c(1,12),],aes(x=soma,y=germ_line,fill=day,color=day)) +
+  geom_abline(intercept=0,slope=1,col="gray",lty="22")  +
+  geom_vline(xintercept=1,col="gray",lty="22")  +
+  geom_hline(yintercept=1,col="gray",lty="22")  +
+  scale_x_continuous(trans='log2',breaks=c(2^(-3:4)),labels=c("1/8","1/4","1/2","1","2","4","8","16"))+
+  scale_y_continuous(trans='log2',breaks=c(2^(-3:4)),labels=c("1/8","1/4","1/2","1","2","4","8","16"))+
+  #plot path linking means of each day
+  geom_point(alpha=.4,pch=21,stroke=NA)+ 
+  geom_text(aes(label=paste("Corr:",round(cor,2)),x=soma/2),data=cors[cors$day %in% c(1,12)],color="black")+
+  geom_smooth(method="lm",lwd=2,se=F,color="black")+
+  geom_smooth(method="lm",lwd=1,se=F,)+
+  #geom_point(data=res_wide_sum,size=2)+  
+  scale_colour_gradientn(colours=c("black", "light blue","red"),values=c(0,.5,1))+ 
+  scale_fill_gradientn(colours=c("black", "light blue","red"),values=c(0,.5,1))+ 
+  xlab(expression(Somatic~lambda,)) +
+  ylab(expression(Germline~lambda)) +facet_wrap(~day,labeller = labeller(day=function(x)paste("Day",x))) +
+    theme(strip.background  = element_blank(),legend.position="none")
+gp2 = ggplot(cors,aes(x=day,y=cor))+geom_ribbon(aes(ymin=cor_l,ymax=cor_u),alpha=.2,fill="red",col=NA) +geom_point()+ geom_line()+
+  
+  scale_x_continuous(breaks=c(1,2,4,6,8,10,12)) + scale_y_continuous(limits=c(.25,1))+
+ # geom_hline(yintercept=1,col="gray",lty="22")+  
+  geom_hline(yintercept=cors$cor[cors$day==1],col="gray",lty="22")  +
+  xlab("Age (days)") + ylab("Germline / Soma\nCorrelation")
+ gp_3 = ggpubr::ggarrange(germ_soma_all,ggpubr::ggarrange(plotlist=list(gp,gp2),nrow=1),nrow=2,heights = c(3,1))
+
+ggsave("../figures/02/soma_vs_germline.pdf",gp_3,width=8,height=8)
+  # geom_label_repel(data=res_wide_sum,cex=4) 
+
+
+dat = glm(sf~tissue,res2[res2$day==12,],family=gaussian(link="log"))
+
+d12 = res2[res2$day==12,]
+```
+#load mean variance estimates
+```{r}
+params_df = NULL;
+trend_df = NULL
+param_models = c("n2_sw","n2_series","d8_glp1","d1_glp1")
+  for (model in param_models){
+    p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,".csv.gz"))
+    if (!("Food" %in% names(p))) p[,Food:=""]
+    if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+    p$model = model
+    params_df = rbind(p,params_df,fill=TRUE);
+     p <- fread(paste0("../data/gene_variability/summary_trend_",model,".csv.gz"))
+  p$model = model
+  trend_df = rbind(p,trend_df,fill=TRUE);
+  }
+  params_df[, Day := factor(Day, levels(annots$Day))]
+  params_df[, Strain := factor(Strain, levels(annots$Strain))]
+  params_df[, Food := factor(Food, levels(annots$Food))]
+  params_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+  params_df <- params_df[AllZeroProp == 0]
+  params_df$ResDisp = as.numeric(params_df$ResDisp)
+  dva_df = list();#differential mean and variability analysis
+  #mean analysis columns have suffixes "DeSeq"
+ if(0) for (model in model_names){ 
+    dva_df[[model]] <-  fread(paste0("../data/gene_variability/regression_effects_",model,".csv.gz"))
+    dva_df[[model]] <-  dva_df[[model]][MeanMissingValueProp == 0]
+    dma_df_tmp <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/",model,".csv.gz"))
+    colnames(dma_df_tmp)[3:ncol(dma_df_tmp)] <- paste0(colnames(dma_df_tmp)[3:ncol(dma_df_tmp)], "_DESeq")
+    dva_df[[model]] <- merge(dva_df[[model]], dma_df_tmp, by = "GeneName")
+  }
+
+params_shared_tech_df = NULL;
+trend_shared_tech_df= NULL
+for (model in param_models){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,"_shared_tech.csv.gz"))  
+  if (!("Food" %in% names(p))) p[,Food:=""]
+  if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+  p$model = model
+  params_shared_tech_df = rbind(p,params_shared_tech_df,fill=TRUE);
+  p <- fread(paste0("../data/gene_variability/summary_trend_",model,"_shared_tech.csv.gz"))
+  p$model = model
+  trend_shared_tech_df = rbind(p,trend_shared_tech_df,fill=TRUE);
+}
+params_shared_tech_df[, Day := factor(Day, levels(annots$Day))]
+params_shared_tech_df[, Strain := factor(Strain, levels(annots$Strain))]
+params_shared_tech_df[, Food := factor(Food, unique(annots$Food))]
+params_shared_tech_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+params_shared_tech_df <- params_shared_tech_df[AllZeroProp == 0]
+```
+
+```{r}
+p = params_shared_tech_df[model=="d8_glp1" & SequenceType=="Biological" & 2^LogMean > 10 & bad_fit ==F,]
+p2 = dcast(p[,.(GeneName,Strain,ResVar)],GeneName~Strain,value.var="ResVar")
+p3 = p2[apply(p2[,2:3],1,function(x)!any(x<0)),]
+p3 = p3[!is.na(p3$QZ0),]
+p4=melt(p3,id.var="GeneName")
+p4$GT = ifelse(p4$variable=="QZ0","Intact","Germline-Ablated")
+colors = c("Intact"="black","Germline-Ablated"="red")
+ggplot(p4,aes(x=value,color=GT,fill=GT))+geom_density(lwd=1,alpha=.1)+scale_color_manual(values=colors)+scale_fill_manual(values=colors) +theme(legend.position="none")
+ggsave("../figures/02/variance_glp1_vs_wt_d8.pdf",width=4,height=4)
+
+
+aggregate(2^(value)~GT,p4,mean)
+
+#calculate CI on medians on each day
+calc_mean=F
+if (calc_mean){
+mn = function(data,x){
+  #browser()
+  r = mean(apply(data[x,],1,function(x)x[["CB4037"]]/x[["QZ0"]]))
+  names(r) = "mean";
+  r
+}
+}else{
+ mn = function(data,x){
+  r = median(apply(data[x,],1,function(x)x[["CB4037"]]/x[["QZ0"]]))
+  names(r) = "median";
+  r
+} 
+}
+library(boot)
+
+p5 = 2^as.matrix(p3[,c("CB4037","QZ0")])
+bt = boot(p5,mn,R=500)
+bt2 = boot.ci(boot.out = bt,type = 'perc')
+res = data.frame(mean = mn(p5,1:nrow(p5)),
+               l = bt2$percent[4],
+               u = bt2$percent[5])
+
+ggplot(p5,aes(QZ0,CB4037))+geom_point()+geom_abline(slope=1,intercept=1,col="red")
+```
+
+
+```{r}
+params_df = NULL;
+trend_df = NULL
+param_models = c("n2_sw","n2_series","d8_glp1","d1_glp1")
+  for (model in param_models){
+    p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,".csv.gz"))
+    if (!("Food" %in% names(p))) p[,Food:=""]
+    if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+    p$model = model
+    params_df = rbind(p,params_df,fill=TRUE);
+     p <- fread(paste0("../data/gene_variability/summary_trend_",model,".csv.gz"))
+  p$model = model
+  trend_df = rbind(p,trend_df,fill=TRUE);
+  }
+  params_df[, Day := factor(Day, levels(annots$Day))]
+  params_df[, Strain := factor(Strain, levels(annots$Strain))]
+  params_df[, Food := factor(Food, levels(annots$Food))]
+  params_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+  params_df <- params_df[AllZeroProp == 0]
+  params_df$ResDisp = as.numeric(params_df$ResDisp)
+  dva_df = list();#differential mean and variability analysis
+  #mean analysis columns have suffixes "DeSeq"
+ if(0) for (model in model_names){ 
+    dva_df[[model]] <-  fread(paste0("../data/gene_variability/regression_effects_",model,".csv.gz"))
+    dva_df[[model]] <-  dva_df[[model]][MeanMissingValueProp == 0]
+    dma_df_tmp <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/",model,".csv.gz"))
+    colnames(dma_df_tmp)[3:ncol(dma_df_tmp)] <- paste0(colnames(dma_df_tmp)[3:ncol(dma_df_tmp)], "_DESeq")
+    dva_df[[model]] <- merge(dva_df[[model]], dma_df_tmp, by = "GeneName")
+  }
+
+params_shared_tech_df = NULL;
+trend_shared_tech_df= NULL
+for (model in param_models){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,"_shared_tech.csv.gz"))  
+  if (!("Food" %in% names(p))) p[,Food:=""]
+  if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+  p$model = model
+  params_shared_tech_df = rbind(p,params_shared_tech_df,fill=TRUE);
+  p <- fread(paste0("../data/gene_variability/summary_trend_",model,"_shared_tech.csv.gz"))
+  p$model = model
+  trend_shared_tech_df = rbind(p,trend_shared_tech_df,fill=TRUE);
+}
+params_shared_tech_df[, Day := factor(Day, levels(annots$Day))]
+params_shared_tech_df[, Strain := factor(Strain, levels(annots$Strain))]
+params_shared_tech_df[, Food := factor(Food, unique(annots$Food))]
+params_shared_tech_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+params_shared_tech_df <- params_shared_tech_df[AllZeroProp == 0]
+```
+
+```{r}
+p = params_shared_tech_df[model=="d1_glp1" & SequenceType=="Biological" & 2^LogMean > 10 & bad_fit ==F,]
+p2 = dcast(p[,.(GeneName,Strain,ResVar)],GeneName~Strain,value.var="ResVar")
+p3 = p2[apply(p2[,2:3],1,function(x)!any(x<0)),]
+p3 = p3[!is.na(p3$QZ0),]
+p4=melt(p3,id.var="GeneName")
+p4$GT = ifelse(p4$variable=="QZ0","Intact","Germline-Ablated")
+colors = c("Intact"="black","Germline-Ablated"="red")
+ggplot(p4,aes(x=value,color=GT,fill=GT))+geom_density(lwd=1,alpha=.1)+scale_color_manual(values=colors)+scale_fill_manual(values=colors) +theme(legend.position="none")
+ggsave("../figures/02/variance_glp1_vs_wt_d1.pdf",width=4,height=4)
+
+
+aggregate(2^(value)~GT,p4,mean)
+
+#calculate CI on medians on each day
+calc_mean=F
+if (calc_mean){
+mn = function(data,x){
+  #browser()
+  r = mean(apply(data[x,],1,function(x)x[["CB4037"]]/x[["QZ0"]]))
+  names(r) = "mean";
+  r
+}
+}else{
+ mn = function(data,x){
+  r = median(apply(data[x,],1,function(x)x[["CB4037"]]/x[["QZ0"]]))
+  names(r) = "median";
+  r
+} 
+}
+library(boot)
+
+p5 = 2^as.matrix(p3[,c("CB4037","QZ0")])
+bt = boot(p5,mn,R=500)
+bt2 = boot.ci(boot.out = bt,type = 'perc')
+res = data.frame(mean = mn(p5,1:nrow(p5)),
+               l = bt2$percent[4],
+               u = bt2$percent[5])
+
+ggplot(data.frame(p5),aes(QZ0,CB4037))+geom_point()+geom_abline(slope=1,intercept=1,col="red")
+```
+
+
+#load time series differential_expression_data
+```{r}
+filename = "n2_series"
+
+mean_df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename,".csv.gz"))
+
+mean_effect_cols = grepl("log2",names(mean_df)) & !grepl("BiologicalReplicate",names(mean_df))
+mean_padj_cols = grepl("adj",names(mean_df)) & !grepl("BiologicalReplicate",names(mean_df))
+mean_tmp_df = mean_df[,mean_effect_cols |mean_padj_cols,with=F]
+names(mean_tmp_df) = paste0(str_replace(names(mean_tmp_df),"_vs_1",""),".mean")
+names(mean_tmp_df) = str_replace(names(mean_tmp_df),"Day_","Day")
+mean_tmp_df$GeneName = mean_df$GeneName;
+
+var_df <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz")) 
+var_effect_cols = grepl("logFold",names(var_df)) & !grepl("BiologicalReplicate",names(var_df))& !grepl("Intercept",names(var_df))
+var_padj_cols = grepl("adj",names(var_df)) & !grepl("BiologicalReplicate",names(var_df))& !grepl("Intercept",names(var_df))
+var_tmp_df = var_df[,var_effect_cols |var_padj_cols,with=F]
+names(var_tmp_df) = paste0(str_replace(names(var_tmp_df),"logFoldChange","log2FoldChange"),".resvar")
+var_tmp_df$GeneName = var_df$GeneName;
+
+da_df = merge(mean_tmp_df,var_tmp_df,by="GeneName");
+col_prefix = substring(names(da_df),4,do.call("c",lapply(gregexpr("_",colnames(da_df)),function(x)x[[1]]))-1)
+col_prefix = col_prefix[2:length(col_prefix)]#remove geneName
+da_long_df = rbindlist(lapply(unique(col_prefix),function(day){
+  df = da_df[,1+which(col_prefix == day),with=F]
+  names(df) = substring(names(df),5+nchar(day),nchar(names(df)))
+  df$GeneName = da_df$GeneName;
+  df$Day = day;
+  df
+}))
+
+da_long_df$Day_factor = factor(da_long_df$Day,levels=c("2","4","6","8","10","12"))
+
+da_long_df$var_sig = ifelse(da_long_df$padj.resdisp >= .001,"NS",ifelse(da_long_df$log2FoldChange.resdisp>0,"Up","Down"))
+
+da_long_df$mean_sig = ifelse(da_long_df$padj.mean >= .001,"NS",ifelse(da_long_df$log2FoldChange.mean>0,"Up","Down"))
+da_long_df$both_sig = apply(da_long_df,1,function(x)paste(x[["mean_sig"]],x[["var_sig"]]))
+
+```
+
+#load n2_sw differential_expression
+```{r}
+#load differential_expression_data
+dva_multiple_shared_tech = list();
+model_names = "n2_sw"
+
+load_single_da = function(filename,shared_resvar_model){
+  print(filename)
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename,".csv.gz"))
+ # browser()
+  multiple_regression_model = grepl("\\+",models$BiologicalCovariates[models$Name == filename]);
+  if (!multiple_regression_model){
+    prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+    prefix = substring(names(df)[3],0,prefix_N-2)
+  
+    names(df)[3:6] = paste0(substring(names(df)[3:6],prefix_N),".mean")
+     
+    df$comparison.mean = prefix;
+    df$group = filename;
+    print(paste(filename,nrow(df),ncol(df)))
+   #print(names(df))
+    df_mean = df[, .(GeneName,GeneSymbol,log2FoldChange.mean,pvalue.mean,padj.mean,comparison.mean,group)]
+    
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,ifelse(shared_resvar_model,"_shared_tech",""),".csv.gz"))
+    prefix2_N = gregexpr("logFold",names(df2)[7])[[1]][[1]];
+    prefix2 = substring(names(df2)[7],0,prefix2_N-2)
+  
+    names(df2)[7:10] = paste0(substring(names(df2)[7:10],prefix2_N),".resvar")
+    df_overdispersion = df2[, .(GeneName,logFoldChange.resvar,pvalue.resvar,padj.resvar)]
+    df_overdispersion$comparrison_da =  prefix2
+    
+    ret = merge(df_mean,df_overdispersion,by="GeneName");
+    return(ret);
+  }
+else{
+    fold_change_columns = which(grepl("FoldChange",names(df))& !grepl("Intercept",names(df)))
+    prefix_N = gregexpr("log2",names(df)[fold_change_columns])
+    prefix = unlist(lapply(1:length(fold_change_columns),function(col)substring(names(df)[fold_change_columns[col]],0,prefix_N[[col]][[1]]-2)))
+    regression_results = lapply(1:length(fold_change_columns),function(col){
+      tmp = df[,fold_change_columns[[col]]:(fold_change_columns[[col]]+3)];
+       names(tmp) = paste0(substring(names(tmp),nchar(prefix[[col]])+2,nchar(prefix[[col]])+30),"_mean")
+       tmp$GeneName = df$GeneName;
+       tmp
+    })
+    names(regression_results) = prefix
+    
+    #add variability data to each estimand's table
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+    fold_change_columns2 = which(grepl("FoldChange",names(df2)) & !grepl("Intercept",names(df2)))
+    prefix2_N = gregexpr("log",names(df2)[fold_change_columns2])
+    prefix2 = unlist(lapply(1:length(fold_change_columns2),function(col)substring(names(df2)[fold_change_columns2[col]],0,prefix2_N[[col]][[1]]-2)))
+    
+     for (col in 1:length(fold_change_columns2)){
+       source_cols = names(df2)[fold_change_columns2[[col]]:(fold_change_columns2[[col]]+3)];
+       dest_cols = paste0(substring(source_cols,nchar(prefix2[[col]])+2,nchar(prefix2[[col]])+30),"_overdispersion")
+       tmp = df2[,source_cols,with=F];
+       names(tmp) = dest_cols;
+       tmp$GeneName = df2$GeneName;
+       regression_results[[ prefix[[col]] ]] = merge( regression_results[[ prefix[[col]] ]],tmp,by="GeneName")
+     }
+    mean_overdispersion_name_matches = unlist(lapply(1:length(fold_change_columns),function(i)paste(prefix[[i]], "(",prefix2[[i]],")")))
+    
+    dva_multiple_shared_tech[[filename]] <<- list(estimands = regression_results, variables = prefix,variable_matches=mean_overdispersion_name_matches)
+    return(NULL)
+}
+}
+
+dva_separate_tech_df <- rbindlist(lapply("n2_sw", function(filename)load_single_da(filename,F)))
+dva_shared_tech_df <- rbindlist(lapply(model_names, function(filename)load_single_da(filename,T)))
+
+
+#add a bunch of important labels for data integration to the table
+dva_shared_tech_df = rbindlist(lapply(unique(dva_shared_tech_df$group),function(cur_group){
+
+ g = dva_shared_tech_df[group==cur_group,]
+  
+  RES_VAR_QUANTITATIVE_THRESHOLD = 1
+  
+  cur_param = params_shared_tech_df[model==cur_group & bad_fit == F & SequenceType=='Biological',]
+
+  #exclude genes with a mean less than 25 in either condition
+ # print(frm)
+  frm  = "BaseMean ~ GeneName + Day"
+  gene_min = as.data.table(aggregate(as.formula(frm),cur_param,FUN=min))
+  
+  frm  = "ResVar ~ GeneName + Day"
+  gene_above_var_quantitative_threshold = as.data.table(aggregate(as.formula(frm),cur_param,FUN=function(x)any(x>=RES_VAR_QUANTITATIVE_THRESHOLD)))
+  
+  g$variance_above_minimum_quantative_threshold=F
+  g$expression_above_minimum_count_threshold=F
+  g[GeneName %in% gene_min[BaseMean>=25,GeneName], expression_above_minimum_count_threshold:=T]
+  g[GeneName %in% gene_above_var_quantitative_threshold[ResVar==T,GeneName],variance_above_minimum_quantative_threshold:=T]
+  g
+}))
+
+```
+
+
+```{r}
+dat = dva_shared_tech_df[group=="n2_sw"&variance_above_minimum_quantative_threshold&expression_above_minimum_count_threshold]
+dat$cv = dat$logFoldChange.resvar/2-dat$log2FoldChange.mean
+cv_decrease_enrich <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   data.table(GeneName=dat$GeneName[dat$cv<0]), 
+                   "Annotation", 
+                   universe = dat$GeneName)
+})
+names(cv_decrease_enrich) <- names(gene_annotations)
+lapply(names(gene_annotations),function(x){
+  v = cv_decrease_enrich[[x]][["qvalue"]]
+  
+  d = data.table(n=rownames(v),vals=v[,1])
+  d[vals<.05,]
+})
+```
+
+
+
+#output supplementary tables
+```{r}
+fwrite(params_shared_tech_df[Pooled==F & bad_fit==F,.(GeneName,SequenceType,Strain,Day,LogMean,LogVar,ResVar,model)],"../tables/02_mean_variation_aging.csv.gz")
+  
+fwrite(dva_shared_tech_df,"../tables/03_mean_variation_aging_effect.csv.gz")
+
+```
+
+
+```{r}
+wt_hits = fread("../data/scaling_models/hits_list.csv")
+all_tested = fread("../data/scaling_models/all_list.csv")
+lifespan_data = fread("../data/lifespan/scaling_hits_survival_summary.csv") #generated by lifespan.Rmd
+
+lifespan_hits = data.frame(GeneSymbol=unique(lifespan_data[p<.01&transfer_day == 4,GeneSymbol]))
+setkey(geneid,GeneSymbol)
+lifespan_hits$GeneName = geneid[lifespan_hits$GeneSymbol,GeneName]
+#wt_hits$GeneName = geneid[wt_hits$GeneSymbol,GeneName]
+
+dva_hits = dva_shared_tech_df[GeneName %in% all_tested$GeneName,]
+ggplot(dva_hits,aes(log2FoldChange.mean,padj.mean)) + geom_point() + scale_y_continuous(trans="log10")
+dva_hits = dva_hits[order(abs(log2FoldChange.mean)),]
+print(dva_hits[,.(GeneSymbol,log2FoldChange.mean,padj.mean)])
+dva_hits[,lifespan_effect := ifelse(GeneName %in% lifespan_hits$GeneName,"yes","no")]
+dva_hits[,RNAi_performed := ifelse(GeneName %in% wt_hits$GeneName,"yes","no")]
+
+hex <- hue_pal()(nrow(dva_hits))
+names(hex) = dva_hits$GeneSymbol
+colors = c(hex,c(`yes`="black",`no` = "NA"));
+stroke_vals = c(`yes`=1,`no` = 0);
+size_vals = c(`yes`=1.5,`no` = 2);
+
+
+ggplot(dva_hits,
+       aes(2^log2FoldChange.mean,
+           2^logFoldChange.resvar,
+           label=GeneSymbol,
+           fill=GeneSymbol,
+           color=GeneSymbol)) +
+  geom_vline(xintercept=c(1/1.5,1.5),col="gray",lty=2)+
+  geom_point(pch=21,fill=colors[dva_hits$GeneSymbol],color=colors[dva_hits$RNAi_performed],stroke=stroke_vals[dva_hits$RNAi_performed],size=size_vals[dva_hits$RNAi_performed]) +
+  scale_color_manual(values=colors)+
+  geom_hline(yintercept=1,lty=1,col="dark gray")+
+  scale_x_continuous(trans="log2",breaks=c(2^(-3:3)),labels=c(paste0("1/",2^(3:1)),2^(0:3)))+
+  scale_y_continuous(trans="log2",breaks=2^(-2:16))+ geom_vline(xintercept=1,lty=1,col="dark gray") +
+  theme(legend.position="none") + 
+  geom_label_repel(fill="#FFFFFF",label.size=NA,aes(color=GeneSymbol),max.overlaps=12)  +
+  xlab("Change in Mean\nBetween Days 1 and 8") + 
+  ylab("Change in Variance Between Days 1 and 8")
+
+ggsave("../figures/03/hit_mean_vs_variance_changes_day1_8.pdf",width=4,height=8)
+
+```
+
+
+#PLOT RESIDUAL VARIATION DIAGNOSTIS AND OVERLAY TREND LINES ETC
+```{r,fig.width=12,fig.height=8}
+source("../scripts/helpers/gene_variability.R")
+ library(viridis) 
+library(ggExtra)
+i = "n2_sw"
+ #  print(i)
+
+
+
+days_to_plot = c(1,8)
+colors_point = c("1 mRNA"="black","8 mRNA"="dark red","1 spike-in" = "green","8 spike-in" = "orange")
+colors_line = c("1 spike-in"="blue","8 spike-in"="red")
+
+
+
+params <- params_shared_tech_df[model == i & bad_fit == F & LogMean >=log2(1) & Day %in% days_to_plot & Strain=="QZ0" & !is.na(ResVar) ,]
+params$type = "shared";
+trends= trend_shared_tech_df[model == i & Day %in% days_to_plot,];
+trend_columns = 6:34
+#trends = trends[,trend_columns,with=F]
+trends$type = "shared"
+
+
+params2 <- params_df[model == i & bad_fit == F & LogMean >=log2(1) & Day %in% days_to_plot & Strain=="QZ0"  & !is.na(ResVar) ,]
+trends2 = trend_df[model == i & Day %in% days_to_plot,]  
+params2$type = "separate";
+trend_columns2 = 6:34
+#trends2= trends2[,trend_columns2,with=F]
+trends2$type = "separate"
+  
+params=rbind(params,params2,fill=T)
+trends2 = rbind(trends,trends2)
+
+cutoff_quantile_value = .9
+cutoff_std_value = quantile(params[ SequenceType=="Consensus Technical",ResVar],cutoff_quantile_value)
+
+
+  params$grp = factor(as.character(params$Strain))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  
+
+  params$transcript_type = ifelse(params$SequenceType == "Biological","mRNA","spike-in")
+
+  if(0){
+    trend_line = rbindlist(lapply(unique(params$Day),function(str){
+      fit = generate_predictive_model_from_min_fit(as.numeric(trends[model == i & Day==str,][,6:34]))
+      new_x = seq(min(params[Day==str,]$LogMean), max(params[Day==str,]$LogMean), length.out = 1001)
+      data.table(LogMean = new_x,LogDisp=predict(fit,new_x)$y,Day=str,SequenceType = "Technical")
+    }))
+  }else{
+    trend_line = rbindlist(lapply(unique(params$Day),function(str){
+      
+      tl = data.frame(t(trends[model == i & Day==str,][,trend_columns,with=F]))
+     # browser()
+      names(tl) = "LogVar";
+      tl$LogMean = log2(as.numeric(substring(rownames(tl),2,10)))
+      tl = tl[!is.na(tl$LogVar) & !is.na(tl$LogMean),]
+      tl$Day = str;
+      tl
+    }))
+  }
+  
+  params$newstdev = sqrt(2^params$LogVar)
+ # params$cv = params$newstdev/2^params$LogMean
+  
+ # trend_line$newstdev = 2^sqrt(LogVar)#sqrt(2^trend_line$LogDisp*((2^(trend_line$LogMean))^2)+2^trend_line$LogMean)
+ trend_line$newstdev =  sqrt(2^trend_line$LogVar)
+  trend_fit = smooth.spline(trend_line$LogMean,log2(trend_line$newstdev))
+ # params$ResDisp_standard = params$LogDisp - predict(trend_fit,params$LogMean)$y
+
+  
+  
+  lm(params$newstdev~sqrt(params$BaseVar))
+  
+  lfit = lm(log10(newstdev)~log10(2^(LogMean)),trend_line[2^trend_line$LogMean < 700 & 2^trend_line$LogMean > 2])
+  lcoef = coef(lfit)# we find that log(stdev) = .5 * log(mean) in our spike ins, so
+                    # the method has a scaling law stdev = mean^.5   .  Wow!
+  
+  
+  lfit2 = lm(log10(sqrt(BaseVar))~log10(BaseMean),params[Day==1 & 2^LogMean < 700 & 2^LogMean > 2])
+  
+  
+ # params$fixed_stdev = 2^(log2(params$newstdev)-predict(trend_fit,params$LogMean)$y)-1
+  params$cv =  params$fixed_stdev/2^params$LogMean
+  
+  
+  gp = ggplot(data=NULL,aes(2^LogMean, 2^LogVar)) +
+   geom_point_rast(aes(fill=paste(Day,transcript_type)),params[ SequenceType=="Biological",] , alpha = .3, 
+               size=1.5,shape=21,stroke=0) +
+    geom_point(aes(fill=paste(Day,transcript_type)),params[ SequenceType=="Consensus Technical",] , alpha = 1, 
+               size = 2, shape = 21,stroke=0) +
+    scale_x_log10(labels = scales::number_format())  + 
+    scale_y_log10(labels = scales::number_format())  + 
+    geom_line(aes(color=paste(Day,"spike-in")),trend_line,lwd=1) +  
+    scale_color_manual(values=colors_line) +
+  scale_fill_manual(values=colors_point) +facet_wrap(~as.character(Day)) +
+    geom_hline(yintercept = c(-4))+
+   
+   #geom_smooth(aes(2^(LogMean), LogDisp,color=paste(tech,SequenceType)), params[SequenceType=="Technical",],method="loess", se=F,size=.75)+
+   
+    xlab("Mean Gene Expression") +
+    
+    ylab(expression(Variation~across~cohort~(Days^2)))+ 
+    ggtitle(paste(tech_type,"Disp"))
+ # scale_color_viridis(discrete = TRUE) 
+  plot(gp)
+  if (tech_type == "shared"){
+     
+  gp = ggplot(data=NULL,aes(2^LogMean, newstdev)) +
+   geom_point_rast(aes(fill=paste(Day,transcript_type)),params[ SequenceType=="Biological",] , alpha = .3, 
+               size=1.5,shape=21,stroke=0,raster.dpi=600) +
+    geom_point(aes(fill=paste(Day,transcript_type)),params[ SequenceType=="Consensus Technical",] , alpha = 1, 
+               size = 2, shape = 21,stroke=0) +
+    #geom_point(aes(color=paste(Day,transcript_type)),params[ SequenceType!="Technical",] , alpha = .5, 
+    #           size = 2, pch = 20) +
+    scale_x_log10(labels = scales::number_format())  + 
+    scale_y_log10(labels = scales::number_format())  + 
+   
+      xlab("Mean Gene Expression (Counts per individual)") +
+    ylab(expression(Variation~across~cohort~(Days^2)))+ 
+    ggtitle(paste(tech_type,"Disp"))+
+    geom_vline(xintercept = 2,col="dark gray",lty=2)+
+    geom_vline(xintercept = 200,col="dark gray",lty=2)+
+    geom_abline(intercept=lcoef[1],slope=lcoef[2],col="dark gray",lwd=1) +
+   geom_abline(slope=1.02,intercept=.2,col="dark gray",lty=2,lwd=1)+
+   geom_abline(slope=1.02,intercept=-1.4,col="dark gray",lty=2,lwd=1) + 
+     geom_line(aes(color=paste(Day,"spike-in")),trend_line,lwd=1,lwd=1) +
+    scale_color_manual(values=colors_line,name="Spike-in standardization fit") +
+  scale_fill_manual(values=colors_point,name="RNA Species") +
+      theme(legend.position = c(0.01, 0.8))+
+    facet_wrap(~as.character(Day)+Pooled)
+ # scale_color_viridis(discrete = TRUE) 
+  plot(gp)
+  ggsave("../figures/01/S_raw_variance_diagnostic.pdf",width=12,height=8)
+  
+ # measurement_cutoff = quantile(params[ SequenceType=="Consensus Technical",ResVar],.9)
+    
+    gp = ggplot(data=NULL,aes(2^LogMean, 2^ResVar)) +
+   geom_point_rast(aes(fill=paste(Day,transcript_type)),params[ SequenceType=="Biological",] , alpha = .3, 
+               size=1.5,shape=21,stroke=0,raster.dpi=600) +
+    geom_point(aes(fill=paste(Day,transcript_type)),params[ SequenceType=="Consensus Technical",] , alpha = 1, 
+               size = 2, shape = 21,stroke=0) +
+      #geom_point(aes(color=paste(Day,transcript_type)),params[ SequenceType!="Technical",] , alpha = .5, 
+      #           size = 2, pch = 20) +
+      scale_x_log10(labels = scales::number_format())  + 
+      scale_y_log10(labels = scales::number_format())+
+     
+     #geom_smooth(aes(2^(LogMean), LogDisp,color=paste(tech,SequenceType)), params[SequenceType=="Technical",],method="loess", se=F,size=.75)+
+     
+      xlab("Mean Gene Expression (Counts per individual)") +
+      ylab(expression(Variation~across~cohort~(Days^2)))+ 
+      geom_abline(slope=1,intercept=0,lty=2,col="dark gray")+
+      geom_hline(yintercept=0)+   
+      scale_color_manual(values=colors_line) +
+      scale_fill_manual(values=colors_point) + 
+      geom_hline(yintercept=cutoff_std_value)+
+      facet_wrap(~as.character(Day)+Pooled)
+     plot(gp)
+     
+    gp1 = ggplot() +    geom_histogram(data=params[ SequenceType=="Consensus Technical" & Day  == 1,], aes(x=ResVar,y=after_stat(density)/2) , fill="blue", alpha = .5,bins = 100)+
+      
+      geom_vline(xintercept=cutoff_std_value,color="dark gray",lty="22",lwd=2)+
+      geom_density(data=params[ SequenceType=="Biological",], aes(x=ResVar,y=after_stat(density),fill=paste(Day,transcript_type)) , alpha = .5, 
+               size = 0) +
+      scale_color_manual(values=colors_line) +
+      scale_fill_manual(values=colors_point,"Cohort Age")  +
+      ylab("pdf") +
+     xlab(expression(Variation~across~cohort~(Counts^2)))+ 
+      theme(legend.position = c(0.01, 0.8))
+   # plot(gp)
+    gp2 = ggplot(params[ SequenceType=="Consensus Technical" & Day  == 1,],aes(x=ResVar)) + stat_ecdf(color="blue",lwd=2)+  geom_vline(xintercept=cutoff_std_value,color="dark gray",lty="22",lwd=2)+  
+      geom_hline(yintercept=.9,color="dark gray",lty="22",lwd=1) + xlab(expression(Variation~across~cohort~(Counts^2)))
+    library(ggpubr)
+    library(egg)
+    plot(gp1 +  
+        annotation_custom(
+          ggplotGrob(gp2), 
+          xmin = 3, xmax = max(params[,ResVar]), ymin = .2, ymax = .4
+  ))
+  ggsave("../figures/01/S_variance_quantitative_range_choice.pdf",width=8,height=8)
+  # plot(egg:ggarrange(gp1,gp2,ncol=2, widths = c(1,.5)))
+  }
+}
+
+```
+
+```{r}
+
+
+params <- params_shared_tech_df[model == i & bad_fit == F & LogMean >=log2(1) & Day %in% days_to_plot & Strain=="QZ0" & !is.na(ResVar) ,]
+params$type = "shared";
+ggplot(para
+```
+
+#compare consensus and separate spike-ins
+```{r,fig.width=12,fig.height=8}
+source("../scripts/helpers/gene_variability.R")
+ library(viridis) 
+library(ggExtra)
+i = "n2_sw"
+ #  print(i)
+
+
+
+days_to_plot = c(1,8)
+colors_point = c("1 separate"="black","8 separate"="red","1 shared" = "green","8 shared" = "green")
+colors_line = c("1 separate"="blue","8 separate"="red","1 shared" = "green")
+shape_point = c("1 separate"=21,"8 separate"=21,"1 shared" = 22,"8 shared" = 22)
+
+
+params= rbindlist(lapply(c("shared","separate"),function(tech_type){
+  if (tech_type == "shared"){
+              params <- params_shared_tech_df[model == i & SequenceType=="Consensus Technical" & bad_fit == F & LogMean >=log2(1) & Day %in% days_to_plot & Strain=="QZ0" & !is.na(ResVar) ,]
+              
+  }else{
+    params <- params_df[model == i & SequenceType=="Technical" &bad_fit == F & LogMean >=log2(1) & Day %in% days_to_plot & Strain=="QZ0"  & !is.na(ResVar) ,]
+  }
+  params$tech_type = tech_type
+    params
+}),fill=T)
+#params = params[paste(Day,tech_type) != "8 shared",]
+
+trend_line = rbindlist(lapply(c("shared","separate"),function(tech_type){
+  if (tech_type == "shared"){
+              trends= trend_shared_tech_df[model == i & Day %in% days_to_plot,];
+              trend_columns = 6:34
+  }else{
+    trends = trend_df[model == i & Day %in% days_to_plot,]   
+    trend_columns = 6:34
+    print(trends[1,])
+  }
+   rbindlist(lapply(unique(params$Day),function(str){
+      
+      tl = data.frame(t(trends[model == i & Day==str,][,trend_columns,with=F]))
+     # browser()
+      names(tl) = "LogVar";
+      tl$LogMean = log2(as.numeric(substring(rownames(tl),2,10)))
+      tl = tl[!is.na(tl$LogVar) & !is.na(tl$LogMean),]
+      tl$Day = str;
+      tl$tech_type = tech_type
+      tl
+    }))
+})) 
+trend_line = trend_line[paste(Day,tech_type) != "8 shared",]
+
+
+  
+  
+  
+cutoff_quantile_value = .9
+cutoff_std_value = quantile(params[ SequenceType=="Consensus Technical",ResVar],cutoff_quantile_value)
+
+  
+  params$newstdev = sqrt(2^params$LogVar)
+ # params$cv = params$newstdev/2^params$LogMean
+  
+ # trend_line$newstdev = 2^sqrt(LogVar)#sqrt(2^trend_line$LogDisp*((2^(trend_line$LogMean))^2)+2^trend_line$LogMean)
+ trend_line$newstdev =  sqrt(2^trend_line$LogVar)
+  trend_fit = smooth.spline(trend_line$LogMean,log2(trend_line$newstdev))
+ # params$ResDisp_standard = params$LogDisp - predict(trend_fit,params$LogMean)$y
+
+  
+  
+  lm(params$newstdev~sqrt(params$BaseVar))
+  
+  lfit = lm(log10(newstdev)~log10(2^(LogMean)),trend_line[2^trend_line$LogMean < 700 & 2^trend_line$LogMean > 2])
+  lcoef = coef(lfit)# we find that log(stdev) = .5 * log(mean) in our spike ins, so
+                    # the method has a scaling law stdev = mean^.5   .  Wow!
+  
+  
+  lfit2 = lm(log10(sqrt(BaseVar))~log10(BaseMean),params[Day==1 & 2^LogMean < 700 & 2^LogMean > 2])
+  
+  
+ # params$fixed_stdev = 2^(log2(params$newstdev)-predict(trend_fit,params$LogMean)$y)-1
+  params$cv =  params$fixed_stdev/2^params$LogMean
+  
+  
+  gp = ggplot(data=NULL,aes(2^LogMean, 2^LogVar)) +
+    geom_point(aes(fill=paste(Day,tech_type),shape=paste(Day,tech_type)),params , alpha = 1, 
+               size = 3, ,stroke=0) +
+    scale_x_log10(labels = scales::number_format(),limits = c(9,2^max(params$LogMean)))  + 
+    scale_y_log10(labels = scales::number_format(),limits = c(9,2^max(params$LogVar)))  + 
+    geom_line(aes(color=paste(Day,tech_type)),trend_line,lwd=1) +  
+    geom_line(aes(y=2^(LogVar+1)+1),color="dark gray",lty=2,trend_line[tech_type=="shared",],lwd=1) +  #resvar = 1
+    scale_color_manual(values=colors_line) +
+   scale_shape_manual(values=shape_point)+
+  scale_fill_manual(values=colors_point)  +
+    geom_hline(yintercept = c(-4))+
+   
+   #geom_smooth(aes(2^(LogMean), LogDisp,color=paste(tech,SequenceType)), params[SequenceType=="Technical",],method="loess", se=F,size=.75)+
+   
+    xlab("Mean Gene Expression") +
+    
+    ylab(expression(Variation~across~cohort~(Counts^2))) + theme(legend.position=c(.05,1))
+ # scale_color_viridis(discrete = TRUE) 
+  plot(gp)
+  ggsave("../figures/01/S_spike_in_stability_over_time.pdf",width=4,height=6)
+```
+
+
+
+#select and plot genes with interesting differences in their variance at one age or across ages
+## Main text figure 1b-c
+```{r, fig.width=4, fig.height=8}
+
+fit_cutoffs = quantile(params$LogMean,c(.05,.95))
+p = params[LogMean>=fit_cutoffs[1] & LogMean<=fit_cutoffs[2],]
+logmean_range = log2(c(100,1000))
+vals = p[LogMean >= logmean_range[1] & LogMean <= logmean_range[2] & bad_fit==F & Strain=="QZ0" & Pooled==F & SequenceType=="Biological",]
+
+d1 = dcast(vals,GeneName~Day,value.var = "LogMean")
+d2 = dcast(vals,GeneName~Day,value.var = "ResVar")
+d = merge(d1,d2,by=c("GeneName"),suffixes=c(".LogMean",".ResVar"))
+d$stable_means = abs(log(d$`8.LogMean`)-log(d$`1.LogMean`)) < log(1.1)
+d$ResVar_large_change = (log(d$`8.ResVar`)-log(d$`1.ResVar`)) > log(2)
+
+setkey(geneid,GeneName)
+d$GeneSymbol = geneid[d$GeneName,GeneSymbol]
+
+cleanup = function(x){
+ x = x[!is.na(x)]
+ x = x[order(x)]
+ x
+}
+
+stable_mean_high_var =cleanup(d[d$stable_means & 2^d$`1.ResVar`>5,"GeneSymbol"])
+genes_to_highlight = "nlp-28" 
+
+stable_mean_low_var =cleanup(d[d$stable_means & 2^d$`1.ResVar` < 1,"GeneSymbol"])
+genes_to_highlight = c("eif-2beta",genes_to_highlight)
+
+
+setkey(params,GeneName)
+setkey(geneid,GeneSymbol)
+sel_mean_disp_df = params[geneid[genes_to_highlight,GeneName],]
+GeneNames_to_highlight = geneid[genes_to_highlight,GeneName]
+gene_highlight_color_gene_day= c("pink",
+                             "light blue",
+                             "pink",
+                             "light blue")
+names(gene_highlight_color_gene_day) = c(
+  paste("1",genes_to_highlight[2]),
+paste("1",genes_to_highlight[1]),
+paste("8",genes_to_highlight[2]),
+paste("8",genes_to_highlight[1]))
+
+
+counts_df = norm[["n2_sw"]]
+counts_df = counts_df[unique(sel_mean_disp_df$GeneName),annots[Strain=="QZ0" & Sample  %in% colnames(counts_df) & model=="n2_sw" & Exclude==F,Sample]]
+counts_long_df = melt(counts_df)
+names(counts_long_df) = c("GeneName","Sample","counts")
+setkey(annots,Sample)
+counts_long_df$Day = annots[ model=="n2_sw",][as.character(counts_long_df$Sample),Day]
+counts_long_df = as.data.table(counts_long_df)
+setkey(geneid,GeneName)
+gene_highlight_color_day = c("1"="black","8"="red")
+gene_highlight_color_gene= c("nlp-28"="pink","eif-2beta"="light blue")
+gp_list1 <- lapply(unique(sel_mean_disp_df$GeneName), function(cur_gene) {
+  
+  ggdf <- counts_long_df[GeneName == cur_gene,]
+  gp = ggplot(ggdf, aes(counts)) +
+    geom_histogram(aes(fill = Day), bins = 30, position = "identity", alpha = .7,color="black",size=.5) +
+    scale_fill_manual(values = (gene_highlight_color_day), name = paste(geneid[cur_gene,GeneSymbol],"on day:")) +
+    theme(legend.position = c(0.05, 0.8))+
+    scale_color_manual(values = (gene_highlight_color_day), name = NULL) +
+    scale_x_log10() +
+    xlab("Counts per individual") +
+    ylab("Frequency ") 
+  gp
+  #plot(gp)
+})
+
+setkey(geneid,GeneName)
+gp_list2 <- lapply(unique(sel_mean_disp_df$Day), function(day) {
+  
+  ggdf <- counts_long_df[Day == day,]
+  ggdf$GeneSymbol = geneid[as.character(ggdf$GeneName),GeneSymbol]
+  gp = ggplot(ggdf, aes(counts)) +
+    geom_histogram(aes(fill = GeneSymbol), bins = 30, position = "identity", alpha = .7,color="black",size=.5) +
+    scale_fill_manual(values = (gene_highlight_color_gene), name = paste("Day",day)) +
+    scale_x_log10() +
+    theme(legend.position = c(0.05, 0.8))+
+    xlab("Counts per individual") +
+    ylab("Frequency ")
+  gp
+  #plot(gp)
+})
+
+plot_grid(plotlist = c(gp_list2,gp_list1), nrow = 4, ncol = 1)
+ggsave("../figures/01/mean_vs_ResVar_examples.pdf", width = 4, height = 8)
+```
+
+## Overdispersion and residual overdispersion - USING CONSENSUS SPIKE-IN NORMALIZATION
+## Main text figure 1a
+```{r,fig.height=8,fig.width=12}
+
+
+ library(viridis) 
+library(ggformula)
+days_to_plot = c(1,8)
+colors_point = c("1"="black","8"="dark red",gene_highlight_color_gene_day)
+colors_line = c("1"="gray","8"="red")
+
+
+for (tech_type in c("shared")){#,"separate")){
+  if (tech_type == "shared"){
+    cutoffs = log2(5+rnorm(nrow(params_shared_tech_df),0,.5)) #fuzzy boundary is prettier
+              params <- params_shared_tech_df[model == i & SequenceType == "Biological"& bad_fit == F & LogMean >=cutoffs & Day %in% days_to_plot & Strain=="QZ0" & Pooled==F ,]
+              trends= trend_shared_tech_df[model == i & Day %in% days_to_plot,];
+  }else{
+    cutoffs = log2(5+rnorm(nrow(params_df),0,.5))
+    params <- params_df[model == i & SequenceType == "Biological"& bad_fit == F & LogMean >=cutoffs& Day %in% days_to_plot & Strain=="QZ0" & Pooled==F ,]
+    trends = trend_df[model == i& Day %in% days_to_plot,]     
+  }
+  
+  params$grp = factor(as.character(params$Day),levels=as.character(c(1,2,4,6,8,10,12)))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+#  params[ResDisp < -10,ResDisp := -10];
+  params=  params[LogMean > log2(2),]
+  #browser()
+  
+  
+  medians = aggregate(LogVar~Day,params,FUN=median)
+
+ # params$Day2 = params$Day
+
+  gp = ggplot() +
+    scale_x_log10(,labels = scales::number_format())  +
+    scale_y_log10(breaks=c(1,5,10,50,100,500,1000,5000),labels = scales::number_format())  +
+    geom_hline(yintercept=c(1,5,10,50,100,1000),lty=2,col="dark gray")+
+    geom_vline(xintercept=c(100),lty=2,col="dark gray")+
+    geom_point_rast(aes(x=2^(LogMean), y=2^ResVar,fill=Day), params, alpha = .3, 
+               size=1.5,shape=21,stroke=0,raster.dpi=600) +
+    geom_point(aes(x=2^(LogMean), y=2^ResVar), params[GeneName%in%  GeneNames_to_highlight,], alpha = 1, 
+               size=5.5,shape=23,stroke=NA,fill="white") +
+    geom_point(aes(x=2^(LogMean), y=2^ResVar,fill=paste(Day,GeneSymbol)), params[GeneName%in%  GeneNames_to_highlight,], alpha = 1, 
+               size=4,shape=23,stroke=0) +
+   
+    
+   #geom_vline(xintercept = 50, linetype = "dashed") +
+  # geom_vline(xintercept = 100000, linetype = "dashed") +
+   #geom_hline(yintercept = 1.5, linetype = "dashed") +
+    stat_spline(aes(x=2^(LogMean), y=2^ResVar,group=Day),data=params[LogMean>=fit_cutoffs[1] & LogMean<=fit_cutoffs[2],],spar=1.2,color="white",linewidth=3)+
+    stat_spline(aes(x=2^(LogMean), y=2^ResVar,color=Day),data=params[LogMean>=fit_cutoffs[1] & LogMean<=fit_cutoffs[2],],spar=1.2,linewidth=2)+
+  # geom_smooth(aes(2^(LogMean), ResDisp,color=grp,linewidth=3,color="white"), params, se=F,method="loess")+
+  # geom_smooth(aes(2^(LogMean), ResDisp,color=grp,linewidth=2), params, se=F,method="loess")+
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Expression\n(Counts per individual)") +
+    ylab(expression(Variation~across~cohort~(Counts^2)))+ggtitle(tech_type)+
+  scale_color_manual(values=colors_line) +
+  scale_fill_manual(values=colors_point) +facet_wrap(~as.character(Day)) + 
+      theme(legend.position = c(0.9, 0.2))
+  plot(gp)
+  
+  
+  if (tech_type == "shared"){
+    ggsave("../figures/01/mean_vs_ResVar.pdf",width=12,height=8)
+  }else
+    ggsave("../figures/01/S_mean_vs_ResVar_separate_erccs.pdf",width=12,height=8)
+}
+
+
+```
+
+#look at correlation among hits
+```{r}
+
+counts_df = norm[["n2_series_all"]]
+days = c(1,2,4,6,8,10,12)
+
+wt_hits = fread("../data/scaling_models/hits_list.csv")
+best_wt_hits = wt_hits[mean_est<.96,]
+genes_to_use = unique(best_wt_hits$GeneName[which(best_wt_hits$GeneName %in% rownames(counts_df))])
+corrs = lapply(days,function(cur_day){
+  cts= counts_df[genes_to_use,annots[Strain=="QZ0" & Sample  %in% colnames(counts_df) & Day==as.character(cur_day) & Exclude==F,Sample]]
+	corr_m = matrix(NA,nrow=nrow(cts),ncol=nrow(cts))
+		rownames(corr_m) = colnames(corr_m) = rownames(cts)
+		for (i in 1:nrow(cts)){
+			for (j in i:nrow(cts)){
+				corr_m[i,j] = corr_m[j,i] = cor(cts[i,],cts[j,], method = "s")
+			}
+		}
+		corr_m
+})
+names(corrs) = as.character(days)
+
+
+cts= counts_df[genes_to_use,annots[Strain=="QZ0" & Sample  %in% colnames(counts_df) & Exclude==F,Sample]]
+corr_all_days = matrix(NA,nrow=nrow(cts),ncol=nrow(cts))
+	rownames(corr_all_days) = colnames(corr_all_days) = rownames(cts)
+	for (i in 1:nrow(cts)){
+		for (j in i:nrow(cts)){
+			corr_all_days[i,j] = corr_all_days[j,i] = cor(cts[i,],cts[j,], method = "s")
+		}
+	}
+```
+
+```{r,fig.width=10,fig.height=10}
+lapply(names(corrs),function(cur_day){
+  corr_m = corrs[[cur_day]]
+	clustered_dat =hclust(as.dist(1-corr_m), method = "complete")
+	ngroup = 3;
+	scaling_group_colors = c("black","red","blue")
+  	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+  	RNAi_scaling_groups = cutree(clustered_dat,k=ngroups)
+  	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+  	setkey(geneid,GeneName)
+  	
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  	gp = Heatmap(corr_m,row_labels =geneid[rownames(corr_m),GeneSymbol],
+  	             column_labels =geneid[rownames(corr_m),GeneSymbol],
+  	             cluster_rows=RNAi_scaling_dendogram,
+  	             cluster_columns=RNAi_scaling_dendogram,
+  	             col = cm,column_title = cur_day) 
+  	draw(gp)
+  	NULL
+})
+```
+
+
+```{r,fig.width=32,fig.height=6}
+	ngroups = 5;
+	scaling_group_colors = c("green","red","blue","brown","gray","purple")
+	clustered_dat =hclust(as.dist(1-abs(corr_all_days)), method = "complete")
+  	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+  	RNAi_scaling_groups = cutree(clustered_dat,k=ngroups)
+  	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+  	setkey(geneid,GeneName)
+  	
+hms = lapply(names(corrs),function(cur_day){
+  corr_m = corrs[[cur_day]]
+
+  	
+  col_fun = colorRamp2(c(0,.5, 1), c("black","light blue", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  diag(corr_m) = NA
+  	gp = Heatmap(abs(corr_m),row_labels =geneid[rownames(corr_m),GeneSymbol],
+  	             column_labels =geneid[rownames(corr_m),GeneSymbol],
+  	             cluster_rows=RNAi_scaling_dendogram,
+  	             cluster_columns=RNAi_scaling_dendogram,
+  	             col = cm,column_title = paste("Day",cur_day)) 
+  	gp
+})
+names(hms) = names(corrs)
+draw(hms[["1"]]+hms[["2"]]+hms[["4"]]+hms[["6"]]+hms[["8"]]+hms[["10"]]+hms[["12"]])
+pdf("../figures/03/S_expression_correlation_among_top_hits.pdf",width=32,height=8)
+draw(hms[["1"]]+hms[["2"]]+hms[["4"]]+hms[["6"]]+hms[["8"]]+hms[["10"]]+hms[["12"]])
+dev.off()
+```
+```{r}
+  
+grp_cors = rbindlist(lapply(unique(RNAi_scaling_groups),function(grp){
+  genes = names(which(RNAi_scaling_groups==grp))
+  rbindlist(lapply(names(corrs),function(cur_day){
+    m = corrs[[cur_day]][genes,genes]
+    diag(m) = NA;
+    d = data.frame(val = as.vector(m))
+    d$grp = paste0("G",grp);
+    d$day = cur_day
+    d[!is.na(d$val),]
+  }))
+}))
+
+```
+
+```{r}
+grp_cors$day = as.integer(grp_cors$day)
+grp_cors$day_f = factor(grp_cors$day,levels=unique(grp_cors$day))
+ggplot(grp_cors,aes(x=val,fill=day_f,color=day_f)) + geom_density()+facet_wrap(~grp,scale="free_y") + geom_vline(xintercept=0,lty=2,col="dark gray") 
+
+grp_cors$day_i = as.integer(grp_cors$day)
+grp_cors$grp_f = as.factor(grp_cors$grp)
+
+colors = 	scaling_group_colors
+names(colors) = as.character(paste0("G",unique(RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)])))
+
+
+ggplot(grp_cors,aes(x=day_i,y=val,fill=grp_f,color=grp_f)) + geom_point()+ geom_smooth(method="loess")+facet_wrap(~grp) +geom_hline(yintercept=0,lty=2,col="dark gray")+scale_fill_manual(values=colors)+scale_color_manual(values=colors)+scale_x_continuous(breaks=c(1,2,4,6,8,10,12))
+```
+
+```{r}
+if (0){
+#compare var, logdisp, and basevar
+plot(log2((params$BaseVar-1/params$BaseMean)/params$BaseMean^2),params$LogDisp)
+plot(log2(params$BaseVar),params$LogVar)
+}
+```
+
+#Compare changes in mean and residual variance between day 1 and 8
+#Main text Figure 1d
+```{r,fig.height=8,fig.width=8}
+sig_colors <- c(Equal = "grey", Var_Up = "#990000ff", Var_Down = "#0b5394ff")
+sig_alpha <- 1e-2
+
+RES_VAR_QUANTITATIVE_THRESHOLD = 1
+
+sig_colors_4w= c(`Up Up`= "#EA4335", 
+              `NS Up`="#990000ff",
+             `Up NS` = "#FBBC05",
+             `NS NS` = "gray",
+             `Down NS` =  "#34A853",
+             `NS Down` = "#0b5394ff", 
+             `Down Down` = "#4285F4",
+             `Down Up` = "pink",
+             `Up Down` = "pink");
+
+sig_colors_4w = brewer.pal(9, "Set1")
+names(sig_colors_4w) = c("Up Up","Down Up","Down Down","Up Down","NS Up", "not used","Up NS","Down NS","NS NS")
+
+
+cur_group = "n2_sw"
+ g = dva_shared_tech_df[group==cur_group,]
+ 
+ g$var_sig = ifelse(g$padj.resvar >= .001  | abs(g$logFoldChange.resvar)< log2(1.5),"NS",ifelse(g$logFoldChange.resvar>0,"Up","Down"))
+
+g$mean_sig = ifelse(g$padj.mean >= .001 | abs(g$log2FoldChange.mean)< log2(1.5),"NS",ifelse(g$log2FoldChange.mean>0,"Up","Down"))
+g$both_sig = apply(g,1,function(x)paste(x[["mean_sig"]],x[["var_sig"]]))
+
+
+  g = merge(g,tissues_df,by="GeneName",all.x=T,all.y=F)
+  g$Tissue[is.na(g$Tissue)] = "multi";
+  
+  RES_VAR_QUANTITATIVE_THRESHOLD = 1
+  
+  cur_param = params_shared_tech_df[model=="n2_sw" & bad_fit == F & SequenceType=='Biological',]
+
+  #exclude genes with a mean less than 3 in either condition
+  frm  = "BaseMean ~ GeneName + Day"
+ # print(frm)
+  gene_min = aggregate(as.formula(frm),cur_param,FUN=min)
+  gene_above_var_quantitative_threshold = aggregate(as.formula(frm),cur_param,FUN=function(x)any(x>=RES_VAR_QUANTITATIVE_THRESHOLD))
+  
+  genes_to_plot = intersect(gene_min$GeneName[gene_min$BaseMean>=25 ],
+                            gene_above_var_quantitative_threshold$GeneName)
+  
+  g = g[GeneName %in% genes_to_plot,]
+  
+ # genes_to_plot = params_shared_tech_df[model==cur_group][BaseMean>5,GeneName]
+  g = g[!is.na(logFoldChange.resvar) & 
+          !is.na(log2FoldChange.mean) &
+          GeneName %in% genes_to_plot,]
+  yl = quantile(g$logFoldChange.resvar,c(.01,.99))
+  xl = quantile(g$log2FoldChange.mean,c(.01,.99))
+  
+  
+  fit_xl = quantile(g$log2FoldChange.mean,c(.01,.99))
+
+  axis_label_range = c(-11,11)
+  axis_labels = c(paste0("1/",2^(abs(axis_label_range[1]):1)),as.character(2^c(0:axis_label_range[2])))
+  axis_labels[seq(1,length(axis_labels),by=2)] = ""
+  axis_breaks = 2^(axis_label_range[1]:axis_label_range[2])
+  
+ var_rng = quantile(g$logFoldChange.resvar,c(.001,.999))
+ mean_rng = quantile(g$log2FoldChange.mean,c(.001,.999))
+ g_capped = g;
+ g_capped$logFoldChange.resvar = ifelse( g_capped$logFoldChange.resvar<var_rng[1],var_rng[1],ifelse(g_capped$logFoldChange.resvar>var_rng[2],var_rng[2], g_capped$logFoldChange.resvar))
+ g_capped$log2FoldChange.mean = ifelse( g_capped$log2FoldChange.mean<mean_rng[1],mean_rng[1],ifelse( g_capped$log2FoldChange.mean>mean_rng[2],mean_rng[2], g_capped$log2FoldChange.mean))
+
+
+ggplot(dva_shared_tech_df[bad_fit == F,], aes(log2FoldChange.mean  , 
+                      logFoldChange.resvar)) + geom_point()
+
+
+  gp = ggplot(g_capped, aes(2^log2FoldChange.mean  , 
+                      2^logFoldChange.resvar)) +
+   geom_point_rast(aes(fill = both_sig,color=both_sig),alpha = .4, size = 2, shape = 21,raster.dpi=600) +
+   
+    xlab("Effect of age on Mean") +
+    ylab("Effect of age on Variance") + ylim(yl) + xlim(xl)+
+     scale_fill_manual(values = sig_colors_4w, name = NULL) + 
+  theme(legend.position = "none") +
+     scale_color_manual(values = sig_colors_4w, name = NULL) + 
+  theme(legend.position = "none") +
+  geom_smooth(data=g_capped[log2FoldChange.mean > fit_xl[1] & log2FoldChange.mean < fit_xl[2]],method = "loess", span=0.5,se = FALSE, color = "black") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_vline(xintercept = 1, linetype = "dashed") + 
+  scale_x_continuous(labels = axis_labels,trans="log2",breaks=axis_breaks)  +
+  scale_y_continuous(labels = axis_labels,trans="log2",breaks=axis_breaks) 
+  
+  ggExtra::ggMarginal(gp, type = "density",size=20,fill="gray")
+  #Main text Figure 1d
+  ggsave("../figures/01/DA_mean_resvar_d1_d8.pdf",width=8,height=8) 
+  
+  #build nice table of number of genes in each category
+  v = c("Down","NS","Up")
+  vs = c(paste(v[1],v),paste(v[2],v),paste(v[3],v))
+  tb = table(factor(g$both_sig,levels=vs))
+  r = matrix(round(tb/sum(tb),2),nrow=3,ncol=3)
+  r = apply(r, 2, rev)
+  rownames(r) = paste("Var",rev(v))
+  colnames(r) = paste("Mean",v)
+  write.csv(r,"../figures/01/gene_classes.csv",row.names=F)
+```
+
+#Main Text Figure 1d (inset)
+```{r,fig.height=2,fig.width=2}
+rl = melt(r)
+  make_arrows = function (dat,thick){
+    #if (!thick)
+    #  return(ifelse(grepl("Up",dat),intToUtf8(c(8593)),ifelse(grepl("Down",dat),intToUtf8(c(8595)),".")))
+  #ifelse(grepl("Up",dat),intToUtf8(c(8679)),ifelse(grepl("Down",dat),intToUtf8(c(8681)),"."))
+    ifelse(grepl("Up",dat),"+",ifelse(grepl("Down",dat),"-","."))
+  }  
+  get_short_string = function (dat){
+      ifelse(grepl("Up",dat),"Up",ifelse(grepl("Down",dat),"Down","NS"))
+  }
+  rl$var_d = make_arrows(rl$Var1,T)
+  rl$mean_d = make_arrows(rl$Var2,T)
+  rl$desc = paste0(rl$var_d,"\n",rl$mean_d)
+  rl$desc_f = factor(rl$desc,levels=rl[order(rl$Var1),]$desc)
+  rl$short_string = apply(rl,1,function(x)paste(get_short_string(x[["Var2"]]),get_short_string(x[["Var1"]])))
+  ggplot(rl,aes(y=value,x=desc_f,fill=short_string))+geom_bar(stat="identity")+theme(legend.position="none")+ylab("Fraction of all genes") + xlab("Effect of aging") +
+     scale_fill_manual(values = sig_colors_4w, name = NULL) + scale_y_continuous(breaks=seq(0,.6,by=.1),limits=c(0,.6)) 
+#Main Text Figure 1d (inset)
+ggsave("../figures/01/mean_var_chart.pdf",width=2,height=2)
+```
+
+```{r,fig.width=8,fig.height=8}
+RES_VAR_QUANTITATIVE_THRESHOLD = 1
+sep= dva_separate_tech_df[group == "n2_sw",]
+con=dva_shared_tech_df[group == "n2_sw",]
+spike_in_diagnostic = merge(sep,con,by=c("GeneName","GeneSymbol","comparison.mean"),suffixes=c(".separate",".consensus"))
+
+cur_param = params_shared_tech_df[model=="n2_sw" & bad_fit == F & SequenceType=='Biological',]
+
+  #exclude genes with a mean less than 3 in either condition
+  frm  = "BaseMean ~ GeneName + Day"
+ # print(frm)
+  gene_min = aggregate(as.formula(frm),cur_param,FUN=min)
+  gene_above_var_quantitative_threshold = aggregate(as.formula(frm),cur_param,FUN=function(x)any(x>=RES_VAR_QUANTITATIVE_THRESHOLD))
+  genes_to_plot = intersect(gene_min$GeneName[gene_min$BaseMean>=100 ],
+                            gene_above_var_quantitative_threshold$GeneName[gene_above_var_quantitative_threshold$BaseMean])
+  
+
+spid = spike_in_diagnostic[GeneName %in% genes_to_plot & abs(logFoldChange.resvar.separate) < 50,]
+spid$both_sig = apply(spid[,.(padj.resvar.separate,padj.resvar.consensus)],1,function(x)paste(
+  ifelse(x[["padj.resvar.separate"]]<.01,"Separate","NS"),
+  ifelse(x[["padj.resvar.consensus"]]<.01,"Consensus","NS")))
+
+colors = c("Consensus only"="blue","Neither"="black","Separate only"="green","Both"="red")
+spid[,both_sig2:=ifelse(both_sig=="NS NS","Neither",ifelse(both_sig=="NS Consensus","Consensus only",ifelse(both_sig=="Separate NS","Separate only","Both")))]
+
+spid[,resvar.consensus:=2^logFoldChange.resvar.consensus]
+spid[,resvar.separate:=2^-logFoldChange.resvar.separate]
+gl_fit = glm(resvar.consensus~resvar.separate,spid,family=gaussian("log"))
+gl_coef = coef(gl_fit)
+
+ axis_label_range = c(-9,9)
+  axis_labels = c(paste0("1/",2^(abs(axis_label_range[1]):1)),as.character(2^c(0:axis_label_range[2])))
+  axis_labels[seq(2,length(axis_labels)-1,by=2)] = ""
+  axis_breaks = 2^(axis_label_range[1]:axis_label_range[2])
+  
+  
+  x_axis_label_range = c(-21,21)
+  x_axis_labels = c(paste0("1/",2^(abs(x_axis_label_range[1]):1)),as.character(2^c(0:x_axis_label_range[2])))
+  x_axis_labels[! 1:length(x_axis_labels) %in% seq(2,length(x_axis_labels)-1,by=4)] = ""
+  x_axis_breaks = 2^(x_axis_label_range[1]:x_axis_label_range[2])
+ # x_axis_labels[abs(log2(x_axis_breaks)) == 16] = ""
+  
+ggplot(spid,aes(2^logFoldChange.resvar.consensus,2^logFoldChange.resvar.separate,color=both_sig2))+geom_point_rast(alpha=.3,size=3,stroke=NA,raster.dpi=600)+
+  scale_color_manual(values=colors,name="Significant chage in:") + 
+  geom_abline(slope=1,intercept=0,lty=2,col="gray") +
+  scale_x_continuous(trans="log2",breaks=axis_breaks,labels=axis_labels)+
+  scale_y_continuous(trans="log2",breaks=x_axis_breaks,labels=x_axis_labels)+
+ # geom_abline(slope=gl_coef[2],intercept=gl_coef[1])+
+  geom_hline(yintercept=1)+
+  geom_vline(xintercept=1)+
+ylab("Change in Variance, Separate spike-ins (1)")+
+xlab("Change in Variance, Consensus spike-ins (1)") + theme(legend.position=c(.1,.9))
+ggsave("../figures/01/S_consensus_vs_separate_spikeins.pdf",width=7,height=4)
+```
+
+## Overdispersion and residual overdispersion - CONSENSUS SPIKE INS + TISSUE-SPECIFIC
+
+```{r}
+ if (0){
+gp_disp_overdisp <- lapply(model_names, function(i) {
+ #  print(i)
+  params <- params_shared_tech_df[params_shared_tech_df$model == i,]
+  params = params[GeneName %in% names(tissues),];
+  params = merge(params,tissues_df,by="GeneName")
+   params$grp = factor(as.character(params$Day),levels=as.character(c(1,2,4,6,8,10,12)))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  params[ResDisp < -10,ResDisp := -10];
+  params = params[LogMean > log2(35),];
+  psp = params[LogMean > log(50),]
+  psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+  #browser()
+  gp = ggplot(params,aes(2^(LogMean), ResDisp,color=grp)) +
+    geom_point(alpha = .5, 
+               size = .75, pch = 20) +
+    scale_x_log10(labels = scales::number_format())  +
+    
+   geom_vline(xintercept = 50, linetype = "dashed") +
+   geom_vline(xintercept = 100000, linetype = "dashed") +
+   geom_hline(yintercept = 1.5, linetype = "dashed") +
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Overdispersion") + geom_smooth(se=F)+ facet_wrap(~Tissue)+
+  scale_color_viridis(discrete = TRUE)
+  gp
+})
+names(gp_disp_overdisp) <- model_names
+
+for (i in names(gp_disp_overdisp)) {
+  gp <- gp_disp_overdisp[[i]]
+  gp <- gp + ggtitle(i)
+  plot(gp)
+  rm(gp)
+}
+}
+```
+
+
+```{r,fig.height=8,fig.width=10}
+ library(viridis) 
+if (0){
+  params <- params_shared_tech_df[params_shared_tech_df$model == model_names[[1]],]
+  params = params[GeneName %in% names(tissues),];
+  params = merge(params,tissues_df,by="GeneName")
+  params$grp = factor(as.character(params$Day),levels=as.character(c(1,2,4,6,8,10,12)))
+  params$Day = as.integer(as.character(params$Day))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  params[ResDisp < -10,ResDisp := -10];
+  params=  params[LogMean > log2(10),]
+  psp = params[LogMean > log(10),]
+  psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+  #browser()
+  gp = ggplot() +
+    geom_line(aes(Day, ResDisp,color=GeneName), params, alpha = .5, 
+               size = .75, pch = 20, show.legend = FALSE) +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Overdispersion")+
+  scale_color_viridis(discrete = TRUE) + geom_smooth(aes(Day, ResDisp), params, show.legend = FALSE,color="black",size=2,method="loess",span=.75)
+  gp
+}
+```
+
+## fit polynomials
+```{r}
+
+poly2raw <- function(polyOut, co, co1.const=TRUE) {
+  n <- length(co)
+  degree <- n-1
+  if (degree > max(attr(polyOut, "degree"))) 
+    stop("More coefficients than polynomials")
+  coefs = attr(polyOut, "coefs")
+  alpha <- coefs$alpha
+  norm2 <- coefs$norm2
+  Z <- matrix(0, n, n)
+  Z[1,1] <- 1
+  if (degree > 0) {
+    Z[1,2] <- -alpha[1]
+    Z[2,2] <- 1
+  }
+  if (degree > 1) {
+    for (i in 2:degree) {
+      Z[2:n, i+1] <- Z[seq(1,n-1), i]
+      Z[,i+1] <- Z[,i+1] - alpha[i]*Z[,i] - (norm2[i + 1]/norm2[i]) * Z[, i - 1]
+    }
+  }
+  for (i in 1:n) {
+    Z[,i] = Z[,i] / sqrt(norm2[i+1])
+  }
+  if (co1.const==TRUE) {
+    const <- co[1]
+    co[1] <- 0
+    out <- Z %*% co
+    out[1] <- out[1] + const
+  } else {
+    out <- Z %*% co
+  }
+  out <- drop(out)
+  names(out) <- names(co)
+  out
+}
+
+```
+
+```{r}
+#fancy poly fitting for diagnostics
+
+degree = 2
+params <- params_shared_tech_df[params_shared_tech_df$model == model_names[[1]]&bad_fit==F,]
+params = params[!grepl("ERCC",params$GeneName),]
+#params = params[GeneName %in% names(tissues),];
+#params = merge(params,tissues_df,by="GeneName")
+#params$grp = factor(as.character(params$Day),levels=as.character(c(1,2,4,6,8,10,12)))
+params$Day = as.integer(as.character(params$Day))
+
+time = unique(params$Day);
+time = time[order(time)]
+
+ResDisp_t = dcast(params,GeneName~Day,value.var="ResDisp")
+rownames(ResDisp_t) = ResDisp_t$GeneName
+ResDisp_t = ResDisp_t[,as.character(time)]
+ResDisp_t = ResDisp_t[apply(ResDisp_t,1,FUN=function(x)!any(is.na(x)| is.infinite(x))),]
+LogMean_t = dcast(params,GeneName~Day,value.var="LogMean")
+rownames(LogMean_t) = LogMean_t$GeneName
+LogMean_t = LogMean_t[,as.character(time)]
+LogMean_t = LogMean_t[apply(LogMean_t,1,FUN=function(x)!any(is.na(x) | is.infinite(x))),]
+
+pred_time <- seq(0, max(time), by = 0.2)
+pred_raw_basis <- cbind(Intercept = 1, poly(pred_time, degree = degree, raw = TRUE))
+colnames(pred_raw_basis)[-1] <- paste0("Poly", 1:degree)
+
+# common variables
+common_reg <- list(time = time, 
+                   # lifespan_scaled_time = lifespan_scaled_time, 
+                   pred_time = pred_time, 
+                   pred_raw_basis = pred_raw_basis)
+
+# fit regression model 
+# time is scaled by transcriptomic scale factor
+
+ResDisp_fits <- pblapply(1:nrow(ResDisp_t), function(j) {
+  
+  y <- t(ResDisp_t[j,])
+  x <- time 
+  
+  if (any(is.na(x))) print(j)
+  
+  basis <- poly(x, degree = degree)
+  fit2 = lm(y~poly(x,degree=degree))
+  beta <-coef(fit2)
+  beta_zero_int = beta;
+  beta_zero_int[1] = 0
+  raw_beta <- poly2raw(basis, beta_zero_int)
+  
+  pred_y <- drop(pred_raw_basis %*% raw_beta)
+  pvalues = summary(fit2)$coefficients[,4]
+  
+  list(beta = beta, 
+       raw_beta = raw_beta, 
+       y = y,
+       pvalues=pvalues,
+       pred_y = pred_y)
+})
+names(ResDisp_fits) <- rownames(ResDisp_t)
+
+LogMean_fits <- pblapply(1:nrow(LogMean_t), function(j) {
+  
+  y <- t(LogMean_t[j,])
+  x <- time 
+  
+  if (any(is.na(x))) print(j)
+  
+  basis <- poly(x, degree = degree)
+  fit2 = lm(y~poly(x,degree=degree))
+  beta <-coef(fit2)
+  beta_zero_int = beta;
+  beta_zero_int[1] = 0
+  raw_beta <- poly2raw(basis, beta_zero_int)
+  
+  pred_y <- drop(pred_raw_basis %*% raw_beta)
+  pvalues = summary(fit2)$coefficients[,4]
+  
+  list(beta = beta, 
+       raw_beta = raw_beta, 
+       y = y,
+       pred_y = pred_y,
+       pvalues=pvalues)
+})
+names(LogMean_fits) <- rownames(LogMean_t)
+
+
+ResDisp_linear_fits <- pblapply(1:nrow(ResDisp_t), function(j) {
+  
+  y <- t(ResDisp_t[j,])
+  x <- time 
+  
+  if (any(is.na(x))) print(j)
+ 
+  fit2 = lm(y~x)
+  beta <-coef(fit2)
+  pred_y = predict(fit2)
+  s = summary(fit2);
+  pvalues = s$coefficients[,4]
+  rsq = summary(fit2)$r.squared;
+  
+  list(beta = beta, 
+       y = y,
+       rsq = rsq,
+       pvalues=pvalues,
+       pred_y = pred_y)
+})
+names(ResDisp_linear_fits) <- rownames(ResDisp_t)
+
+LogMean_linear_fits <- pblapply(1:nrow(LogMean_t), function(j) {
+  
+  y <- t(LogMean_t[j,])
+  x <- time 
+  
+  fit2 = lm(y~x)
+  beta <-coef(fit2)
+  pred_y = predict(fit2)
+  s = summary(fit2);
+  pvalues = s$coefficients[,4]
+  rsq = summary(fit2)$r.squared;
+  
+  list(beta = beta, 
+       y = y,
+       rsq = rsq,
+       pvalues=pvalues,
+       pred_y = pred_y)
+})
+names(LogMean_linear_fits) <- rownames(LogMean_t)
+}
+```
+
+
+```{r}
+
+# organize quadratic fits
+ResDisp_params <- data.frame(t(sapply(ResDisp_fits, `[[`, "beta"))[, -1])
+colnames(ResDisp_params) = paste0("ResDisp_Poly",1:degree)
+rownames(ResDisp_params) = rownames(ResDisp_t)
+LogMean_params <- data.frame(t(sapply(LogMean_fits, `[[`, "beta"))[, -1])
+colnames(LogMean_params) = paste0("LogMean_Poly",1:degree)
+rownames(LogMean_params) = rownames(ResDisp_t)
+
+ResDisp_pvalues = data.frame(Poly1 = t(sapply(ResDisp_fits, function(x)x$pvalues[2]))[, -1],
+                             Poly2 = t(sapply(ResDisp_fits, function(x)x$pvalues[3]))[, -1]);
+rownames(ResDisp_pvalues) = substring(rownames(ResDisp_pvalues),0,14)
+LogMean_pvalues = data.frame(Poly1 = t(sapply(LogMean_fits, function(x)x$pvalues[2]))[, -1],
+                             Poly2 = t(sapply(LogMean_fits, function(x)x$pvalues[3]))[, -1])
+rownames(LogMean_pvalues) = substring(rownames(LogMean_pvalues),0,14)
+LogMean_params$LogMean_Poly1_pvalue = NA;
+LogMean_params$LogMean_Poly2_pvalue = NA;
+LogMean_params[rownames(LogMean_pvalues),]$LogMean_Poly1_pvalue = LogMean_pvalues$Poly1
+LogMean_params[rownames(LogMean_pvalues),]$LogMean_Poly2_pvalue = LogMean_pvalues$Poly2
+ResDisp_params$ResDisp_Poly1_pvalue = 
+  ResDisp_params$ResDisp_Poly2_pvalue = NA;
+ResDisp_params[rownames(ResDisp_pvalues),]$ResDisp_Poly1_pvalue = ResDisp_pvalues$Poly1
+ResDisp_params[rownames(ResDisp_pvalues),]$ResDisp_Poly2_pvalue = ResDisp_pvalues$Poly2
+
+all_params = merge(ResDisp_params,LogMean_params,by=0)
+rownames(all_params) = all_params$Row.names;
+all_params = all_params[,colnames(all_params)[colnames(all_params)!="Row.names"]]
+```
+
+```{r}
+# organize linear fits
+ResDisp_linear_params <- data.frame(ResDisp=t(sapply(ResDisp_linear_fits, `[[`, "beta"))[, -1])
+rownames(ResDisp_linear_params) = rownames(ResDisp_t)
+
+LogMean_linear_params <- data.frame(LogMean=t(sapply(LogMean_linear_fits, `[[`, "beta"))[, -1])
+rownames(LogMean_linear_params) = rownames(LogMean_t)
+
+ResDisp_linear_pvalues = data.frame(ResDisp_pvalue=(sapply(ResDisp_linear_fits, function(x)x$pvalues[2])));
+rownames(ResDisp_linear_pvalues) = rownames(ResDisp_t)
+LogMean_linear_pvalues = data.frame(logMean_pvalue=sapply(LogMean_linear_fits, function(x)x$pvalues[2]))
+rownames(LogMean_linear_pvalues) = rownames(LogMean_t)
+LogMean_linear_params$LogMean_pvalue = NA;
+LogMean_linear_params[rownames(LogMean_linear_pvalues),]$LogMean_pvalue = LogMean_linear_pvalues$logMean_pvalue
+ResDisp_linear_params$ResDisp_pvalue = NA;
+ResDisp_linear_params[rownames(ResDisp_linear_pvalues),]$ResDisp_pvalue = ResDisp_linear_pvalues$ResDisp_pvalue
+
+all_linear_params = merge(LogMean_linear_params,ResDisp_linear_params,by=0)
+names(all_linear_params)[1]= "GeneName"
+setkey(geneid,GeneName);
+all_linear_params$GeneSymbol = geneid[all_linear_params$GeneName,GeneSymbol]
+all_linear_params = as.data.table(all_linear_params)
+```
+```{r}
+setkey(all_linear_params,"GeneName")
+high_exp = apply(counts[["n2_series"]],1,function(x)length(which(x<5))<.05*length(x));
+gg = rownames(counts[["n2_series"]])[high_exp]
+
+all_linear_params_high_exp = all_linear_params[GeneName %in% gg,]
+LogMean_range = quantile(all_linear_params_high_exp$LogMean,c(.05,.95))
+LogMean_abs_min = quantile(abs(all_linear_params_high_exp$LogMean),.1)
+ResDisp_range = quantile(all_linear_params_high_exp$ResDisp,c(.01,.95))
+ResDisp_abs_min = quantile(abs(all_linear_params_high_exp$ResDisp),.1)
+
+#mean_var
+up_up = all_linear_params_high_exp[LogMean>= LogMean_range[2] & ResDisp > ResDisp_range[2],.(GeneName,GeneSymbol,LogMean,ResDisp)]
+up_up = up_up[order(LogMean,decreasing=T),]
+up_up_sel = c("Y41C4A.32","dod-3","thn-2","nlp-31")
+up_NS = all_linear_params_high_exp[LogMean>= LogMean_range[2] & abs(ResDisp) < ResDisp_abs_min,.(GeneName,GeneSymbol,LogMean,ResDisp)]
+up_NS = up_NS[order(LogMean,decreasing=T),]
+up_NS_sel = c("aex=3", "C04E7.3","C14B9.2")
+NS_up = all_linear_params_high_exp[abs(LogMean)<LogMean_abs_min & ResDisp > ResDisp_range[2],.(GeneName,GeneSymbol,LogMean,ResDisp)]
+NS_up = NS_up[order(ResDisp,decreasing=T),]
+NS_up_sel = c("fat-2", "K06G5.1","lec-5")
+
+
+down_down = all_linear_params_high_exp[LogMean<= LogMean_range[1] & ResDisp < ResDisp_range[1],.(GeneName,GeneSymbol,LogMean,ResDisp)]
+down_down = down_down[order(ResDisp),]
+down_down_sel = c("fat-7","gst-38","asp-14")
+down_NS = all_linear_params_high_exp[LogMean<= LogMean_range[1] & abs(ResDisp) < ResDisp_abs_min,.(GeneName,GeneSymbol,LogMean,ResDisp)]
+down_NS = down_NS[order(LogMean),]
+down_NS_sel = c("ugt-5","nhr-114","gst-44")
+NS_down = all_linear_params_high_exp[abs(LogMean)<LogMean_abs_min & ResDisp < ResDisp_range[1],.(GeneName,GeneSymbol,LogMean,ResDisp)]
+NS_down_sel = c("nhr-41","ttx-1","ins-5")
+
+down_up = all_linear_params_high_exp[LogMean<= LogMean_range[1] & ResDisp >= ResDisp_range[2],.(GeneName,GeneSymbol,LogMean,ResDisp)]
+down_up_sel = c("vit-5","col-106","asp-4","hsp-60")
+
+
+genes_to_plot = data.frame(GeneSymbol=c(up_up_sel,up_NS_sel,NS_up_sel,down_down_sel,down_NS_sel,NS_down_sel,down_up_sel))
+setkey(all_linear_params_high_exp,GeneSymbol)
+genes_to_plot$GeneName = all_linear_params_high_exp[genes_to_plot,GeneName]
+genes_to_plot$class = c(rep("up up",length(up_up_sel)),rep("up NS",3),rep("NS up",3),rep("down down",3),rep("down NS",3),rep("NS down",3),rep("down up",4))
+
+down_up_list = data.frame(GeneSymbol=down_up$GeneSymbol)
+down_up_list$GeneName = all_linear_params_high_exp[down_up$GeneSymbol,GeneName]
+down_up_list$class = rep("down up",nrow(down_up))
+
+NS_up_list = data.frame(GeneSymbol=NS_up$GeneSymbol)
+NS_up_list$GeneName = all_linear_params_high_exp[NS_up$GeneSymbol,GeneName]
+NS_up_list$class = rep("NS up",nrow(NS_up))
+  
+```
+```{r}
+for (i in 1:nrow(genes_to_plot)){
+gtp = genes_to_plot$GeneName[i]
+data = data.frame(counts = counts[["n2_series"]][gtp,],sample = names(counts[["n2_series"]][gtp,]))
+data$Day = as.integer(as.character(annots[data$sample,Day]))
+gg = ggplot(data,aes(Day+rnorm(nrow(data),0,.2),(counts)))+geom_point()+scale_x_continuous(breaks=seq(0,14,2))+xlab("Age (Days)")+xlab("Counts") + ggtitle(paste0(genes_to_plot$GeneSymbol[i]," (",genes_to_plot$class[i],")")) + geom_smooth(se=F) +  scale_y_log10() 
+plot(gg)
+}
+
+```
+```{r}
+for (i in 1:nrow(down_up_list)){
+gtp = down_up_list$GeneName[i]
+data = data.frame(counts = counts[["n2_series"]][gtp,],sample = names(counts[["n2_series"]][gtp,]))
+data$Day = as.integer(as.character(annots[data$sample,Day]))
+gg = ggplot(data,aes(Day+rnorm(nrow(data),0,.2),log10(counts)))+geom_point()+scale_x_continuous(breaks=seq(0,14,2))+xlab("Age (Days)")+xlab("Counts") + ggtitle(paste0(down_up_list$GeneSymbol[i]," (",down_up_list$class[i],")")) + geom_smooth(se=F)
+plot(gg)
+}
+
+```
+```{r}
+for (i in 1:nrow(NS_up_list)){
+gtp = NS_up_list$GeneName[i]
+data = data.frame(counts = counts[["n2_series"]][gtp,],sample = names(counts[["n2_series"]][gtp,]))
+data$Day = as.integer(as.character(annots[data$sample,Day]))
+gg = ggplot(data,aes(Day+rnorm(nrow(data),0,.2),log10(counts)))+geom_point()+scale_x_continuous(breaks=seq(0,14,2))+xlab("Age (Days)")+xlab("Counts") + ggtitle(paste0(NS_up_list$GeneSymbol[i]," (",NS_up_list$class[i],")")) + geom_smooth(se=F)
+gg2 = ggplot(data) + geom_density_ridges(aes(x = log10(counts), factor(as.character(Day),levels=c("1","2","4","6","8","10","12"))))+xlab("Age (Days)")+ylab("Counts") + ggtitle(paste0(NS_up_list$GeneSymbol[i]," (",NS_up_list$class[i],")")) 
+plot(gg)
+plot(gg2)
+}
+library(ggridges)
+```
+```{r}
+pc_res = prcomp(all_params[,!grepl("pvalue",colnames(all_params))])
+pc_loadings = data.frame(pc_res$x)
+
+ggplot(pc_loadings,aes(x=PC1,y=PC2)) + geom_point()
+ggplot(pc_loadings,aes(x=PC2,y=PC3)) + geom_point()
+ggplot(pc_loadings,aes(x=PC3,y=PC4)) + geom_point()
+
+```
+#look at relationship among changes in mean, residual overdispersion
+```{r}
+library(ggExtra)
+gm = ggplot(all_params,aes(LogMean_Poly1,ResDisp_Poly1))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0) + geom_smooth(method="loess",color="red",size=1,span=.75)
+plot(ggMarginal(gm, type="density"))
+gm = ggplot(all_params,aes(LogMean_Poly2,ResDisp_Poly2))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0) + geom_smooth(method="loess",color="red",size=1,span=.75)
+plot(ggMarginal(gm, type="density"))
+gm = ggplot(all_params,aes(LogMean_Poly1,LogMean_Poly2))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0)
+plot(ggMarginal(gm, type="density"))
+gm = ggplot(all_params,aes(ResDisp_Poly1,ResDisp_Poly2))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0)
+plot(ggMarginal(gm, type="density"))
+```
+```{r}
+(all_params$ResDisp_Poly1)
+```
+
+
+#look at relationship among changes in mean, residual overdispersion ONLY SIGNIFICANT changes
+```{r}
+library(ggExtra)
+all_p = as.data.table(all_params)
+ggplot(all_p[LogMean_Poly1_pvalue<.001 | ResDisp_Poly1_pvalue <.001],aes(LogMean_Poly1,ResDisp_Poly1))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0)
+
+ggplot(all_p[LogMean_Poly2_pvalue<.001 | ResDisp_Poly2_pvalue <.001],aes(LogMean_Poly2,ResDisp_Poly2))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0)
+
+ggplot(all_p[LogMean_Poly1_pvalue<.001,],aes(LogMean_Poly1,LogMean_Poly2))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0)
+
+prms = all_p
+prms$poly2_sig = F;
+prms[ResDisp_Poly2_pvalue<.001,]$poly2_sig = T
+prms = prms[ResDisp_Poly1_pvalue < .001,];
+ggplot(prms,aes(ResDisp_Poly1,ResDisp_Poly2,color=poly2_sig))+geom_point()+geom_hline(yintercept=0)+geom_vline(xintercept=0)
+```
+## Residual overdispersion
+
+```{r}
+sig_colors <- c(Equal = "grey", Up = "#990000ff", Down = "#0b5394ff")
+sig_alpha <- 1e-2
+```
+
+#Look at differentially regulated genes in each comparrison--overdispersion vs overdispersion
+```{r}  
+group = "n2_series"
+
+da_long_df$sig = ifelse(da_long_df$padj.resdisp >= .001,"NS",ifelse(da_long_df$Log2Foldchange.resdisp>0,"Up","Down"))
+sig_colors= c(NS="gray", Up = "#990000ff", Down = "#0b5394ff")
+ggplot(da_long_df, aes(log2FoldChange.mean, Log2Foldchange.resdisp)) +
+  geom_point(aes(color = sig), alpha = .5, size = .5, pch = 20) + facet_wrap(~Day_factor)+
+   
+  scale_color_manual(values = sig_colors, name = NULL) +
+  theme(legend.position = "none") +
+ 
+  xlab(paste0("Residual Overdispersion (",comp_levels[1], ")")) +
+  ylab(paste0("Residual Overdispersion (",comp_levels[2], ")")) + ggtitle(group)
+
+## geom_smooth(method = "lm", se = FALSE, color = "purple") +
+ # geom_smooth(se = FALSE) +
+ # geom_abline() +ggrepel::geom_text_repel(aes(color = ResultDiff, label = GeneSymbol), 
+ #                         min.segment.length = unit(0, 'lines'),
+  #                         rbind(ggdf[ResultDiff == "Up"][order(-logFoldChange_overdispersion)][1:3],
+   #                              ggdf[ResultDiff == "Down"][order(logFoldChange_overdispersion)][1:3])) +
+
+```
+ 
+
+```{r,fig.width=12,fig.height=8}  
+group = "n2_series"
+sig_colors= c(NS="gray", Up = "#990000ff", Down = "#0b5394ff")
+RES_VAR_QUANTITATIVE_THRESHOLD = 1
+
+fine_contour_breaks=c(.005,.025,.075,.125,seq(.250,1,.250))
+Nf = length(fine_contour_breaks)
+thick_contour_breaks=seq(0,1,.1)
+Nt = length(thick_contour_breaks)
+lwd = .5
+lty=1
+
+cur_param = params_shared_tech_df[model=="n2_series" & bad_fit == F & SequenceType=='Biological',]
+frm = "BaseMean~GeneName+Day"
+gene_min = aggregate(as.formula(frm),cur_param,FUN=min)
+gene_above_var_quantitative_threshold = aggregate(as.formula(frm),cur_param,FUN=function(x)any(x>=RES_VAR_QUANTITATIVE_THRESHOLD))
+genes_to_plot = intersect(gene_min$GeneName[gene_min$BaseMean>=100 ],
+                          gene_above_var_quantitative_threshold$GeneName[gene_above_var_quantitative_threshold$BaseMean])
+  
+da_long_df[GeneName %in% genes_to_plot,]
+library(MASS)
+rng = c(range(da_long_df_capped[,log2FoldChange.mean]),range(da_long_df_capped[,log2FoldChange.mean]))
+
+unsig_density_df = rbindlist(lapply(unique(da_long_df_capped$Day_factor),function(day){
+  num_unsig = nrow(da_long_df_capped[padj.resvar>=.05 & Day_factor == day,])
+  num_sig= nrow(da_long_df_capped[padj.resvar<.05 & Day_factor == day,])
+  unsig_density=kde2d(
+    da_long_df_capped[padj.resvar>=.05 & Day_factor == day,log2FoldChange.mean], 
+    da_long_df_capped[padj.resvar>=.05 & Day_factor == day,log2FoldChange.resvar], n = 60,lims=rng)
+  sig_density=kde2d(
+    da_long_df_capped[padj.resvar<.05 & Day_factor == day,log2FoldChange.mean], 
+    da_long_df_capped[padj.resvar<.05 & Day_factor == day,log2FoldChange.resvar], n = 60,lims=rng)
+  
+  frac_unsig_density=unsig_density;
+  unsig_total = sum(unsig_density$z)
+  sig_total = sum(sig_density$z)
+  frac_unsig_density$z=-sig_density$z/sig_total*num_sig+unsig_density$z/unsig_total*num_unsig
+  frac_unsig_density$z = ifelse(frac_unsig_density$z>0,frac_unsig_density$z,0)
+  frac_unsig_density$z = frac_unsig_density$z/max(frac_unsig_density$z)
+  image(frac_unsig_density$z,col=grey(rev(seq(0, 1, length = 256))))
+  nx=nrow(frac_unsig_density$z)
+  ny=ncol(frac_unsig_density$z)
+  ids = matrix(1:(nx*ny),
+               nrow=nx,
+               ncol=ny,byrow=T)
+  id_y_lookup = as.numeric(ids-1)%%nx+1
+  id_x_lookup = floor(as.numeric(ids)/nx)+1
+  unsig_density_df=data.frame(log2FoldChange.mean=frac_unsig_density$x[id_x_lookup],
+                              log2FoldChange.resvar=frac_unsig_density$y[id_y_lookup],
+                              unsig_frac = as.numeric(frac_unsig_density$z))
+  unsig_density_df$Day_factor = day
+  unsig_density_df
+}))
+
+ggplot(unsig_density_df,aes(x=log2FoldChange.mean,y=log2FoldChange.resvar,fill=unsig_frac)) + geom_tile() + facet_wrap(~Day_factor)
+
+ggplot(da_long_df, aes(log2FoldChange.mean, log2FoldChange.resvar))+
+  geom_hline(yintercept=0,col="gray",lwd=1,lty=lty) +geom_vline(xintercept=0,col="gray",lwd=lwd,lty=lty)+
+  stat_density_2d(fill="#DDDDDD",geom="polygon",contour_var = "ndensity",breaks=fine_contour_breaks[c((Nf-1):Nf)],adjust=c(2,2),na.rm = T,lwd=lwd)+
+  geom_density_2d(aes(color = Day_factor),contour_var = "ndensity",breaks=fine_contour_breaks,adjust=c(2,2),na.rm = T,lwd=0)+
+  facet_wrap(~Day_factor)+
+   
+  theme(legend.position = "none") +
+ 
+  xlab("Change in Mean (1)") +
+  ylab("Change in Variance across cohort (1)") + ggtitle(group) 
+  
+  ggplot(da_long_df[padj.mean < .01 | padj.resvar < .01,], aes(log2FoldChange.mean, log2FoldChange.resvar)) +geom_hline(yintercept=0,col="gray",lwd=lwd,lty=lty)+
+    geom_vline(xintercept=0,col="gray",lwd=lwd,lty=lty) +
+    stat_density_2d(fill="#DDDDDD",geom="polygon",contour_var = "ndensity",breaks=thick_contour_breaks[c((Nt-1):Nt)],na.rm = T,lwd=lwd)+
+    geom_density_2d(aes(color = Day_factor),contour_var = "ndensity",na.rm = T,lwd=lwd,breaks=thick_contour_breaks) +
+  facet_wrap(~Day_factor)+
+    
+  theme(legend.position = "none") +
+ 
+  xlab("Change in Mean") +
+  ylab("Chage in Variance") + ggtitle(group)
+  
+  mean_limits = aggregate(log2FoldChange.mean~Day_factor,da_long_df,quantile,probs=c(.001,.999))
+  mean_limits = c(min(mean_limits[,2][,1]),max(mean_limits[,2][,2]))
+  var_limits =aggregate(log2FoldChange.resvar~Day_factor,da_long_df,quantile,probs=c(.001,.999))
+  var_limits = c(min(var_limits[,2][,1]),max(var_limits[,2][,2]))
+  da_long_df_capped = da_long_df
+  
+  da_long_df_capped[,log2FoldChange.mean:=ifelse(log2FoldChange.mean> mean_limits[2],mean_limits[2],ifelse(log2FoldChange.mean < mean_limits[1],mean_limits[1],log2FoldChange.mean))]
+  da_long_df_capped[,log2FoldChange.resvar:=ifelse(log2FoldChange.resvar> var_limits[2],var_limits[2],ifelse(log2FoldChange.resvar< var_limits[1],var_limits[1],log2FoldChange.resvar))]
+  
+
+   ggplot(da_long_df_capped, aes(log2FoldChange.mean, log2FoldChange.resvar)) +
+     geom_hex(bins = 60,aes(fill = ..ndensity..))+
+     scale_fill_gradientn(colors=c("light gray","dark gray","blue","red"),values=c(0,.01,.5,1))+
+     
+     stat_contour(data=unsig_density_df,aes(z=unsig_frac),contour_var = "ndensity",breaks=.1,na.rm = T,lwd=1,lty="22",color="black")+
+     
+     geom_hline(color="black",yintercept=0,lwd=lwd,lty=lty)+
+    geom_vline(color="black",xintercept=0,lwd=lwd,lty=lty) +
+   
+    # geom_hline(yintercept=var_limits,lwd=lwd,lty=1,col="dark grey")+
+   # geom_vline(xintercept=mean_limits,lwd=lwd,lty=1,col="dark grey")  +
+    theme(strip.background  = element_blank())+
+  facet_wrap(~Day_factor,ncol=2,labeller = labeller(Day_factor=function(x)paste("Day",x)))+
+    
+  theme(legend.position = "none") +
+ 
+  xlab("Change in Mean") +
+  ylab("Chage in Variance") 
+  ggsave("../figures/01/time_series_mean_var_heatmap.pdf",width=8,height=8)
+
+```
+
+```{r,fig.width=13,fig.height=8}  
+group = "n2_series"
+
+sig_colors= c(NS="gray", Up = "#990000ff", Down = "#0b5394ff")
+
+
+sig_colors_4w= c(`Up Up`= "#EA4335", `NS Up`="#EA4335",
+             `Up NS` = "#FBBC05",
+             `NS NS` = "gray",
+             `Down NS` =  "#34A853",
+             `NS Down` = "#4285F4", 
+             `Down Down` = "#4285F4",
+             `Down Up` = "pink",
+             `Up Down` = "pink");
+
+ggplot(da_long_df, aes(log2FoldChange.mean, log2FoldChange.resdisp)) + 
+  
+  geom_point(aes(color = both_sig), alpha = .5, size = 2, pch = 20) + 
+  scale_color_manual(values = sig_colors_4w, name = NULL) +
+  geom_density_2d(color="black",contour_var = "ndensity",breaks=fine_contour_breaks,adjust=c(2,2))+geom_hline(yintercept=0) +geom_vline(xintercept=0,col="gray")+ 
+   
+  facet_wrap(~Day_factor)+
+  
+  theme(legend.position = "none") +
+ 
+  xlab("Change in Mean") +
+  ylab("Change in Variance") + ggtitle(group)
+```
+
+```{r,fig.width=13,fig.height=8}  
+
+
+ggplot(da_long_df,aes(x=as.integer(Day)+rnorm(nrow(da_long_df),0,.3),y=log2FoldChange.mean,color = both_sig))  + geom_point(size=.75) + scale_color_manual(values = sig_colors_4w, name = NULL) +  scale_x_continuous(breaks=seq(0,14,2))+xlab("Age (Days)")+xlab("Change in Expression Mean")
+ggplot(da_long_df,aes(x=as.integer(Day)+rnorm(nrow(da_long_df),0,.3),y=log2FoldChange.resdisp,color = both_sig)) + geom_point(size=.75)+ scale_color_manual(values = sig_colors_4w, name = NULL)+  scale_x_continuous(breaks=seq(0,14,2))+xlab("Age (Days)")+xlab("Change in Expression Variance")
+
+```
+
+
+
+```{r,fig.width=13,fig.height=8}  
+mean_data = aggregate(abs(log2FoldChange.mean)~Day,da_long_df,FUN=median)
+names(mean_data) = c("Day","log2FoldChange")
+mean_data2 = aggregate(abs(log2FoldChange.mean)~Day,da_long_df,FUN=length)
+names(mean_data2) = c("Day","N")
+var_data = aggregate(abs(log2FoldChange.resdisp)~Day,da_long_df,FUN=median)
+names(var_data) = c("Day","log2FoldChange")
+var_data2 = aggregate(abs(log2FoldChange.resdisp)~Day,da_long_df,FUN=length)
+names(var_data2) = c("Day","N")
+
+m1 = merge(mean_data,mean_data2,by=c("Day"))
+m1$stat = "mean"
+v1 = merge(var_data,var_data2,by=c("Day"))
+v1$stat = "var"
+all_summary_stats = rbind(m1,v1)
+
+ggplot(all_summary_stats,aes(x=as.integer(Day),y=log2FoldChange,color=stat)) + geom_line()
+
+```
+#Load DA for scaling model fits
+```{r}
+source("../scripts/helpers/gene_variability.R")
+
+nlp28_da= fread("../data/differential_analysis/tables/net_validation/N2_nlp28_Set3_Day8.csv.gz")
+ggplot(nlp28_da,aes(RNAi_nlp28_vs_EV_log2FoldChange,-log10(RNAi_nlp28_vs_EV_padj))) + geom_point()
+nlp15_da= fread("../data/differential_analysis/tables/net_validation/N2_nlp15_Set3_Day8.csv.gz")
+pcn1_da = fread("../data/differential_analysis/tables/net_validation/N2_pcn1_Set5_Day8.csv.gz")
+rps22_da= fread("../data/differential_analysis/tables/net_validation/N2_rps22_Set1_Day8.csv.gz")
+atp5_da= fread("../data/differential_analysis/tables/net_validation/N2_atp5_Set5_Day8.csv.gz")
+glp1_d1_da= fread("../data/differential_analysis/tables/single_and_pooled_worms/d1_glp1.csv.gz")
+glp1_d8_da= fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_glp1.csv.gz")
+
+
+
+RNAis = list(nlp28_da = nlp28_da, 
+             nlp15_da = nlp15_da,
+             pcn1_da = pcn1_da,
+             rps22_da = rps22_da,
+             atp5_da = atp5_da,
+             glp1_d1_da = glp1_d1_da,
+             glp1_d8_da = glp1_d8_da)
+
+RNAi_cols = list(nlp28_da = "RNAi_nlp28_vs_EV_log2FoldChange",
+          nlp15_da= "RNAi_nlp15_vs_EV_log2FoldChange",
+          pcn1_da= "RNAi_pcn1_vs_EV_log2FoldChange",
+          rps22_da= "RNAi_rps22_vs_EV_log2FoldChange",
+          atp5_da= "RNAi_atp5_vs_EV_log2FoldChange",
+          glp1_d1_da= "Strain_CB4037_vs_QZ0_log2FoldChange",
+          glp1_d8_da= "Strain_CB4037_vs_QZ0_log2FoldChange")
+
+RNAi_name_lookup = list(nlp28_da = "N2_nlp28_Set3_Day8", 
+nlp15_da = "N2_nlp15_Set3_Day8",
+pcn1_da = "N2_pcn1_Set5_Day8",
+rps22_da = "N2_rps22_Set1_Day8",
+atp5_da = "N2_atp5_Set5_Day8",
+glp1_d1_da = "d1_glp1",
+glp1_d8_da = "d8_glp1")
+
+
+setkey(geneid,GeneSymbol)
+RNAi_GeneName_to_exclude = list(nlp28_da = geneid["nlp-28",GeneName], 
+             nlp15_da = geneid["nlp-15",GeneName],
+             pcn1_da = geneid["pcn-1",GeneName],
+             rps22_da = geneid["rps-22",GeneName],
+             atp5_da = geneid["atp-5",GeneName],
+             glp1_d1_da = "",
+             glp1_d8_da = "")
+```
+
+#load n2 series data 
+```{r}
+tmp=list()
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d8_ref.csv.gz"))
+tmp[["08v04"]] = out[,c(1:2,11:14)] # 4 vs 8
+tmp[["08v06"]] = out[,c(1:2,15:18)] # 6 vs 8
+tmp[['10v08']] = out[,c(1:2,19:22)] # 10 vs 8
+tmp[['12v08']] = out[,c(1:2,23:26)] # 12 vs 8
+
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series.csv.gz"))
+tmp[["02v01"]] = out[,c(1:2,7:10)] # 2 vs 8
+tmp[["04v01"]] = out[,c(1:2,11:14)] # 2 vs 8
+
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d2.csv.gz"))
+tmp[["04v02"]] = out[,c(1:6)] 
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d4.csv.gz"))
+tmp[["06v04"]] = out[,c(1:6)] 
+
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d6_d10.csv.gz"))
+tmp[["06v10"]] = out[,c(1:6)] 
+
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d2_d6.csv.gz"))
+tmp[["02v6"]] = out[,c(1:6)] 
+
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d10.csv.gz"))
+tmp[["12v10"]] = out[,c(1:6)] 
+
+
+#consecutive points
+#1-2
+#2-4
+#4-6
+#6-8
+#8-10
+#10-12
+
+#every 2 points
+#1-4
+#2-6
+#4-8
+#6-10
+#8-12
+
+
+
+for (n in names(tmp)){
+  colnames(tmp[[n]])[3:6] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+  tmp[[n]][,Name:=n]
+}
+tmp[["08v06"]]$log2FoldChange = -tmp[["08v06"]]$log2FoldChange #day 8 is written to file backwards
+tmp[["08v04"]]$log2FoldChange = -tmp[["08v04"]]$log2FoldChange
+tmp_cols = list()
+for (n in names(tmp)){
+  tmp_cols[[n]] = "log2FoldChange";
+}
+RNAi_excl = list()
+for (n in names(tmp)){
+  RNAi_excl[[n]] = "";
+}
+tmp_name_lookup = c(`02v01`= "n2_d2_vs_1",
+                    `04v02`= "n2_series_d2",
+                    `06v04`= "n2_series_d4",
+                    `08v06`= "n2_d6_vs_8",
+                    `10v08`= "n2_d10_vs_8",
+                    `12v10`= "n2_series_d10",
+                    `01v04`= "n2_d4_vs_1",
+                    `02v06`= "n2_series_d2_d6",
+                    `04v08`= "n2_d4_vs_8",
+                    `06v10`= "n2_series_d6_d10",
+                    `08v12`= "n2_d12_vs_8")
+
+n2_series_aging_direction = c(`02v01`= "foward",
+                    `04v02`= "forward",
+                    `06v04`= "reverse",
+                    `08v06`= "reverse",
+                    `10v08`= "forward",
+                    `12v10`= "forward",
+                    `01v04`= "forward",
+                    `02v06`= "reverse",
+                    `04v08`= "reverse",
+                    `06v10`= "reverse",
+                    `08v12`= "forward")
+                    
+RNAis = c(RNAis,tmp)
+RNAi_cols = c(RNAi_cols,tmp_cols)
+RNAi_name_lookup = c(RNAi_name_lookup,tmp_name_lookup)
+RNAi_GeneName_to_exclude = c(RNAi_GeneName_to_exclude,RNAi_excl)
+```
+	
+
+```{r}
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+
+cnts = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[["n2_series_all"]]))];
+for (i in unique(ts_annots$Day)){
+  cts = cnts[,unique(ts_annots[Day==i,Sample])]
+  cts = cts[,! colnames(cts) %in% to_exclude]
+
+  x <- cts
+  x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, unique(annots[ annots$model=="n2_series_all"][colnames(x)]), by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+  gp_pca <- ggplot(scores_df, aes(PC1, PC2,label=Sample)) +
+    geom_point(size = 2) +
+    scale_color_viridis_c(trans = "log10") + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "left")  + geom_text_repel() + ggtitle(i)
+ plot(gp_pca)
+}
+```
+
+#plot PC across all timepoints
+#Main Text Figure 1 e
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+cnts = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[[1]]))];
+  cts = cnts[,! colnames(cnts) %in% to_exclude]
+
+  x <- cts
+  x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+  library(colorspace)
+  plot_means=T
+if(plot_means){
+  #calculate CI on medians on each day
+mn = function(data,x){
+  #browser()
+  r = mean(unlist(data[x]))
+  names(r) = "mean";
+  r
+}
+}else{
+ mn = function(data,x){
+  r = median(unlist(data[x]))
+  names(r) = "median";
+  r
+} 
+}
+library(boot)
+
+cis = rbindlist(lapply(unique(scores_df$Day),function(cur_day){
+  rbindlist(lapply(c("PC1","PC2"),function(cur_PC){
+    dat = scores_df[Day == cur_day,cur_PC,with=F]
+    boot_res_d12 = boot(dat,mn,R=5)
+    boot_ci_d12 = boot.ci(boot.out = boot_res_d12,type = 'perc')
+    res = data.frame(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     PC = cur_PC)
+  }))
+}))
+cis_wide_l = dcast(cis,day~PC,value.var = "l")
+cis_wide_u = dcast(cis,day~PC,value.var = "u")
+cis_wide = merge(cis_wide_l,cis_wide_u,by="day",suffixes=c(".95_ci_l",".95_ci_u"))
+
+
+if (!plot_means){
+#calculate medians of each day
+rs1 = aggregate(PC1~Day,scores_df,median)
+rs2 = aggregate(PC2~Day,scores_df,median)
+rs = merge(rs1,rs2,by="Day")
+}else{
+#mean
+rs1 = aggregate(PC1~Day,scores_df,mean)
+rs2 = aggregate(PC2~Day,scores_df,mean)
+rs = merge(rs1,rs2,by="Day")
+}
+centers = merge(rs,cis_wide,by.x="Day",by.y="day")
+centers = centers[order(centers$Day),]
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+  scores_df$Day = factor(scores_df$Day,levels=c(1,2,4,6,8,10,12))
+ 
+   gp_pca <- ggplot(scores_df[Genotype=="N2"], aes(-PC2, PC1,color=Day)) +
+    
+  geom_hline(yintercept=centers[centers$Day==1,"PC2"],lty=2,col="dark gray")+
+  geom_vline(xintercept=centers[centers$Day==1,"PC1"],lty=2,col="dark gray")+
+    geom_point(size = 1.5) + 
+    geom_path(data=centers,color="black",lwd=1) +
+    geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+    scale_colour_manual(values=cc)+
+    scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    theme(legend.position = c(0.025,0.3))  #+ geom_text_repel()
+ plot(gp_pca)
+ #Main Text Figure 1 e
+ ggsave("../figures/02/wt_timeseries_PC1_PC2.pdf",width=8,height=8)
+```
+#plot PC across all timepoints including glp1
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+ts_data = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[[1]]))]
+glp1_data = norm[["d_glp1"]]
+common_rows = intersect(rownames(ts_data),rownames(glp1_data))
+cnts = cbind(glp1_data[common_rows,],ts_data[common_rows,])
+
+cts = cnts[,! colnames(cnts) %in% to_exclude]
+
+  x <- cts
+  x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+  library(colorspace)
+  plot_means=T
+if(plot_means){
+  #calculate CI on medians on each day
+mn = function(data,x){
+  #browser()
+  r = mean(unlist(data[x]))
+  names(r) = "mean";
+  r
+}
+}else{
+ mn = function(data,x){
+  r = median(unlist(data[x]))
+  names(r) = "median";
+  r
+} 
+}
+library(boot)
+
+cis = rbindlist(lapply(unique(scores_df$Genotype),function(geno){
+rbindlist(lapply(unique(scores_df[Genotype==geno,Day]),function(cur_day){
+  rbindlist(lapply(c("PC1","PC2"),function(cur_PC){
+    dat = scores_df[Day == cur_day & Genotype==geno,cur_PC,with=F]
+    boot_res_d12 = boot(dat,mn,R=5)
+    boot_ci_d12 = boot.ci(boot.out = boot_res_d12,type = 'perc')
+    res = data.frame(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     Genotype= geno,
+                     PC = cur_PC)
+  }))
+}))
+}))
+cis_wide_l = dcast(cis,day+Genotype~PC,value.var = "l")
+cis_wide_u = dcast(cis,day+Genotype~PC,value.var = "u")
+cis_wide = merge(cis_wide_l,cis_wide_u,by=c("day","Genotype"),suffixes=c(".95_ci_l",".95_ci_u"))
+
+
+if (!plot_means){
+#calculate medians of each day
+rs1 = aggregate(PC1~Day+Genotype,scores_df,median)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,median)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}else{
+#mean
+rs1 = aggregate(PC1~Day+Genotype,scores_df,mean)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,mean)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}
+centers = merge(rs,cis_wide,by.x=c("Day","Genotype"),by.y=c("day","Genotype"))
+centers = centers[order(centers$Day),]
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+  scores_df$Day = factor(scores_df$Day,levels=c(1,2,4,6,8,10,12))
+ 
+   gp_pca <- ggplot(scores_df, aes(-PC2, -PC1,color=Day,shape=Genotype)) +
+    
+  geom_hline(yintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC2"],lty=2,col="dark gray")+
+  geom_vline(xintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC1"],lty=2,col="dark gray")+
+    geom_point(size = 1.5) + 
+    geom_path(data=centers,color="black",lwd=1) +
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+    scale_colour_manual(values=cc)+
+    scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    theme(legend.position = c(0.025,0.3))  #+ geom_text_repel()
+ plot(gp_pca)
+ ggsave("../figures/02/S_wt_timeseries_PC1_PC2_glp1.pdf",width=8,height=8)
+```
+#plot PC just for day 8 glp1 meams
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+#ts_data = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[[1]]))]
+glp1_data = norm[["d8_glp1"]]
+common_rows = rownames(glp1_data)
+cnts = glp1_data[common_rows,]
+cnts = cnts[apply(cnts,1,function(x)!any(x < 30)), ]
+ants = annots[Sample%in%colnames(cnts) & model=="d8_glp1",]
+ # cts = log(x,cnts[,! colnames(cnts) %in% to_exclude]+1)
+  nrm = t(do.call("rbind", lapply(unique(ants$Strain),function(s){
+    smps = ants[Strain==s,Sample]
+    print(smps)
+    scale(t((cnts[,smps])),center=T,scale=F)
+  })))
+
+  x <- nrm
+  #x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(x), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, ants[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+
+ mn = function(data,x){
+  r = median(unlist(data[x]))
+  names(r) = "median";
+  r
+} 
+library(boot)
+
+cis = rbindlist(lapply(unique(scores_df$Genotype),function(geno){
+rbindlist(lapply(unique(scores_df[Genotype==geno,Day]),function(cur_day){
+  rbindlist(lapply(c("PC1","PC2"),function(cur_PC){
+    dat = scores_df[Day == cur_day & Genotype==geno,cur_PC,with=F]
+    boot_res_d12 = boot(dat,mn,R=5)
+    boot_ci_d12 = boot.ci(boot.out = boot_res_d12,type = 'perc')
+    res = data.frame(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     Genotype= geno,
+                     PC = cur_PC)
+  }))
+}))
+}))
+cis_wide_l = dcast(cis,day+Genotype~PC,value.var = "l")
+cis_wide_u = dcast(cis,day+Genotype~PC,value.var = "u")
+cis_wide = merge(cis_wide_l,cis_wide_u,by=c("day","Genotype"),suffixes=c(".95_ci_l",".95_ci_u"))
+
+
+if (!plot_means){
+#calculate medians of each day
+rs1 = aggregate(PC1~Day+Genotype,scores_df,median)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,median)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}else{
+#mean
+rs1 = aggregate(PC1~Day+Genotype,scores_df,mean)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,mean)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}
+centers = merge(rs,cis_wide,by.x=c("Day","Genotype"),by.y=c("day","Genotype"))
+centers = centers[order(centers$Day),]
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+  scores_df$Day = factor(scores_df$Day,levels=c(1,2,4,6,8,10,12))
+ 
+   gp_pca <- ggplot(scores_df, aes(-PC2, -PC1,color=Genotype,shape=Genotype)) +
+    
+  geom_hline(yintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC2"],lty=2,col="dark gray")+
+  geom_vline(xintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC1"],lty=2,col="dark gray")+
+    geom_point(size = 1.5) + 
+    geom_path(data=centers,color="black",lwd=1) +
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+ #   scale_colour_manual(values=cc)+
+ #   scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    theme(legend.position = c(0.025,0.3))  #+ geom_text_repel()
+ plot(gp_pca)
+ ggsave("../figures/02/PC1_PC2_glp1_wt_d8_means_removed.pdf",width=8,height=8)
+```
+
+#plot PC just for day 8 glp1
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+#ts_data = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[[1]]))]
+glp1_data = norm[["d8_glp1"]]
+common_rows = rownames(glp1_data)
+cnts = glp1_data[common_rows,]
+cnts = cnts[apply(cnts,1,function(x)!any(x < 30)), ]
+ants = annots[Sample%in%colnames(cnts) & model=="d8_glp1",]
+ # cts = log(x,cnts[,! colnames(cnts) %in% to_exclude]+1)
+  nrm = t(do.call("rbind", lapply(unique(ants$Strain),function(s){
+    smps = ants[Strain==s,Sample]
+    print(smps)
+    #scale(t((cnts[,smps])),center=T,scale=F)
+    t(cnts[,smps])
+  })))
+
+  x <- nrm
+  #x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(x), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, ants[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+
+ mn = function(data,x){
+  r = median(unlist(data[x]))
+  names(r) = "median";
+  r
+} 
+library(boot)
+
+cis = rbindlist(lapply(unique(scores_df$Genotype),function(geno){
+rbindlist(lapply(unique(scores_df[Genotype==geno,Day]),function(cur_day){
+  rbindlist(lapply(c("PC1","PC2"),function(cur_PC){
+    dat = scores_df[Day == cur_day & Genotype==geno,cur_PC,with=F]
+    boot_res_d12 = boot(dat,mn,R=5)
+    boot_ci_d12 = boot.ci(boot.out = boot_res_d12,type = 'perc')
+    res = data.frame(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     Genotype= geno,
+                     PC = cur_PC)
+  }))
+}))
+}))
+cis_wide_l = dcast(cis,day+Genotype~PC,value.var = "l")
+cis_wide_u = dcast(cis,day+Genotype~PC,value.var = "u")
+cis_wide = merge(cis_wide_l,cis_wide_u,by=c("day","Genotype"),suffixes=c(".95_ci_l",".95_ci_u"))
+
+
+if (!plot_means){
+#calculate medians of each day
+rs1 = aggregate(PC1~Day+Genotype,scores_df,median)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,median)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}else{
+#mean
+rs1 = aggregate(PC1~Day+Genotype,scores_df,mean)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,mean)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}
+centers = merge(rs,cis_wide,by.x=c("Day","Genotype"),by.y=c("day","Genotype"))
+centers = centers[order(centers$Day),]
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+
+ scores_df$GT = ifelse(scores_df$Genotype=="N2","Intact","Germline-Ablated")
+ colors_edge = c("Intact"="black","Germline-Ablated"="red")
+ colors_fill = c("Intact"="black","Germline-Ablated"="red")
+   gp_pca <- ggplot(scores_df, aes(-PC2, PC1,fill=GT)) +
+    
+  geom_hline(yintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC2"],lty=2,col="dark gray")+
+  geom_vline(xintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC1"],lty=2,col="dark gray")+
+    geom_point(size = 1.5,pch=21,,alpha=.8) + 
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+  #  scale_colour_manual(values=colors_edge)+
+    scale_fill_manual(values=colors_fill)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    theme(legend.position = c(.6,0.9))  #+ geom_text_repel()
+ plot(gp_pca)
+ ggsave("../figures/02/PC1_PC2_glp1_wt_d8.pdf",width=5,height=5)
+ ggsave("../figures/02/PC1_PC2_glp1_wt_d8_fl.pdf",width=5,height=2.5)
+ ```
+ 
+
+
+#plot PC just for day 8 glp1
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+#ts_data = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[[1]]))]
+glp1_data = norm[["d8_glp1"]]
+common_rows = rownames(glp1_data)
+cnts = glp1_data[common_rows,]
+cnts = cnts[apply(cnts,1,function(x)!any(x < 30)), ]
+ants = annots[Sample%in%colnames(cnts) & model=="d8_glp1",]
+ # cts = log(x,cnts[,! colnames(cnts) %in% to_exclude]+1)
+  nrm = t(do.call("rbind", lapply(unique(ants$Strain),function(s){
+    smps = ants[Strain==s,Sample]
+    print(smps)
+    scale(t((cnts[,smps])),center=T,scale=F)
+  })))
+
+  x <- nrm
+  #x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(x), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, ants[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+
+ mn = function(data,x){
+  r = median(unlist(data[x]))
+  names(r) = "median";
+  r
+} 
+library(boot)
+
+cis = rbindlist(lapply(unique(scores_df$Genotype),function(geno){
+rbindlist(lapply(unique(scores_df[Genotype==geno,Day]),function(cur_day){
+  rbindlist(lapply(c("PC1","PC2"),function(cur_PC){
+    dat = scores_df[Day == cur_day & Genotype==geno,cur_PC,with=F]
+    boot_res_d12 = boot(dat,mn,R=5)
+    boot_ci_d12 = boot.ci(boot.out = boot_res_d12,type = 'perc')
+    res = data.frame(l = boot_ci_d12$percent[4],
+                     u = boot_ci_d12$percent[5],
+                     day = cur_day,
+                     Genotype= geno,
+                     PC = cur_PC)
+  }))
+}))
+}))
+cis_wide_l = dcast(cis,day+Genotype~PC,value.var = "l")
+cis_wide_u = dcast(cis,day+Genotype~PC,value.var = "u")
+cis_wide = merge(cis_wide_l,cis_wide_u,by=c("day","Genotype"),suffixes=c(".95_ci_l",".95_ci_u"))
+
+
+if (!plot_means){
+#calculate medians of each day
+rs1 = aggregate(PC1~Day+Genotype,scores_df,median)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,median)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}else{
+#mean
+rs1 = aggregate(PC1~Day+Genotype,scores_df,mean)
+rs2 = aggregate(PC2~Day+Genotype,scores_df,mean)
+rs = merge(rs1,rs2,by=c("Day","Genotype"))
+}
+centers = merge(rs,cis_wide,by.x=c("Day","Genotype"),by.y=c("day","Genotype"))
+centers = centers[order(centers$Day),]
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+  scores_df$Day = factor(scores_df$Day,levels=c(1,2,4,6,8,10,12))
+ 
+   gp_pca <- ggplot(scores_df, aes(-PC2, -PC1,color=Genotype,shape=Genotype)) +
+    
+  geom_hline(yintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC2"],lty=2,col="dark gray")+
+  geom_vline(xintercept=centers[centers$Day==1 & centers$Genotype =="N2","PC1"],lty=2,col="dark gray")+
+    geom_point(size = 1.5) + 
+    geom_path(data=centers,color="black",lwd=1) +
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+ #   scale_colour_manual(values=cc)+
+ #   scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    theme(legend.position = c(0.025,0.3))  #+ geom_text_repel()
+ plot(gp_pca)
+ ggsave("../figures/02/PC1_PC2_glp1_wt_d8_means_removed.pdf",width=2,height=2)
+```
+
+
+#plot PC across all timepoints but removing day means first
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+set_name = "n2_series_all"
+cnts = norm[[set_name]][,grepl("TS_QZ0",colnames(norm[[set_name]]))];
+cnts=cnts[apply(cnts,1,function(x)!any(x < 30)), ]
+setkey(annots,Sample)
+days = annots[colnames(cnts),Day]
+nrm = t(do.call("rbind", lapply(unique(days),function(d){
+  smps = annots[Day==d & model == set_name,Sample]
+  smps = smps[smps%in%colnames(cnts)]
+  scale(t(log(cnts[,smps])),center=T,scale=T)
+})))
+
+  x <- nrm
+  pca <- prcomp(t(x), center = F, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+  scores_df$Day = factor(scores_df$Day,levels=c(1,2,4,6,8,10,12))
+ 
+   gp_pca <- ggplot(scores_df, aes(PC2, PC1,color=Day)) +
+    
+    geom_point(size = 1.5) + 
+    #geom_path(data=centers,color="black",lwd=1) +
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+    scale_colour_manual(values=cc)+
+    scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    theme(legend.position = c(0.025,0.3))  #+ geom_text_repel()
+ plot(gp_pca)
+ ggsave("../figures/02/wt_timeseries_PC1_PC2_centered.pdf",width=8,height=8)
+```
+
+```{r}
+
+to_exclude = c("TS_QZ0_d10_46","TS_QZ0_d1_14","TS_QZ0_d8_33", "TS_QZ0_d8_66")
+set_name = "n2_series_all"
+cnts = norm[[set_name]][,grepl("TS_QZ0",colnames(norm[[set_name]]))];
+cnts=cnts[apply(cnts,1,function(x)!any(x < 30)), ]
+setkey(annots,Sample)
+days = annots[colnames(cnts),Day]
+nrm = t(do.call("rbind", lapply(unique(days),function(d){
+  smps = annots[Day==d & model == set_name,Sample]
+  smps = smps[smps%in%colnames(cnts)]
+  scale(t(log(cnts[,smps])),center=F,scale=F)
+})))
+
+  x <- nrm
+  pca <- prcomp(t(x), center = T, scale. = T)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+
+cc <- colorRampPalette(c("black","light blue","red"),bias=1,interpolate ="spline")(length(unique(scores_df$Day)))
+ 
+scores_df$Day_f = relevel(scores_df$Day_f,ref="12")
+lmres = glm(PC2~PC1*Day_f,scores_df,family="gaussian")
+cf = summary(lmres)$coefficients
+cf2 = cf[grep("PC1",rownames(cf),value=F),]
+cf3 = data.frame(cf2)
+cf3$coef = rownames(cf2)
+cf3$label = paste("Delta day",substring(cf3$coef,nchar("PC1:Day_f")+1))
+cf3$label[cf3$coef=="PC1"] = "Day 12 Slope"
+
+ggplot(cf3,aes(label,Estimate))+geom_point()+geom_errorbar(aes(ymin=Estimate-Std..Error,ymax=Estimate+Std..Error)) + geom_hline(yintercept=0,lty=2,col="dark gray")
+#cc = rainbow(7)
+#cc =diverging_hcl(7,palette = "blue_red")
+
+
+  scores_df$Day = factor(scores_df$Day,levels=c(1,2,4,6,8,10,12))
+rs1 = aggregate(PC1~Day,scores_df,mean)
+rs2 = aggregate(PC2~Day,scores_df,mean)
+rs = merge(rs1,rs2,by="Day")
+
+centers = rs
+centers = centers[order(centers$Day),]
+
+ 
+   gp_pca <- ggplot(scores_df, aes(-PC2, PC1,color=Day)) +
+    geom_hline(yintercept=0,lty=2,col="dark gray")+
+     geom_vline(xintercept=0,lty=2,col="dark gray")+
+    geom_point(size = 1.5) + 
+      geom_path(data=centers,color="black",lwd=1) +
+     geom_smooth(method="lm",se=F)+
+    geom_point(data=centers,aes(fill=Day),size=7,pch=21,fill="white",color="black",stroke=1) + 
+    geom_text(data=centers,aes(label=Day),size=4) + 
+    #geom_path(data=centers,color="black",lwd=1) +
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+    scale_colour_manual(values=cc)+
+    scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    #theme(legend.position = c(0.025,0.3))  #+ geom_text_repel() + 
+     theme_void()+
+       theme(legend.position="none")
+   
+    plot(gp_pca)
+ ggsave("../figures/02/wt_timeseries_PC1_PC2_fits.pdf",width=8,height=8)
+ ggsave("../figures/02/wt_timeseries_PC1_PC2_fits.png",width=8,height=8)
+ 
+     gp_pca <- ggplot(scores_df, aes(-PC2, PC1,color=Day)) +
+    geom_hline(yintercept=0,lty=2,col="dark gray")+
+     geom_vline(xintercept=0,lty=2,col="dark gray")+
+    geom_point(size = 1.5) + 
+      geom_path(data=centers,color="black",lwd=1) +
+    geom_point(data=centers,aes(fill=Day),size=7,pch=21,fill="white",color="black",stroke=1) + 
+    geom_text(data=centers,aes(label=Day),size=4) + 
+    #geom_path(data=centers,color="black",lwd=1) +
+   # geom_point(data=centers,aes(fill=Day),size=2,pch=21,color="black",stroke=2) + 
+    scale_colour_manual(values=cc)+
+    scale_fill_manual(values=cc)+
+    xlab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    ylab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    #theme(legend.position = c(0.025,0.3)) +
+     theme_void()+
+    theme(legend.position="none")
+ plot(gp_pca)
+ 
+ ggsave("../figures/02/wt_timeseries_PC1_PC2.pdf",width=8,height=8)
+ ggsave("../figures/02/wt_timeseries_PC1_PC2.png",width=8,height=8)
+ #plot(gp_pca2)
+```
+
+```{r}
+if (0){
+cnts = norm[["n2_series_all"]][,grepl("TS_QZ0",colnames(norm[["n2_series_all"]]))];
+#cnts = cnts[rowMeans(cnts)>100,]
+ts_annots = annots[Sample %in% colnames(cnts),]
+days_to_run = unique(annots$Day)
+days_to_run = 8
+day_fits = lapply(days_to_run,function(day){
+  to_run = names(RNAis)
+  to_run = "nlp28_da"
+  res =  lapply(to_run,function(RNAi){
+    cts = cnts[,ts_annots[Day==day,Sample]]
+    cts = cts[,! colnames(cts) %in% to_exclude]
+      res = ns_fit_da_linear_model(cts,
+                                   RNAis[[RNAi]],
+                                   differential_analysis_column_name = RNAi_cols[[RNAi]],
+                                   RNAi_GeneName_to_exclude=RNAi_GeneName_to_exclude[[RNAi]],
+                                   keep_x=F)
+     # res$residuals = NULL;
+      res
+  })
+  names(res) = to_run;
+  res;
+})
+names(day_fits) = as.character(days_to_run)
+}
+```
+```{r}
+if(0){
+rel_var = rbindlist(lapply(names(day_fits),function(x)rbindlist(lapply(names(day_fits[[x]]),function(y)data.frame(day = as.integer(x),RNAi = y,rel_var = day_fits[[x]][[y]]$relative_variance)))))
+ggplot(rel_var,aes(day,rel_var)) + geom_point()+facet_wrap(~RNAi)
+}
+```
+
+
+
+```{r}
+if(0){
+#r = day_fits[["10"]][["pcn1_da"]]
+cfs = rbindlist(lapply(names(day_fits),function(x)rbindlist(lapply(names(day_fits[[x]]),function(y){
+    cf = day_fits[[x]][[y]]$coef[grep("TS_QZ0",names(day_fits[[x]][[y]]$coef))];
+    data.frame(day =as.integer(rep(x,length(cf))),RNAi = rep(y,length(cf)),cf = cf);
+}))))
+ggplot(cfs,aes(day,cf)) + geom_jitter()+facet_wrap(~RNAi,scale="free")
+
+cfs_sum = aggregate(cf~day+RNAi,cfs,FUN=function(x)mean(abs(x)))
+ggplot(cfs_sum,aes(day,cf)) + geom_line()+facet_wrap(~RNAi,scale="free")+xlab("Average abs score")
+
+cfs_sum = aggregate(cf~day+RNAi,cfs,FUN=var)
+ggplot(cfs_sum,aes(day,cf)) + geom_line()+facet_wrap(~RNAi,scale="free") + xlab("Var in score")
+
+```
+```{r}
+
+cnts = norm[["n2_series"]][,grepl("TS_QZ0",colnames(norm[[1]]))];
+cnts2 = norm[["d1_sw"]];
+cnts2 = cnts2[,unique(annots[Sample %in% colnames(cnts2) & Strain=="QZ0",Sample])];
+cnts2 <- cnts2[apply(cnts2,1,function(cnts2)!any(cnts2 < 30)), ]
+ts_annots = annots[Sample %in% colnames(cnts),]
+
+days_to_run = unique(annots$Day)
+counts_as_list = lapply(days_to_run,function(day){
+    res = cnts[,ts_annots[Day==day,Sample]]
+    rownames(res) = rownames(cnts);
+    res
+})
+names(counts_as_list) = days_to_run;
+}
+
+```
+
+
+#Load condensed data for n2 time series
+```{r}
+if (0)}
+out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series.csv.gz"))
+n2_series_da = list()
+n2_series_da[["8"]] = out[,1:6,with=F] # 1 vs 8
+n2_series_da[["2"]] = out[,c(1:2,7:10),with=F] # 2 vs 8
+n2_series_da[["4"]] = out[,c(1:2,11:14),with=F] # 2 vs 8
+n2_series_da[["6"]] = out[,c(1:2,15:18),with=F] # 2 vs 8
+n2_series_da[['10']] = out[,c(1:2,19:22),with=F] # 2 vs 8
+n2_series_da[['12']] = out[,c(1:2,23:26),with=F] # 2 vs 8
+for (n in names(n2_series_da)){
+  colnames(n2_series_da[[n]])[3:6] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+  n2_series_da[[n]][,Name:=n]
+}
+any_sig = apply(sapply(n2_series_da,function(x)x$padj),1,function(x)any(x < .01))
+n2_series_fc = sapply(n2_series_da,function(x)x$log2FoldChange[any_sig])
+n2_series_fc = n2_series_fc[,c("2","4","6","8","10","12")]
+rownames(n2_series_fc) = n2_series_da[[1]]$GeneName[any_sig]
+
+gene_names_for_fitting_consensus_scale_factor = read.csv("../data/gene_names_for_fitting_consensus_scale_factor.csv")[[1]]
+}
+```
+
+#calculate scale factors relating days
+```{r}
+if (0){
+cur_da = "glp1_d8_da"
+da = RNAis[[cur_da]]
+
+cnts = norm[["n2_series"]][,grepl("TS_QZ0",colnames(norm[[1]]))];
+cnts2 = norm[["d1_sw"]];
+cnts2 = cnts2[,unique(annots[Sample %in% colnames(cnts2) & Strain=="QZ0",Sample])];
+genes_to_use = names(which(apply(cnts2,1,function(cnts2)!any(cnts2 < 30))))
+
+
+fc = lapply(1:ncol(n2_series_fc),function(i){
+    g1 = n2_series_fc[genes_to_use %in% rownames(n2_series_fc),1]
+    g2 =  n2_series_fc[genes_to_use %in% rownames(n2_series_fc),i]
+   #r = lm(g1~g2)
+    plot(g1,g2,xlab=paste(colnames(n2_series_fc)[1],"vs 1"),ylab=paste(colnames(n2_series_fc)[i],"vs 1"))
+    return(coef(lm(g2~g1)))
+ })
+names(fc)= colnames(n2_series_fc)
+
+tot = sapply(1:ncol(n2_series_fc),function(i){
+  sum(n2_series_fc[,i])
+})
+ 
+source("../scripts/helpers/gene_variability.R")
+
+  per_day_scale_factor = sapply(1:ncol(n2_series_fc),function(i){
+    g1 = n2_series_fc[,i]
+    g2 = da$Strain_CB4037_vs_QZ0_log2FoldChange
+    common_genes = intersect(rownames(n2_series_fc),da$GeneName)
+    common_genes = intersect(common_genes,gene_names_for_fitting_consensus_scale_factor)
+    g1 = n2_series_fc[common_genes,i];
+    setkey(da,GeneName)
+    g2 = da[common_genes,Strain_CB4037_vs_QZ0_log2FoldChange]
+   #r = lm(g1~g2)
+    plot(g1,g2,xlab=paste(colnames(n2_series_fc)[i],"vs 1"),ylab="glp1",ylim=c(-10,10))
+   
+    mean(g1-g2)
+  })
+  names(per_day_scale_factor) = colnames(n2_series_fc)
+  plot(as.integer(names(per_day_scale_factor)),per_day_scale_factor,ylim=c(0,3))
+}
+``` 
+
+
+#Calculate SCALE FACTOR TO RELATE DAYS (for debugging)
+```{r}
+if (0){
+source("../scripts/helpers/gene_variability.R")
+cur_da = "glp1_d8_da"
+day_scale_factors = rbindlist(lapply(names(RNAi_name_lookup),function(cur_da){
+  da = RNAis[[cur_da]]
+  RNAi_col = RNAi_cols[[cur_da]]
+  preset_log_means = rep(0,nrow(n2_series_fc))
+  names(preset_log_means) = rownames(n2_series_fc)
+  res_day = ns_fit_da_linear_model(n2_series_fc,
+                                    da,
+                                    differential_analysis_column_name = RNAi_col,
+                                    RNAi_GeneName_to_exclude = GeneName_ex, 
+                                    keep_x=F,
+                                    genes_to_fit=gene_names_for_fitting_consensus_scale_factor,
+                                    min_count_for_fitting = 0,
+                                    allow_recursion_for_outliers=0,
+                                    keep_residuals=F,
+                                   preset_log_means = preset_log_means,log_transform=F)
+  day_scale_factor = data.table(day = c(1,names(res_day$coef)),coef = c(0,res_day$coef))
+  day_scale_factor$day = as.integer(day_scale_factor$day)
+  day_scale_factor$da = cur_da
+  day_scale_factor
+}))
+plot(day_scale_factors$day,day_scale_factors$coef)
+day_scale_factors$grp = RNAi_name_lookup[day_scale_factors$da]
+}
+
+```
+
+
+#LOAD SCALE FACTOR COEFFICIENTS AND FRACTION VAR EXPLAINED FOR EACH DA
+```{r,fig.width=5,fig.height=10}
+library(qs)
+scaling_model_fits = "all_30min"
+RNAi_name_lookup_to_load = RNAi_name_lookup[c("glp1_d1_da","glp1_d8_da","02v01"     , "04v02"  ,    "06v04"    ,  "08v06"   ,  
+ "10v08"   ,   "12v10"  ,    "01v04"   ,   "02v06"   ,   "04v08"   ,   "06v10" ,     "08v12" )]   
+n2_series_scaling_coefs = rbindlist(lapply(names(RNAi_name_lookup_to_load),function(grp){
+ 
+  days_to_load = c("1","2","4","6","8","10","12")
+  n2_series_scaling_coefs = rbindlist(lapply(days_to_load,function(day){
+    fname = paste0("../data/scaling_models/",scaling_model_fits,"/",RNAi_name_lookup[[grp]],"_n2_series_all_",day,"=all.qs");
+    cat(paste(fname,"\n"))
+    r = data.frame(coef = qread(fname)$dat$coef)
+    r$sample = rownames(r)
+    r$day = day;
+    r$grp = grp;
+    r
+  }))
+}))
+keycols = c("grp","day")
+#setkeyv(day_scale_factors,keycols)
+n2_series_scaling_coefs$day = as.numeric(n2_series_scaling_coefs$day )
+
+#n2_series_scaling_coefs$day_rel_coef = n2_series_scaling_coefs$coef#+day_scale_factors[n2_series_scaling_coefs[,.(grp,day)],coef]
+
+n2_series_stats = rbindlist(lapply(names(RNAi_name_lookup_to_load),function(grp){
+  days_to_load = c("1","2","4","6","8","10","12")
+  n2_series_scaling_coefs = rbindlist(lapply(days_to_load,function(day){
+    fname = paste0("../data/scaling_models/",scaling_model_fits,"/",RNAi_name_lookup[[grp]],"_n2_series_all_",day,"=all.qs");
+    cat(paste(fname,"\n"))
+    rr= qread(fname)
+    r = rr$stats
+    r$type = rownames(r)
+    r$day = day;
+    r$grp = grp;
+    r
+  }))
+}))
+```
+
+
+```{r,fig.width=20,fig.height=10}
+library(ggridges)
+ggplot(n2_series_scaling_coefs,aes(y = as.factor(day), group = as.factor(day),x=coef)) + geom_density_ridges(fill=NA,scale = 1) +  geom_hline(yintercept=seq(1:12),col="gray",lty=2) + facet_grid(.~grp,scales = "free_x")
+
+```
+
+
+```{r,fig.width=10,fig.height=10}
+
+ggplot(n2_series_scaling_coefs,aes(bg = as.factor(day),color = as.factor(day), x=coef)) + geom_density(aes(y = ..density..),lwd=.5,alpha=.4)  + facet_wrap(.~grp,scales = "free")
+n2_series_stats_capped = n2_series_stats;
+n2_series_stats_capped$mean_est = ifelse(n2_series_stats$mean_est>1,1,n2_series_stats$mean_est)
+n2_series_stats_capped$`ci.97.5.` = ifelse(n2_series_stats$`ci.97.5.`>1,1,n2_series_stats$`ci.97.5.`)
+n2_series_stats_capped$`ci.5.` = ifelse(n2_series_stats$`ci.5.`>1,1,n2_series_stats$`ci.5.`)
+ggplot(n2_series_stats_capped[type=="relative_total_variance",],aes(x=as.integer(day),y=1-mean_est,color=grp))+ geom_hline(yintercept=0,lty=2,col="gray") + geom_point()   + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`))
+ggplot(n2_series_stats_capped[type=="relative_total_variance",],aes(x=as.integer(day),y=1-mean_est,color=grp))+ geom_hline(yintercept=0,lty=2,col="gray") + geom_point()   + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`)) + facet_wrap(~grp) + ggtitle("Relative total variance")
+ggplot(n2_series_stats_capped[type=="relative_per_gene_variance",],aes(x=as.integer(day),y=1-mean_est,color=grp)) + geom_hline(yintercept=0,lty=2,col="gray")+ geom_point() + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`))
+
+ggplot(n2_series_stats_capped[type=="relative_per_gene_variance",],aes(x=as.integer(day),y=1-mean_est,color=grp)) + geom_hline(yintercept=0,lty=2,col="gray")+ geom_point() + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`))+ facet_wrap(~grp)+ ggtitle("Relative per gene variance")
+
+ggplot(n2_series_scaling_coefs[grp=="glp1_d8_da",],aes(bg = as.factor(day),color = as.factor(day), x=coef)) + geom_density(aes(y = ..density..),lwd=.5,alpha=.4)  + facet_wrap(.~grp,scales = "free")
+
+
+ggplot(n2_series_stats_capped[type=="relative_per_gene_variance" & grp=="glp1_d8_da",],aes(x=as.integer(day),y=1-mean_est,color=grp)) + geom_hline(yintercept=0,lty=2,col="gray")+ geom_point() + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`))+ facet_wrap(~grp)+ ggtitle("Relative per gene variance")
+
+```
+```{r,fig.width=8,fig.height=4}
+library(viridis)
+yax = c(`2`="02v01",`4`="04v02", `6`="06v04"    ,  `8`="08v06"  ,    `10`="10v08"   ,   `12`="12v10" )
+#for (cur_y in yax){
+  glp1 = n2_series_scaling_coefs[grp=="glp1_d1_da",]
+  days = n2_series_scaling_coefs[grp%in% yax,]
+  dat_wide1 = rbindlist(lapply(names(yax),function(cur_day){
+    dat_days = days[day==cur_day & grp == yax[as.character(cur_day)],]
+    if (n2_series_aging_direction[yax[cur_day]] == "reverse"){
+      dat_days$coef=-1*dat_days$coef
+      print(paste("Reversing",yax[cur_day]))
+    }
+    dat = merge.data.frame(glp1[day==cur_day,],dat_days,by=
+                             c("sample","day"),suffixes=c(".glp1",'.aging'))
+    dat$by="2 timepoints"
+    dat
+  }))
+  
+
+yax = c(`2`="01v04",`4`="02v06", `6`="04v08"    ,  `8`="06v10"  ,   `10`= "08v12"  )
+    days = n2_series_scaling_coefs[grp%in% yax,]
+  dat_wide2 = rbindlist(lapply(names(yax),function(cur_day){ 
+    dat_days = days[day==cur_day & grp == yax[as.character(cur_day)],]
+    if (n2_series_aging_direction[yax[cur_day]] == "reverse"){
+      dat_days$coef=-1*dat_days$coef
+      print(paste("Reversing",yax[cur_day]))
+    }
+    dat = merge.data.frame(glp1[day==cur_day,],dat_days,by=
+                             c("sample","day"),suffixes=c(".glp1",'.aging'))
+    dat$by="3 timepoints"
+    dat
+  }))
+  dat_wide = rbind(dat_wide1,dat_wide2)
+  
+  #calculate correlations on each day
+   mn = function(dat,x){
+    cor(dat$coef.glp1[x],dat$coef.aging[x])
+  }
+  library(boot)
+  age_glp1_cor=rbindlist(lapply(unique(dat_wide$day),function(cur_day){
+    d = dat_wide[by=="2 timepoints"&day==cur_day ,];
+    #data.frame(day=cur_day,cor=cor(d$coef.glp1,d$coef.aging))
+    bd = boot(d,mn,2000)
+    boot_ci = boot.ci(boot.out = bd,type = 'perc')
+    data.frame(day=cur_day,cor=mn(d,1:nrow(d)),cor_l=boot_ci$percent[4],cor_u=boot_ci$percent[5])
+    #browser()
+  }))
+  age_glp1_cor$day_s = as.character(age_glp1_cor$day)
+  gp_cor_mag = ggplot(age_glp1_cor[day>2,],aes(day,cor)) +  scale_x_continuous(breaks=c(1,seq(2,10,by=2)))+
+    geom_ribbon(aes(ymin=cor_l,ymax=cor_u),alpha=.1)+geom_point()+geom_line() + geom_hline(yintercept=0,col="dark gray",lty=2) + ylab("Correlation between\npseudotime and glp-1 scale factors") + xlab("Age (days)")
+ plot( gp_cor_mag)
+ setkey(age_glp1_cor,day_s)
+ #plot scale factors
+  gp_scale_plot=plot(ggplot(dat_wide[by=="2 timepoints"&day%in%c(4,8,12),],aes(2^coef.glp1,2^coef.aging))) + geom_hline(yintercept=1,color="dark gray",lty=2)+   geom_vline(xintercept=1,color="dark gray",lty=2)+ 
+    geom_point_rast(size=.75,alpha=.4,raster.dpi=600) + 
+    scale_x_continuous(trans="log2",breaks=seq(.85,1.15,by=.05))+
+    scale_y_continuous(trans="log2",breaks=c(.125,.25,.5,.75,1,1.5,2,3,4),labels=c("1/8","1/4","1/2","","1","","2","","4"))+
+    scale_color_viridis(option="turbo") + 
+    scale_fill_viridis(option="turbo") +
+    theme(legend.position = "none")+
+    xlab("glp-1(e2141) scale factor")+
+    ylab("Age Pseudotime scale factor")+
+    geom_smooth(aes(group=day),color="red",method="lm",se=F) + facet_grid(day~by,labeller = labeller(day=function(x){paste("Day",x, "cor=",round(age_glp1_cor[x,cor],2))})) +
+    theme(strip.background  = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  #ggsave("../figures/03/S_glp1_vs_wt_scale_factors_timeseries.pdf",width=8,height=4)
+#}
+  plot(gp_scale_plot)
+  
+```
+
+
+```{r,fig.width=8,fig.height=8}
+
+stats_to_plot = "relative_per_gene_variance"
+#stats_to_plot = "relative_total_IQD90"
+
+
+tp_bindings = list(
+local_1_tp_slopes_pre = data.frame(
+          day=c(1,2,4,6,8,10,12),
+          scaling_model=c(NA,"02v01","04v02","06v04","08v06","10v08","12v10")),
+#local_1_tp_slopes_post = data.frame(
+#          day=c(1,2,4,6,8,10,12),
+#          scaling_model=c("02v01","04v02","06v04","08v06","10v08","12v10",NA)),
+local_2_tp_slopes = data.frame(
+          day=c(1,2,4,6,8,10,12),
+          scaling_model=c(NA,"01v04","02v06","04v08","06v10","08v12",NA)
+))
+
+stats = rbindlist(lapply(names(tp_bindings),function(bnd){
+  b = tp_bindings[[bnd]];
+  stats = rbindlist(lapply(1:nrow(b),function(i){
+    n2_series_stats[grp == b$scaling_model[i] & day == b$day[i],]
+  }))
+  stats$bnd = bnd;
+  stats;
+}))
+
+stats_capped = stats;
+stats_capped$mean_est = ifelse(stats$mean_est>1,1,stats$mean_est)
+stats_capped$`ci.97.5.` = ifelse(stats$`ci.97.5.`>1,1,stats$`ci.97.5.`)
+stats_capped$`ci.5.` = ifelse(stats$`ci.5.`>1,1,stats$`ci.5.`)
+
+ggplot(stats_capped[type==stats_to_plot,],aes(x=as.integer(day),y=1-mean_est,color=bnd))+ geom_hline(yintercept=0,lty=2,col="gray")+ geom_point(cex=2) + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`))+ facet_wrap(~bnd)+ ggtitle("Relative per gene variance")  + ylim(c(0,.12))
+
+ggplot(stats_capped[type==stats_to_plot,],aes(x=as.integer(day),y=1-mean_est,color=bnd))+ geom_hline(yintercept=0,lty=2,col="gray")+ geom_point(cex=2) + geom_line() +
+  scale_color_manual(name="Relative per gene variance",values=c("blue","red"))+
+  scale_fill_manual(name="Relative per gene variance",values=c("blue","red"))+
+  geom_ribbon(aes(x=as.integer(day),ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`,bg=bnd),alpha=.1,col=NA)+ ylim(c(0,.12))+ 
+      theme(legend.position = c(0.01, 0.8))+ylab("Fraction cohort variance explained")+
+  xlab("Age")
+ggsave("../figures/03/S_local_slope_scale_model_timeseries.pdf",width=8,height=8)
+ggplot(stats[type==stats_to_plot,],aes(x=as.integer(day),y=1-mean_est,color=bnd)) + geom_hline(yintercept=0,lty=2,col="gray")+ geom_point()   + geom_line() + geom_errorbar(aes(ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`)) + facet_wrap(~bnd) + ggtitle("Relative total variance") 
+
+
+stats_capped$group = apply(stats_capped,1,function(x)paste("Aging pseudotime", ifelse(grepl("_1_",x[["bnd"]]),"(1 day)","(2 day)")))
+tmp3 = n2_series_stats_capped[grp=="glp1_d8_da",];
+tmp3$group = "glp-1 (day 8)"
+tmp2 = n2_series_stats_capped[grp=="glp1_d1_da",];
+tmp2$group = "glp-1 (day 1)"
+
+n2_glp1 = rbind(tmp3,tmp2,stats_capped[grepl("1 day",stats_capped$group),],fill=T)
+
+frac_var_explained=ggplot(n2_glp1[type==stats_to_plot & group=="glp-1 (day 1)",],aes(x=as.integer(day),y=1-mean_est,color=group))+ geom_hline(yintercept=0,lty=2,col="gray")+ geom_point(cex=2) + geom_line() +
+  scale_color_manual(name="Relative per gene variance",values=c("black","red","green","orange"))+
+  scale_fill_manual(name="Relative per gene variance",values=c("black","red","green","orange"))+
+  geom_ribbon(aes(x=as.integer(day),ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`,bg=group),alpha=.1,col=NA)+ ylim(c(0,.3))+ 
+      theme(legend.position = c(0.01, 0.8))+ylab("Fraction cohort variance explained")+
+  xlab("Age (days)") + scale_x_continuous(breaks=c(1,2,4,6,8,10,12))
+
+ggpubr::ggarrange(frac_var_explained,gp_scale_plot,ncol=1,heights=c(1,2))
+
+#gp_3 = ggpubr::ggarrange(ggpubr::ggarrange(frac_var_explained,gp_cor_mag,nrow=2),gp_scale_plot,ncol=2)
+#gp_3
+ggsave("../figures/03/glp_1_vs_time_compound_panel.pdf",width=4,height=8)
+
+n2_glp1 = rbind(tmp3,tmp2,stats_capped,fill=T)
+ggplot(n2_glp1[type==stats_to_plot ],aes(x=as.integer(day),y=1-mean_est,color=group))+ geom_hline(yintercept=0,lty=2,col="gray")+ geom_point(cex=2) + geom_line() +
+  scale_color_manual(name="Relative per gene variance",values=c("black","red","green","orange"))+
+  scale_fill_manual(name="Relative per gene variance",values=c("black","red","green","orange"))+
+  geom_ribbon(aes(x=as.integer(day),ymin = 1-`ci.5.`,ymax=1-`ci.97.5.`,bg=group),alpha=.1,col=NA)+ ylim(c(0,.3))+ 
+      theme(legend.position = c(0.01, 0.8))+ylab("Fraction cohort variance explained")+
+  xlab("Age (days)") + scale_x_continuous(breaks=c(1,2,4,6,8,10,12))
+ggsave("../figures/03/S_pseudo_time_glp1_fraction .pdf",width=8,height=8)
+
+
+```
+
+```{r}
+
+source("../scripts/helpers/gene_variability.R")
+day_means = sapply(counts_as_list,function(x){rowMeans(log2(x+1))})
+day_means <- day_means[apply(day_means,1,function(x)!any(x < log2(30))), ]
+preset_log_means = day_means[,"1"]
+GeneName_ex = RNAi_GeneName_to_exclude[[cur_da]]
+#names(preset_log_means) = rownames(day_means)
+res_day = ns_fit_da_linear_model(day_means,
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  genes_to_fit=gene_names_for_fitting_consensus_scale_factor,
+                                  min_count_for_fitting = 0,
+                                  allow_recursion_for_outliers=0,
+                                  keep_residuals=F,
+                                 preset_log_means = preset_log_means,
+                                 log_transform=F)
+plot(as.integer(names(res_day$coef)),res_day$coef)
+```
+
+
+```{r}
+preset_log_means = rep(0,nrow(n2_series_fc))
+ names(preset_log_means) = rownames(n2_series_fc)
+res_fc_day = ns_fit_da_linear_model(2^n2_series_fc,
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = 0,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F,
+                                 preset_log_means = preset_log_means)
+plot(as.integer(names(res_fc_day$coef)),res_fc_day$coef)
+
+res = ns_fit_set_da_linear_model(counts_as_list,
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = 25,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+
+}else{
+  res = lapply(counts_as_list,function(x){
+    x <- x[apply(x,1,function(x)!any(x < 30)), ]
+    
+    ns_fit_da_linear_model(x,
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = 100,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+    })
+}
+names(res) = names(counts_as_list)
+```
+
+
+```{r}
+```
+
+
+```{r}
+min_count_for_fitting = 100
+min_count_for_fitting = 25
+cnts2 = norm[["d8_sw"]]; 
+cnts2 <- cnts2[apply(cnts2,1,function(x)!any(x < 30)), ]
+source("../scripts/helpers/gene_variability.R")
+full_d1 = ns_fit_da_linear_model(cnts2[,colnames(cnts2) != "QZ0_d1_65"],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+full_d1_p = ns_fit_da_linear_model(cnts2[,colnames(cnts2) != "QZ0_d1_65"],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F,cor_type="p")
+fold_change_var = full_d1$residuals$residuals_IQD90/full_d1$residuals$orig_IQD90
+names(fold_change_var) = rownames(full_d1$residuals)
+genes_to_focus = names(which(fold_change_var <= .9))
+
+subset_d1 = ns_fit_da_linear_model(cnts2[,colnames(cnts2) != "QZ0_d1_65"],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  genes_to_fit = genes_to_focus,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+
+subset_d1_p = ns_fit_da_linear_model(cnts2[,colnames(cnts2) != "QZ0_d1_65"],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  genes_to_fit = genes_to_focus,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F,cor_type="p")
+
+stop()
+full_d1 = ns_fit_da_linear_model(cnts2[,colnames(cnts2) != "QZ0_d1_65"],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+ 
+plot(full_d1$residuals$orig,full_d1$residuals$residuals,log="xy",pch=21,bg="black",cex=.7)
+abline(a=0,b=1,col="red")
+nms = names(full_d1$coef);
+plot(factor(nms,levels=nms[order(nms)]),full_d1$coef)
+good_samples = which(full_d1$coef <= .3)
+
+full_d1_outliers_removed = ns_fit_da_linear_model(cnts2[,names(good_samples)],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+
+setkey(annots,Sample)
+r = data.table(Sample = names(full_d1$coef),coef=full_d1$coef)
+
+r$Group = annots[model == "d1_sw",][r$Sample,Group]
+ggplot(r,aes(Group,coef)) + geom_point()+theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+
+```{r}
+#test dependency on cutoff
+cnts2 = norm[["d8_sw"]];
+    cur_group = "QZ0.t20.d8.fNEC937.br10.sw"
+
+#  tst = rbindlist(lapply((0:100)*10,function(thresh){ 
+#  data.frame(thresh=thresh,num = length(which(apply(cnts2,1,function(cnts2)!any(cnts2 < thresh)))))
+#}))
+ # thresholds = (0:20)*10;
+ 
+  
+  grps = unique(annots[Sample %in% colnames(cnts2) & Strain=="QZ0",Group])
+  thresholds = c((0:20)*10,5);
+ tst3 = lapply(thresholds,function(thresh){ 
+    print(thresh)
+    cnts3 <- cnts2[apply(cnts2,1,function(cnts2)!any(cnts2 < thresh)), ]
+    sim_res2 = lapply(grps,function(cur_group){
+      print(cur_group)
+      smp = annots[Sample %in% colnames(cnts2) & Group == cur_group,Sample]
+      res = ns_fit_da_linear_model(cnts3[,smp],
+                                    da,
+                                    differential_analysis_column_name = RNAi_col,
+                                    RNAi_GeneName_to_exclude = GeneName_ex, 
+                                    keep_x=F,
+                                    min_count_for_fitting = 0,
+                                    allow_recursion_for_outliers=2,
+                                    keep_residuals=F)
+      res$cur_group = cur_group
+      res$thresh = thresh
+      res
+  })
+    names(sim_res2) = grps
+    sim_res2
+})
+  
+  
+  if (0){
+   min_count_for_fitting=100;
+  tst2 = lapply(thresholds,function(thresh){ 
+    print(thresh)
+    cnts3 <- cnts2[apply(cnts2,1,function(cnts2)!any(cnts2 < thresh)), ]
+    smp = annots[Sample %in% colnames(cnts2) & Group == cur_group,Sample]
+    ns_fit_da_linear_model(cnts3[,smp],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = min_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+  
+})
+  
+  sim_res = rbindlist(lapply(1:length(threshholds),function(i){
+    
+    data.frame(thresh=thresholds[i],
+               genes = length(tst2[[i]]$genes_used_to_fit),
+               relative_per_gene_variance = tst2[[i]]$stats["relative_per_gene_variance"],
+              relative_per_gene_IQD90 =  tst2[[i]]$stats["relative_per_gene_IQD90"],
+              mean_threshold=min_count_for_fitting)
+  }))
+  
+    sim_res2 = rbindlist(lapply(1:length(threshholds),function(i){
+    data.frame(thresh=thresholds[i],
+               genes = length(tst3[[i]]$genes_used_to_fit),
+               relative_per_gene_variance = tst3[[i]]$stats["relative_per_gene_variance"],
+              relative_per_gene_IQD90 =  tst3[[i]]$stats["relative_per_gene_IQD90"],
+              mean_threshold=0)
+  }))
+  sim_all = rbind(sim_res,sim_res2)
+  ggplot(sim_all,aes(thresh,relative_per_gene_variance))+geom_point()+facet_wrap(~mean_threshold)
+  
+
+  ggplot(sim_res2,aes(thresh,1-relative_per_gene_variance))+geom_point()+xlab("Minimum Count Threshold") + ylab("Fraction of variance explained")
+  }
+   sim_res2 = rbindlist(lapply(1:length(threshholds),function(i){
+    data.frame(thresh=thresholds[i],
+               genes = length(tst3[[i]]$genes_used_to_fit),
+               relative_per_gene_variance = tst3[[i]]$stats["relative_per_gene_variance"],
+              relative_per_gene_IQD90 =  tst3[[i]]$stats["relative_per_gene_IQD90"],
+              group =  tst3[[i]]$stats$group 
+              mean_threshold=0)
+  }))
+  saveRDS(tst3,"tmp.RDS")
+  frac_exp = rbindlist(lapply(1:length(thresholds),function(i){ 
+    sim_res2 = rbindlist(lapply(as.character(grps),function(cur_group){
+      print(paste(i,cur_group))
+      data.frame(
+        thresh = tst3[[i]][[cur_group]]$thresh,
+        group = tst3[[i]][[cur_group]]$cur_group,
+        relative_per_gene_variance = tst3[[i]][[cur_group]]$stats["relative_per_gene_variance"],
+        relative_per_gene_IQD90= tst3[[i]][[cur_group]]$stats["relative_per_gene_IQD90"]
+      )
+    }))
+  }))
+  fwrite(frac_exp,"../data/scaling_models/min_parameter_threshold_sensitivity.csv.gz")
+```
+
+
+```{r}
+max_vales= rbindlist(lapply(as.character(grps),function(cur_group){
+    sub = frac_exp[group == cur_group,]
+    data.frame(cur_group=cur_group,max=sub$thresh[which(sub$relative_per_gene_variance == min(sub$relative_per_gene_variance))])
+  }))
+  best_val = median(max_vales$max)
+  ggplot(frac_exp,aes(thresh,1-relative_per_gene_variance,color=group))+ 
+    geom_vline(xintercept=best_val,col="dark gray")+
+    geom_point()+
+    geom_line()+
+    xlab("Minimum Count Threshold") + 
+    ylab("Fraction of variance explained") +
+    theme(legend.position="none")
+  ggsave("../figures/03/S_CSM_gene_threshold_sensitivity.pdf",width=4,height=8)
+
+```
+
+#permute da model
+```{r}
+#min_count_for_fitting = 100
+source("../scripts/helpers/gene_variability.r")
+min_min_count_for_fitting=30
+min_mean_count_for_fitting=0
+cnts2 = norm[["d8_sw"]];
+cnts2 = cnts2[,unique(annots[Sample %in% colnames(cnts2) & Strain=="QZ0",Sample])];
+cnts2 <- cnts2[apply(cnts2,1,function(cnts2)!any(cnts2 < 30)), ]
+
+
+grps = unique(annots[Sample %in% colnames(cnts2) & Strain=="QZ0",Group])
+
+cur_da = "glp1_d1_da"
+da = RNAis[[cur_da]]
+GeneName_ex=""
+RNAi_col=RNAi_cols[[cur_da]]
+res_by_grp_d8 = lapply(grps,function(cur_group){
+    smp = annots[Sample %in% colnames(cnts2) & Group == cur_group& Strain =="QZ0",Sample]
+    ns_fit_da_linear_model(cnts2[,smp],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_min_count_for_fitting = min_min_count_for_fitting,
+                                  min_mean_count_for_fitting = min_mean_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+})
+names(res_by_grp_d8) = grps
+
+grp_frac_d8 = rbindlist(lapply(names(res_by_grp_d8),function(group){
+  data.frame( relative_total_variance = res_by_grp_d8[[group]]$stats["relative_total_variance"],
+                  relative_per_gene_variance = res_by_grp_d8[[group]]$stats["relative_per_gene_variance"],
+                  relative_per_gene_IQD90 = res_by_grp_d8[[group]]$stats["relative_per_gene_IQD90"],
+                  genes_used =length(res_by_grp_d8[[group]]$genes_used_to_fit),
+                  group =group)
+}))
+
+
+
+source("../scripts/helpers/gene_variability.r")
+cnts2 = norm[["d8_sw"]];
+res_by_grp_d8_diff_min = lapply(grps,function(cur_group){
+    smp = annots[Sample %in% colnames(cnts2) & Group == cur_group & Strain =="QZ0",Sample]
+    ns_fit_da_linear_model(cnts2[,smp],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,  
+                                  min_min_count_for_fitting = min_min_count_for_fitting,
+                                  min_mean_count_for_fitting = min_mean_count_for_fitting,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+})
+names(res_by_grp_d8_diff_min) = grps
+
+grp_frac_d8_diff_min = rbindlist(lapply(names(res_by_grp_d8_diff_min),function(group){
+  data.frame( relative_total_variance = res_by_grp_d8_diff_min[[group]]$stats["relative_total_variance"],
+                  relative_per_gene_variance = res_by_grp_d8_diff_min[[group]]$stats["relative_per_gene_variance"],
+                  relative_per_gene_IQD90 = res_by_grp_d8_diff_min[[group]]$stats["relative_per_gene_IQD90"],
+                  genes_used =length(res_by_grp_d8_diff_min[[group]]$genes_used_to_fit),
+                  group =group)
+}))
+library(boot)
+
+
+total = ns_fit_da_linear_model(cnts2,
+       da,
+       differential_analysis_column_name = RNAi_col,
+        RNAi_GeneName_to_exclude = GeneName_ex, 
+        keep_x=F,
+        min_count_for_fitting = 0,
+        allow_recursion_for_outliers=0,
+        keep_residuals=F,
+        only_return_stats=T
+  )
+
+  
+  est = total
+ # ci = total-apply(boot_data-total,1,FUN=quantile,probs=c(.025,.975))
+ # pv = rowSums(boot_data>=1)/ncol(boot_data)
+ 
+ # data.frame(est=(est),ci=t(ci),pv=pv)
+
+source("../scripts/helpers/gene_variability.R")
+da2 = da
+da2$Strain_CB4037_vs_QZ0_log2FoldChange = sample(da$Strain_CB4037_vs_QZ0_log2FoldChange,replace=F)
+if (0){
+res = ns_fit_da_linear_model_bootstrapped(3,
+                                    cnts2,
+                                  da2,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  min_count_for_fitting = 0,
+                                  allow_recursion_for_outliers=0)
+res2 = ns_fit_da_linear_model_bootstrapped(4,
+                                    cnts2,
+                                  da2,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  min_count_for_fitting = 0,
+                                  allow_recursion_for_outliers=0)
+}
+res_d8 =
+    ns_fit_da_linear_model(cnts2,
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = 100,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F,only_return_stats=T)
+res_d8_perm =
+    ns_fit_da_linear_model(cnts2,
+                                  da2,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = 100,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F,only_return_stats=T)
+
+```
+
+```{r}
+#Figure out descrepency
+done_live = res_by_grp_d8[["QZ0.t20.d8.fNEC937.br10.sw"]]
+stored = qread("../data/scaling_models/test/d1_glp1_n2_series_all_8=all.qs")
+#stored_boot = qread("../data/scaling_models/all_30min/d1_glp1_n2_series_all_1=boots.qs")
+stored_dat = stored$dat
+
+c(live=length(done_live$genes_used_to_fit),stored=length(stored_dat$genes_used_to_fit))
+c(live=done_live$stats["relative_per_gene_variance"],stored=stored_dat$stats["relative_per_gene_variance"])
+```
+
+```{r}
+bootstrap_dat = qread("../data/scaling_models/all/d1_glp1_d8_sw_QZ0=stats.qs")
+
+
+
+stat_to_plot = "relative_per_gene_variance"
+stat_to_plot = "relative_per_gene_IQD90"
+
+to_plot = rbindlist(lapply(c("relative_per_gene_variance","relative_per_gene_IQD90"),function(stat_to_plot){
+  d = data.frame(grp_frac_d8)[,c(stat_to_plot,"group")]
+  names(d)[1] = "stat";
+  to_plot = rbind(d,
+                  data.frame(stat=res_d8_perm[[stat_to_plot]],
+                                         group="permuted"))
+  to_plot$`ci.97.5.` = NA;
+  to_plot$`ci.95.` = NA;               
+  to_plot$`ci.5.`  = NA;              
+  to_plot$`ci.2.5.` = NA;         
+  to_plot$pv = NA;
+  to_plot = rbind(to_plot,data.frame(stat = bootstrap_dat[stat_to_plot,"mean_est"],
+                                     group = "all",
+                                     `ci.97.5.` = bootstrap_dat[stat_to_plot,"ci.97.5."],
+                                     `ci.95.` =  bootstrap_dat[stat_to_plot,"ci.95."],
+                                     `ci.5.` = bootstrap_dat[stat_to_plot,"ci.5."],
+                                     `ci.2.5.` =  bootstrap_dat[stat_to_plot,"ci.2.5."],
+                                      pv =  bootstrap_dat[stat_to_plot,"pv"]))
+  to_plot$label = ifelse(to_plot$group=="all","All replicates",ifelse(to_plot$group=="permuted","All replicates, genes permuted","Individual replicate"))
+  to_plot$stat_to_plot = stat_to_plot;
+  to_plot;
+}))
+
+colors = c(`All replicates`="#FF1F5B",`All replicates, genes permuted`="#009ADE",`Individual replicate`="black")
+size = c(`All replicates`=2.5,`All replicates, genes permuted`=2.5,`Individual replicate`=1.5)
+to_plot$grp = factor(ifelse(grepl("IQD",to_plot$stat_to_plot),"90-10 interquantile distance","Variance"))
+to_plot$pos_jitter = rnorm(nrow(to_plot),1,.03)+as.numeric(to_plot$grp)-1
+ggplot(to_plot,aes(pos_jitter,1-stat,color=label,size=label,group=group)) + 
+  geom_hline(yintercept=0,lty=2,col="dark gray")+
+  geom_point() + 
+  geom_errorbar(aes(ymax= 1-`ci.2.5.`, ymin= 1-`ci.97.5.`),width=.5,size=1)+
+  xlab("Day 8")+
+  ylab("Fraction of cohort variance explained")+theme(legend.position="bottom")+
+  scale_x_continuous(limits=c(.5,2.5),breaks=c(1,2),labels=levels(to_plot$grp))+
+  scale_color_manual(values=colors)+
+  scale_size_manual(values=size) 
+ ggsave("../figures/03/S_scaling_model_permutation_and_subgroup_test.pdf",height=8,width=6)
+
+```
+
+```{r}
+grps = unique(annots[Sample %in% colnames(cnts2) & Strain=="QZ0",Group])
+
+res_by_grp = lapply(grps,function(cur_group){
+    smp = annots[Sample %in% colnames(cnts2) & Group == cur_group,Sample]
+    ns_fit_da_linear_model(cnts2[,smp],
+                                  da,
+                                  differential_analysis_column_name = RNAi_col,
+                                  RNAi_GeneName_to_exclude = GeneName_ex, 
+                                  keep_x=F,
+                                  min_count_for_fitting = 100,
+                                  allow_recursion_for_outliers=2,
+                                  keep_residuals=F)
+})
+names(res_by_grp) = grps
+
+grp_frac = rbindlist(lapply(names(res_by_grp),function(group){
+  data.frame( relative_total_variance = res_by_grp[[group]]$relative_total_variance,
+                  relative_per_gene_variance = res_by_grp[[group]]$relative_per_gene_variance,
+                  group =group)
+}))
+```
+
+
+```{r}
+high_var_group = res_by_grp[["QZ0.t20.d1.fNEC937.br7.sw"]]$residuals
+high_var_group$GeneName = rownames(high_var_group)
+plot(high_var_group$orig,high_var_group$residuals/high_var_group$orig,log="xy",pch=21,bg="black",cex=.7)
+abline(h=1,col="red")
+med_var_group = res_by_grp[["QZ0.t20.d1.fNEC937.br3.sw"]]$residuals
+med_var_group$GeneName = rownames(med_var_group)
+points(med_var_group$orig,med_var_group$residuals/med_var_group$orig,pch=21,bg="blue",cex=.7)
+
+b = data.table(merge(high_var_group,med_var_group,by="GeneName",suffixes=c(".high",".med")))
+plot(b$orig.high,b$orig.med,log="xy",pch=21,bg="black",cex=.7)
+plot(b$orig.high/b$orig.med,log="xy",pch=21,bg="black",cex=.7)
+weird_genes = data.frame(GeneName = b$GeneName[which(b$orig.high/b$orig.med > 10)])
+setkey(geneid,GeneName)
+weird_genes$GeneSymbol = geneid[weird_genes$GeneName,GeneSymbol]
+setkey(b,GeneName)
+weird_genes$orig_var = b[weird_genes$GeneName,"orig.high"]
+weird_genes = weird_genes[order(weird_genes$orig_var,decreasing=T),]
+plot(b$residuals.high,b$residuals.med,log="xy",pch=21,bg="black",cex=.7)
+plot(b$residuals.high/b$orig.high,b$residuals.med/b$orig.med,log="xy",pch=21,bg="black",cex=.7)
+abline(a=0,b=1,col="gray")
+
+#high var group
+smp = annots[Sample %in% colnames(cnts2) & Group == "QZ0.t20.d1.fNEC937.br7.sw",Sample]
+outliers_for_each_weird_gene = lapply(weird_genes$GeneName,function(cur_gene){
+  #h=hist(cnts2[cur_gene,smp])
+  v = cnts2[weird_genes$GeneName[1],smp]/median(cnts2[weird_genes$GeneName[1],smp])
+  return(v[v>3])
+})
+#QZ0_d1_65 is the culprit!  we remove.
+plot(h)
+
+```
+
+```{r}
+ts_scores = rbindlist(lapply(names(res),function(day){
+  r = data.frame(score = res[[day]]$coef) 
+  r$day = as.numeric(day)
+  r
+}))
+ts_frac = rbindlist(lapply(names(res),function(day){
+  data.frame( relative_total_variance = res[[day]]$relative_total_variance,
+                  relative_per_gene_variance = res[[day]]$relative_per_gene_variance,
+                  day = as.numeric(day))
+}))
+ggplot(ts_scores,aes(day,score)) + geom_point() + geom_smooth(method="loess")
+ggplot(ts_frac,aes(day,relative_total_variance)) + geom_point() + ylim(c(0,1.1)) + geom_hline(yintercept=1)
+ggplot(ts_frac,aes(day,relative_per_gene_variance)) + geom_point()+ ylim(c(0,1.1)) + geom_hline(yintercept=1)
+
+plot(res[["10"]]$residuals$orig,res[["10"]]$residuals$residuals,log="xy",pch=21,bg="black",cex=.7)
+abline(a=0,b=1,col="red")
+```
+```
+
+
+
+
+
+```{r}
+resid = day_fits[["8"]]$nlp28_da$residuals
+resid_s = 2^(resid+day_fits[["8"]]$nlp28_da$log2_intercepts)
+cts = cnts[rownames(resid),ts_annots[Day==8,Sample]]
+
+cv = function(x)sqrt(var(x))/mean(x)
+r_var = apply(resid_s,1,cv)
+cts_var = apply(cts,1,cv)
+
+ch_var = log10(r_var/cts_var)
+setkey(geneid,GeneName)
+ch_var_df = data.frame(GeneSymbol = geneid[names(ch_var),GeneSymbol],10^ch_var)
+ch_var_df = ch_var_df[order(ch_var),]
+View(ch_var_df)
+names(which(ch_var == min(ch_var)) )
+
+```
+

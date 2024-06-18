@@ -1,0 +1,234 @@
+```{r}
+library(ggplot2)
+library(data.table)
+```
+
+```{r}
+
+lifespan_GeneSymbol_lookup = c(`EV` = "EV",
+                               `ev` = "EV",
+               `QZ0`="EV",
+               `rop1`="rop-1",
+               `aexr-1`="aexr-1",
+               `srp-2`="srp-2",
+               `mig-6`="mig-6",
+                `nlp28`="nlp-28",
+                `nlp15`="nlp-15",
+                `nlp-28`="nlp-28",
+                `nlp-15`="nlp-15",
+                `skr1`="skr-1",
+                `atp5`="atp-5",
+                `rps22`="rpl-22",
+                `aexr1`="aexr-1",
+                `mak1`="mak-1",
+                `mak-1`="mak-1",
+                `pcn1`="pcn-1",
+                `C25E10.8`="C25E10.8",
+                `C25E10`="C25E10.8",
+                `egl-3` = "egl-3",
+                `sbt-1` = "sbt-1",
+                `rpl-7`="rpl-7",
+                `eef1A`="eef-1A",
+                `skr-1`="skr-1",
+                `skr1`="skr-1",
+                `C25E10`="C25E10.8",
+                `col-122`="col-122",
+                `col122`="col-122",
+                `vha-11`="vha-11",
+                `vha11`="vha-11",
+                 `QC133`="mig-6(sa580)",
+                `RB631`= "srp-2(ok350)",
+                `VC1063`="nlp-15(ok1512)",
+                 `glp1`="germline ablated")
+
+```
+
+```{r}
+RNAi_day_8 = fread("../data/fluorescence/rnai_worm_asynch_analysis_with_glp1.csv")
+pixel_to_mm_conversion_factor = .414/1000 #um / pixel
+RNAi_day_8$worm_size_pixels=RNAi_day_8$worm_size
+RNAi_day_8$worm_size=RNAi_day_8$worm_size*pixel_to_mm_conversion_factor*pixel_to_mm_conversion_factor #convert from pixels^2 to mm^2
+RNAi_day_8$RNAi = factor(RNAi_day_8$food)
+RNAi_day_8$RNAi = relevel(RNAi_day_8$RNAi,ref="ev")
+
+pop_size = aggregate(worm~food+rep,RNAi_day_8,FUN=length)
+write.csv(pop_size,"../tables/fluorescence_pop_size.csv")
+germline_cell_number_effect = glm(germline_cell_number~RNAi+rep,RNAi_day_8,family=gaussian(link="log"))
+summary(germline_cell_number_effect)
+
+worm_size_effect = glm(worm_size~RNAi+rep,RNAi_day_8,family=gaussian(link="log"))
+summary(worm_size_effect)
+
+
+RNAi_day_8[is.na(germline_cell_number),germline_cell_number:=0] #animals with no germline were coded as "NA"
+
+norm_fact = data.table(aggregate(germline_cell_number~rep,RNAi_day_8[RNAi=="ev",],median))
+setkey(norm_fact,rep);
+RNAi_day_8[,rep_norm_germline_cell_number := germline_cell_number/norm_fact[rep,germline_cell_number]]
+
+norm_fact = data.table(aggregate(worm_size~rep,RNAi_day_8[RNAi=="ev",],median))
+setkey(norm_fact,rep);
+RNAi_day_8[,rep_norm_worm_size := worm_size/norm_fact[rep,worm_size]]
+
+group_medians = aggregate(rep_norm_germline_cell_number~rep+RNAi,RNAi_day_8,median)
+
+ggplot(RNAi_day_8,aes(RNAi,rep_norm_germline_cell_number,color=factor(rep)))+geom_jitter() + 
+  #geom_point(size=8,data=group_medians) +
+  geom_boxplot()+ geom_hline(yintercept=1,lty=2)
+
+ggplot(RNAi_day_8,aes(RNAi,rep_norm_germline_cell_number))+geom_jitter() + 
+  #geom_point(size=8,data=group_medians) +
+  geom_boxplot()+ geom_hline(yintercept=1,lty=2)
+
+```
+```{r}
+
+RNAi_day_8$RNAi = factor(RNAi_day_8$food)
+RNAi_day_8$RNAi = relevel(RNAi_day_8$RNAi,ref="ev")
+
+worm_size_effect = glm(worm_size ~RNAi+rep,RNAi_day_8,family=gaussian(link="log"))
+summary(worm_size_effect)
+norm_fact = data.table(aggregate(worm_size ~rep,RNAi_day_8[RNAi=="ev",],median))
+
+setkey(norm_fact,rep);
+RNAi_day_8[,rep_norm_worm_size  := worm_size /norm_fact[rep,worm_size]]
+
+
+group_medians = aggregate(rep_norm_worm_size ~rep+RNAi,RNAi_day_8,median)
+
+ggplot(RNAi_day_8,aes(RNAi,rep_norm_worm_size ,color=factor(rep)))+geom_jitter() + 
+  #geom_point(size=8,data=group_medians) +
+  geom_boxplot()+ geom_hline(yintercept=1,lty=2)
+
+ggplot(RNAi_day_8,aes(RNAi,rep_norm_worm_size))+geom_jitter() + 
+  #geom_point(size=8,data=group_medians) +
+  geom_boxplot()+ geom_hline(yintercept=1,lty=2)
+
+```
+
+```{r}
+
+worm_size_effect = glm(worm_size ~RNAi+rep,RNAi_day_8,family=gaussian(link="log"))
+summary(worm_size_effect)
+
+germline_cell_number_effect = glm(germline_cell_number~RNAi+rep,RNAi_day_8[RNAi!="glp1",],family=gaussian(link="log"))
+summary(germline_cell_number_effect)
+
+dat = melt(RNAi_day_8,id.vars=c("RNAi","rep"),measure.vars=c("rep_norm_worm_size","rep_norm_germline_cell_number"))
+dat$RNAi_pretty = lifespan_GeneSymbol_lookup[as.character(dat$RNAi)]
+dat$RNAi_pretty = factor(dat$RNAi_pretty,levels=c("EV","aexr-1","mak-1","vha-11","pcn-1","col-122"))
+dat$measurement = ifelse(dat$variable=="rep_norm_worm_size","Body Size","Germ-cell Number")
+
+
+sig_table = data.table(RNAi_pretty=unique(dat$RNAi_pretty))
+sig_table$RNAi_pretty = factor(sig_table$RNAi_pretty,levels=c("EV","aexr-1","mak-1","vha-11","pcn-1","col-122"))
+sig_table$sig=""
+sig_table$measurement="Body Size";
+#sig_table$sig[sig_table$RNAi == "aexr-1"]="*" 
+#sig_table$sig[sig_table$RNAi == "col-122"]="*" 
+sig_table$sig[sig_table$RNAi == "vha-11"]="*" 
+
+sig_table2 = sig_table;
+sig_table2$measurement="Germ-cell Number"
+sig_table2$sig[sig_table2$RNAi == "pcn-1"]="*" 
+sig_table2$sig[sig_table2$RNAi == "vha-11"]="*" 
+
+sig_table = rbind(sig_table,sig_table2)
+
+
+
+colors = list("Body Size"="orange","Germ-cell Number"="black")
+ggplot(dat,aes(RNAi_pretty,value,color=measurement))+
+  geom_boxplot()+ 
+   geom_jitter(position = position_jitterdodge())+
+  geom_hline(yintercept=1,lty=2)+theme(legend.position="top")+
+  geom_text(aes(label=sig,y=max(dat$value)*1.1),position = position_jitterdodge(),size=12,data=sig_table)+
+
+  scale_color_manual(values=colors)+
+
+  scale_fill_manual(values=colors)+
+   geom_hline(yintercept=1,lty=2,col="dark gray") +  
+  theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="top")+
+  scale_y_continuous(trans="log2",breaks=c(seq(.2,1,by=.2),seq(1.5,3,by=.5)),limits=c(.2,4))+ylab("Relative effect")+xlab("")
+
+ggsave("../figures/04/physical_effects_of_RNAis.pdf",height=4,width=5.5)
+
+RNAi_day_8[,rel_germline_soma := rep_norm_germline_cell_number/rep_norm_worm_size]
+ggplot(RNAi_day_8,aes(rep_norm_worm_size,rep_norm_germline_cell_number,color=RNAi))+geom_jitter()+geom_smooth(method="lm",se=F)+ geom_hline(yintercept=1,lty=2)+theme(legend.position="top")
+ggplot(RNAi_day_8,aes(RNAi,rel_germline_soma,color=factor(rep)))+
+  geom_jitter(position = position_jitterdodge())+
+  geom_boxplot()+ geom_hline(yintercept=1,lty=2)+theme(legend.position="top")
+
+
+
+#ev_model = glm(germline_cell_number ~worm_size+rep,RNAi_day_8[RNAi=="ev",],family=gaussian(link="log"))
+#summary(ev_model)
+#full_model = glm(germline_cell_number ~worm_size*RNAi,RNAi_day_8,family=gaussian(link="log"))
+#summary(full_model)
+
+```
+
+
+```{r,fig.height=4,fig.width=6.5}
+
+dat = RNAi_day_8
+#dat$worm_size = dat$worm_size_pixels
+dat = melt(dat,id.vars=c("RNAi","rep"),measure.vars=c("worm_size","germline_cell_number"))
+
+dat$RNAi_pretty = lifespan_GeneSymbol_lookup[as.character(dat$RNAi)]
+dat$RNAi_pretty = factor(dat$RNAi_pretty,levels=c("EV","germline ablated","aexr-1","mak-1","vha-11","pcn-1","col-122"))
+dat$measurement = ifelse(dat$variable=="worm_size","Body Size","Germ-cell Number")
+
+EV_BS_means = aggregate(value~measurement,dat[dat$RNAi=="ev" & dat$measurement=="Body Size",],median)
+EV_GN_means = aggregate(value~measurement,dat[dat$RNAi=="ev" & dat$rep != 3 & dat$measurement=="Germ-cell Number",],median) #rep 3 does not have germ cell number measured, only size.
+EV_means = rbind(EV_BS_means,EV_GN_means)
+
+
+sig_table = data.table(RNAi_pretty=unique(dat$RNAi_pretty))
+sig_table$RNAi_pretty = factor(sig_table$RNAi_pretty,levels=c("EV","germline ablated","aexr-1","mak-1","vha-11","pcn-1","col-122"))
+sig_table$sig=""
+sig_table$measurement="Body Size";
+sig_table$sig[sig_table$RNAi == "aexr-1"]="*" 
+sig_table$sig[sig_table$RNAi == "col-122"]="*" 
+sig_table$sig[sig_table$RNAi == "vha-11"]="*" 
+sig_table$sig[sig_table$RNAi == "germline ablated"]="*" 
+sig_table$y_pos = max(dat$value[dat$variable=="worm_size"])*1.1
+
+sig_table2 = sig_table;
+sig_table2$sig=""
+sig_table2$measurement="Germ-cell Number"
+sig_table2$sig[sig_table2$RNAi == "pcn-1"]="*" 
+sig_table2$sig[sig_table2$RNAi == "vha-11"]="*" 
+sig_table2$sig[sig_table2$RNAi == "germline ablated"]="*" 
+sig_table2$y_pos = max(dat$value[dat$variable=="germline_cell_number"])*1.1
+
+sig_table = rbind(sig_table,sig_table2)
+
+
+
+plts = lapply(unique(dat$measurement),function(m){
+  if (m=="Germ-cell Number"){dat2=dat[dat$rep!=3 | dat$RNAi != "ev",]; #rep 3 does not have germ cell number measured in EV, only size.
+  } else dat2 = dat;
+  mean_v = aggregate(value~RNAi_pretty+measurement,dat2,mean)
+  mean_v1 = mean_v[mean_v$measurement==m & mean_v$RNAi_pretty != "EV",]
+  mean_v1 = mean_v1[order(mean_v1$value,decreasing=T),]
+dat2$RNAi_pretty = factor(dat2$RNAi_pretty,levels=c("EV",as.character(mean_v1$RNAi_pretty)))
+  ggplot(dat2[dat2$measurement==m,],aes(RNAi_pretty,value))+
+   # geom_boxplot()+ 
+     geom_jitter(width=.25)+
+    geom_text(aes(label=sig,y=y_pos),size=8,data=sig_table[measurement==m,])+
+  
+    scale_color_manual(values=colors)+
+    scale_fill_manual(values=colors)+
+     geom_hline(aes(yintercept=value),data=EV_means[EV_means$measurement==m,],lty=2,col="dark gray") +  
+    theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")+
+    #scale_y_continuous(trans="log2",breaks=c(seq(.2,1,by=.2),seq(1.5,3,by=.5)),limits=c(.2,4))+
+   xlab("")+ylab(m)
+})
+ggpubr::ggarrange(plts[[2]],plts[[1]],ncol=2,nrow=1)
+
+ggsave("../figures/04/physical_effects_of_RNAis_separate.pdf",height=4,width=6.5)
+
+
+```
+

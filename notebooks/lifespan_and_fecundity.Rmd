@@ -1,0 +1,2459 @@
+```{r}
+library(devtools)
+library(survival)
+library(ggplot2)
+library(data.table)
+library(rms)
+if (!("ns.survival.code" %in% rownames(installed.packages())))
+  install_github("nstroustrup/ns.survival.code")
+library(ns.survival.code)
+#source(r"(D:\Dropbox (Personal)\work\data_analysis\ns.survival.code\R\ns_convert_frequencies_into_repeats.r)")
+#source(r"(D:\Dropbox (Personal)\work\data_analysis\ns.survival.code\R\ns_bj_standards.r)")
+library(cowplot)
+theme_set(theme_cowplot())
+```
+
+
+```{r}
+
+
+#0 == "DAY 0 of adulthood i.e L4"
+#4 == "DAY 0 of adulthood"
+rnai_hits_0 = fread("../data/lifespan/lifespan_230305_manual_Asynch_byplate.csv")
+rnai_hits_0_long = as.data.table(ns_convert_frequencies_into_repeats(as.data.frame(rnai_hits_0),frequency_column="D"))
+rnai_hits_0_long$experiment = "hits_exp";
+rnai_hits_0_long$Device = "by_hand"
+rnai_hits_0_long$day_VMC = NA;
+rnai_hits_0_long$`Plate Name` = as.character(rnai_hits_0_long$Plate)
+
+egl3 = fread("../data/lifespan/18.08.2021_qz0_egl3_sbt1_RNAi.csv")
+egl3_d = egl3[,.(day,RNAi,Plate,Dead)]
+egl3_d$Censored=0
+egl3_c = egl3[,.(day,RNAi,Plate,Censored)]
+names(egl3_c)[4] = "Dead"
+egl3_c$Censored=1
+egl3 = rbind(egl3_d,egl3_c)
+egl3 = egl3[!is.na(Dead)]
+egl3_long = as.data.table(ns_convert_frequencies_into_repeats(as.data.frame(egl3),frequency_column="Dead"))
+
+names(egl3_long)[names(egl3_long) == "Plate"] = "Plate Name"
+names(egl3_long)[names(egl3_long) == "Censored"] = "C"
+egl3_long$transfer_day = "4"
+egl3_long$experiment = "egl3"; 
+egl3_long$Age.at = NA;
+egl3_long$Device = "by_hand"
+egl3_long$day_VMC = NA;
+
+
+rna_hits2 = fread("../data/lifespan/2023_05_19_AsynchSeq_RNAi=survival=machine_hand_jmp_days.csv")
+rna_hits2 =rna_hits2 [!Device %in% c("yuno","videl"),] #these devices failed during data acquisition
+rna_hits2_long =as.data.table(ns_convert_frequencies_into_repeats(as.data.frame(rna_hits2),frequency_column="Event Frequency" ))
+names(rna_hits2_long)[names(rna_hits2_long)=="Food Source"] = "RNAi";
+names(rna_hits2_long)[names(rna_hits2_long)=="Age at Death (d)"] = "day";
+names(rna_hits2_long)[names(rna_hits2_long)=="Censored"] = "C";
+names(rna_hits2_long)[names(rna_hits2_long)=="Age at Final Vigorous Movement (d)"] = "day_VMC";
+rna_hits2_long$experiment = "hits_exp_2"
+rna_hits2_long$transfer_day = "0"
+
+rna_hits3 = fread("../data/lifespan/2023_11_06_AsynchSeq_RNAi=survival=machine_hand_jmp_days.csv")
+#rna_hits3 =rna_hits3 [!Device %in% c("yuno","videl"),] #these devices failed during data acquisition
+rna_hits3_long = as.data.table(ns_convert_frequencies_into_repeats(as.data.frame(rna_hits3),frequency_column="Event Frequency" ))
+names(rna_hits3_long)[names(rna_hits3_long)=="Condition 1"] = "RNAi";
+rna_hits3_long[,RNAi := trimws(substring(RNAi,0,nchar(RNAi)-6))]
+rna_hits3_long = rna_hits3_long[RNAi!="GLP-1 EV",]
+names(rna_hits3_long)[names(rna_hits3_long)=="Age at Death (d)"] = "day";
+names(rna_hits3_long)[names(rna_hits3_long)=="Censored"] = "C";
+names(rna_hits3_long)[names(rna_hits3_long)=="Age at Final Vigorous Movement (d)"] = "day_VMC";
+rna_hits3_long$experiment = "hits_exp_3"
+rna_hits3_long$transfer_day = "0"
+
+cols = c("RNAi","day","day_VMC","C","transfer_day","experiment","Device","Plate Name")
+rnai_hits_long = rbind(rnai_hits_0_long[,cols,with=F],
+                       egl3_long[,cols,with=F],
+                       rna_hits2_long[,cols,with=F],
+                    #   mutant_hits2_long[,cols,with=F],
+                       rna_hits3_long[,cols,with=F])
+
+lifespan_name_lookup = list(`EV`="Empty Vector control",
+                 `QZ0`="Control Strain",
+                 `aexr-1`=expression(bolditalic("aexr-1")),
+                 `srp-2`=expression(bolditalic("srp-2")),
+                 `mig-6`=expression(bolditalic("mig-6")),
+                `rop1`=expression(bolditalic("rop-1")),
+                `nlp28`=expression(bolditalic("nlp-28")),
+                `nlp-28`=expression(bolditalic("nlp-28")),
+                `nlp15`=expression(bolditalic("nlp-15")),
+                `nlp-15`=expression(bolditalic("nlp-15")),
+                `skr1`=expression(bolditalic("skr-1")),
+                `atp5`=expression(bolditalic("atp-5")),
+                `rps22`=expression(bolditalic("rpl-22")),
+                `aexr1`=expression(bolditalic("aexr-1")),
+                `mak1`=expression(bolditalic("mak-1")),
+                `mak-1`=expression(bolditalic("mak-1")),
+                `pcn1`=expression(bolditalic("pcn-1")),
+                `C25E10.8`=expression(bolditalic("C25E10.8")),
+                `C25E10`=expression(bolditalic("C25E10.8")),
+                `rpl-7`=expression(bolditalic("rpl-7")),
+                `eef1A`=expression(bolditalic("eef-1A.1")),
+                `skr-1`=expression(bolditalic("skr-1")),
+                `col-122`=expression(bolditalic("col-122")),
+                `sbt-1`=expression(bolditalic("sbt-1")),
+                `egl-3`=expression(bolditalic("egl-3")),
+                `vha-11`=expression(bolditalic("vha-11")),
+                 `QC133`=expression(bolditalic("mig-6(sa580)")),
+                `RB631`= expression(bolditalic("srp-2(ok350)")),
+                `VC1063`=expression(bolditalic("nlp-15(ok1512)")))
+
+lifespan_GeneSymbol_lookup = c(`EV` = "EV",
+               `QZ0`="EV",
+               `rop1`="rop-1",
+               `aexr-1`="aexr-1",
+               `srp-2`="srp-2",
+               `mig-6`="mig-6",
+                `nlp28`="nlp-28",
+                `nlp15`="nlp-15",
+                `nlp-28`="nlp-28",
+                `nlp-15`="nlp-15",
+                `skr1`="skr-1",
+                `atp5`="atp-5",
+                `rps22`="rpl-22",
+                `aexr1`="aexr-1",
+                `mak1`="mak-1",
+                `mak-1`="mak-1",
+                `pcn1`="pcn-1",
+                `C25E10.8`="C25E10.8",
+                `C25E10`="C25E10.8",
+                `egl-3` = "egl-3",
+                `sbt-1` = "sbt-1",
+                `rpl-7`="rpl-7",
+                `eef1A`="eef-1A",
+                `skr-1`="skr-1",
+                `skr1`="skr-1",
+                `C25E10`="C25E10.8",
+                `col-122`="col-122",
+                `vha-11`="vha-11",
+                 `QC133`="mig-6(sa580)",
+                `RB631`= "srp-2(ok350)",
+                `VC1063`="nlp-15(ok1512)")
+
+rnai_hits_long$RNAi_tmp = lifespan_GeneSymbol_lookup[rnai_hits_long$RNAi]
+if (any(is.na(rnai_hits_long$RNAi_tmp))){
+  warning("Some RNAis were not processed correctly:")
+  warning(unique(rnai_hits_long[is.na(RNAi_tmp),RNAi]))
+}
+rnai_hits_long[,RNAi := RNAi_tmp]
+rnai_hits_long$Method = ifelse(rnai_hits_long$Device=="by_hand","by_hand","automated")
+pop_sizes = aggregate(day~RNAi+experiment+transfer_day+Method,rnai_hits_long,FUN=length)
+pop_sizes$experiment = as.numeric(factor(pop_sizes$experiment))
+write.csv(pop_sizes,"../tables/lifespan_pop_sizes.csv")
+```
+
+#calulate device residuals for scaling analysis of rnai 
+#used to then calculate bootstrap change in variance
+```{r}
+source(r"(D:\Dropbox (Personal)\work\data_analysis\ns.survival.code\R\ns_bj_standards.r)")
+aft_results = rbindlist(lapply(unique(rnai_hits_long$experiment),function(cur_exp){
+  dat2 = rnai_hits_long[experiment==cur_exp,]
+  RNAis = unique(dat2$RNAi)
+  transfer_days = unique(dat2$transfer_day)
+  rbindlist(lapply(transfer_days,function(cur_tf_day){
+  
+   rbindlist(lapply(RNAis,function(cur_RNAi){
+     cat(paste0(cur_RNAi," day ",cur_tf_day,": ",cur_exp,"\n"))
+      devices = unique(dat2[RNAi==cur_RNAi,Device])
+      dat  = dat2[RNAi%in%c(cur_RNAi) & transfer_day == cur_tf_day & Device %in% devices,]
+      if (length(unique(dat$`Plate Name`)) == 1){
+        browser()
+        dat$`Plate Name` = sample(c("a","b","c"),nrow(dat),replace=T)
+        
+      }
+      saft = ns_single_bj_group(Surv(dat$day,1-dat$C)~dat$`Plate Name`)
+     
+      data.table(death=dat$day,
+                 experiment = cur_exp,
+                  Device=dat$Device,
+                  bj_residual = saft$bj_residual,
+                  RNAi=cur_RNAi, 
+                  day = cur_tf_day,
+                  Censored = dat$C)
+  }))
+  }))
+}))
+
+aft_results_VMC = rbindlist(lapply(unique(rnai_hits_long$experiment),function(cur_exp){
+  sub = rnai_hits_long$experiment==cur_exp & !is.na(rnai_hits_long$day_VMC)
+  if (!any(sub))
+    return(NULL)
+  dat2 = rnai_hits_long[experiment==cur_exp & !is.na(day_VMC),]
+  RNAis = unique(dat2$RNAi)
+  transfer_days = unique(dat2$transfer_day)
+  rbindlist(lapply(transfer_days,function(cur_tf_day){
+  
+   rbindlist(lapply(RNAis,function(cur_RNAi){
+     cat(paste0(cur_RNAi," day ",cur_tf_day,": ",cur_exp,"\n"))
+      devices = unique(dat2[RNAi==cur_RNAi,Device])
+      dat  = dat2[RNAi%in%c(cur_RNAi) & transfer_day == cur_tf_day & Device %in% devices,]
+      if (length(unique(dat$`Plate Name`)) == 1){
+        browser()
+        dat$`Plate Name` = sample(c("a","b","c"),nrow(dat),replace=T)
+        
+      }
+      saft = ns_single_bj_group(Surv(dat$day_VMC,1-dat$C)~dat$`Plate Name`)
+     
+      data.table(VMC=dat$day_VMC,
+                 experiment = cur_exp,
+                  Device=dat$Device,
+                  bj_residual = saft$bj_residual,
+                  RNAi=cur_RNAi, 
+                  day = cur_tf_day,
+                  Censored = dat$C)
+  }))
+  }))
+}))
+
+
+structured_aft_results = list()
+for (i in  unique(aft_results$day))
+  structured_aft_results[[i]] = list();
+
+lapply(unique(aft_results$experiment),function(cur_exp){
+  dat2 = aft_results[experiment==cur_exp,]
+  RNAis = unique(dat2$RNAi)
+  RNAis = RNAis[!RNAis%in%c("EV","QZ0")]
+  transfer_days = unique(dat2$day)
+  lapply(transfer_days,function(cur_tf_day){
+      if (! cur_tf_day %in% names(structured_aft_results))
+        structured_aft_results[[cur_tf_day]] <<- list();
+    lapply(RNAis,function(cur_RNAi){
+      cat(paste0(cur_RNAi," day ",cur_tf_day, ": ",cur_exp,"\n"))
+      if (! cur_RNAi %in% names(structured_aft_results[[cur_tf_day]]))
+        structured_aft_results[[cur_tf_day]][[cur_RNAi]] <<- list();
+      
+      structured_aft_results[[cur_tf_day]][[cur_RNAi]][[cur_exp]] <<- dat2[RNAi%in%c(cur_RNAi,"EV","QZ0") & day == cur_tf_day,]
+     # browser()
+      print(paste(cur_RNAi,nrow(dat2[RNAi%in%c(cur_RNAi) & day == cur_tf_day,])))
+    })
+    NULL
+  })
+  NULL
+})
+
+
+structured_aft_results_VMC = list()
+for (i in  unique(aft_results_VMC$day))
+  structured_aft_results_VMC[[i]] = list();
+
+lapply(unique(aft_results_VMC$experiment),function(cur_exp){
+
+  dat2 = aft_results_VMC[experiment==cur_exp,]
+  RNAis = unique(dat2$RNAi)
+  RNAis = RNAis[!RNAis%in%c("EV","QZ0")]
+  transfer_days = unique(dat2$day)
+  lapply(transfer_days,function(cur_tf_day){
+      if (! cur_tf_day %in% names(structured_aft_results_VMC))
+        structured_aft_results_VMC[[cur_tf_day]] <<- list();
+    lapply(RNAis,function(cur_RNAi){
+      cat(paste0(cur_RNAi," day ",cur_tf_day, ": ",cur_exp,"\n"))
+      if (! cur_RNAi %in% names(structured_aft_results_VMC[[cur_tf_day]]))
+        structured_aft_results_VMC[[cur_tf_day]][[cur_RNAi]] <<- list();
+      
+      structured_aft_results_VMC[[cur_tf_day]][[cur_RNAi]][[cur_exp]] <<- dat2[RNAi%in%c(cur_RNAi,"EV","QZ0") & day == cur_tf_day,]
+     # browser()
+      print(paste(cur_RNAi,nrow(dat2[RNAi%in%c(cur_RNAi) & day == cur_tf_day,])))
+    })
+    NULL
+  })
+  NULL
+})
+```
+
+#calculate fold change in lifespan + other statistics
+#and also calculate aft residuals
+#used to make nice figure comparing lifespan effects of all mutants / rnais
+```{r}
+#source(r"(D:\Dropbox (Personal)\work\data_analysis\ns.survival.code\R\ns_convert_frequencies_into_repeats.r)")
+
+transfer_days = unique(rnai_hits_long$transfer_day)
+aft_residuals = list()
+aft_residuals_VMC = list()
+for (death_not_VMC in c(F,T)){
+  res = rbindlist(lapply(unique(rnai_hits_long$experiment),function(cur_exp){
+    
+    dat2 = rnai_hits_long[experiment==cur_exp,]
+    if (!death_not_VMC){
+      dat2 = dat2[!is.na(day_VMC),]
+    }
+    RNAis = unique(dat2$RNAi)
+    RNAis = RNAis[!RNAis%in%c("EV","QZ0")]
+    transfer_days = unique(dat2$transfer_day)
+    rbindlist(lapply(transfer_days,function(cur_tf_day){
+      rbindlist(lapply(RNAis,function(cur_RNAi){
+        cat(paste0(cur_exp," ",cur_RNAi," day ",cur_tf_day,"\n"))
+        dat  = dat2[RNAi%in%c(cur_RNAi,"EV","QZ0") & transfer_day == cur_tf_day,]
+        if (death_not_VMC){
+          s <- Surv(dat$day,1-dat$C)
+        }else s <- Surv(dat$day_VMC,1-dat$C)
+        srv <- survfit(s~dat$transfer_day+dat$RNAi)
+        colors=rep("black",2)
+        colors[which(!grepl("EV",names(srv$strata)))] = "red"
+        
+       # plot(srv,col=colors)
+        sdif = survdiff(s~dat$RNAi)
+        if (1 || min(aggregate(Device~RNAi,dat,function(x)length(unique(x)))$Device)<=1){
+          saft = ns_single_bj_group(Surv(dat$day,1-dat$C)~dat$RNAi,reference_group="EV")
+          
+          
+          aft_residuals[[cur_tf_day]][[cur_RNAi]] <<-   data.table(death=dat$day,
+                                                                   Device=dat$Device,
+                                                                   bj_residual = saft$bj_residual,
+                                                                   RNAi=dat$RNAi, 
+                                                                   Censored = dat$C)
+          r = saft$coefficients
+          r$transfer_day=cur_tf_day
+          r$RNAi = cur_RNAi
+          r$log_rank_pval=pchisq(sdif$chisq, length(sdif$n)-1, lower.tail = FALSE)
+        }else{
+        
+          dat$C2 = 1-dat$C
+          ref_group = "EV"
+          if ("QZ0"%in%dat$RNAi)
+            ref_group = "QZ0"
+          devices = unique(dat[RNAi == cur_RNAi,Device])
+          dat = dat[Device %in% devices,]
+          saft = ns_multiple_bj(data.frame(dat),bj_group_column="RNAi",bj_group_2_column="Device",time_column="day",censored_column="C2",reference_group=ref_group)
+          aft_residuals[[cur_tf_day]][[cur_RNAi]] <<-   saft$bj_residual
+          browser()
+          r = data.frame(bj_group = cur_RNAi,
+                         coefficient=saft$group_coefficients[["Contrast"]],
+                         se=saft$group_coefficients[["SE"]],
+                         lower=saft$group_coefficients[["Lower"]],
+                         upper=saft$group_coefficients[["Upper"]],
+                         p=saft$group_coefficients[["Pvalue"]])
+          r$transfer_day=cur_tf_day
+          r$RNAi = cur_RNAi
+          r$log_rank_pval=pchisq(sdif$chisq, length(sdif$n)-1, lower.tail = FALSE)
+          
+        }
+        r
+      }))
+    }))
+  }))
+  if (death_not_VMC){
+    knockdown_aft_results = res;
+  }else knockdown_aft_results_VMC = res;
+}
+  #knockdown_aft_results$GeneSymbol = lifespan_GeneSymbol_lookup[knockdown_aft_results$RNAi]
+  write.csv(knockdown_aft_results,"../data/lifespan/scaling_hits_survival_summary.csv")
+  write.csv(knockdown_aft_results_VMC,"../data/lifespan/scaling_hits_survival_summary_VMC.csv")
+
+```
+
+
+
+#calculate fold change in lifespan + other statistics GROUPING ALL REPLICATES TOGETHER
+#and also calculate aft residuals
+#used to make nice figure comparing lifespan effects of all mutants / rnais
+```{r}
+source(r"(D:\Dropbox (Personal)\work\data_analysis\ns.survival.code\R\ns_bj_standards.r)")
+
+transfer_days = unique(rnai_hits_long$transfer_day)
+aft_residuals = list()
+aft_residuals_VMC = list()
+dat2 = rnai_hits_long;
+
+transfer_days = unique(dat2$transfer_day)
+aft_residuals_cross_rep = list()
+aft_residuals_cross_rep_VMC = list()
+for (death_not_VMC in c(F,T)){
+  res = rbindlist(lapply(transfer_days,function(cur_tf_day){
+     dat2  = rnai_hits_long[transfer_day == cur_tf_day,]
+     if (!death_not_VMC){
+    aft_residuals_cross_rep_VMC[[cur_tf_day]] = list()
+      dat2 = dat2[!is.na(day_VMC),]
+    }else aft_residuals_cross_rep[[cur_tf_day]] = list()
+    
+  RNAis = unique(dat2$RNAi)
+  RNAis = RNAis[!RNAis%in%c("EV","QZ0")]
+  #browser()
+    rbindlist(lapply(RNAis,function(cur_RNAi){
+      cat(paste0(cur_RNAi," day ",cur_tf_day,"\n"))
+      dat  = rnai_hits_long[RNAi%in%c(cur_RNAi,"EV","QZ0") & transfer_day == cur_tf_day,]
+      s <- Surv(dat$day,1-dat$C)
+      srv <- survfit(s~dat$transfer_day+dat$RNAi)
+      colors=rep("black",2)
+      colors[which(!grepl("EV",names(srv$strata)))] = "red"
+      
+     # plot(srv,col=colors)
+      sdif = survdiff(s~dat$RNAi)
+      if (1 || min(aggregate(Device~RNAi,dat,function(x)length(unique(x)))$Device)<=1){
+       # browser()
+      if (length(unique(dat$experiment))>1){
+        saft = ns_multiple_bj(as.data.frame(dat),
+      			bj_group_column="RNAi",
+      			bj_group_2_column="experiment",
+      			time_column="day",
+      			censored_column="C",
+      			reference_group="EV",
+      			reference_group_2=NA);
+         r = saft$group_coefficients
+         # browser()
+      }else{
+          saft = ns_single_bj_group(Surv(dat$day,1-dat$C)~dat$RNAi,reference_group="EV")
+           r = saft$coefficients
+         # browser()
+      }
+        
+       res =   data.table(death=dat$day,
+                                                                 Device=dat$Device,
+                                                                 bj_residual = saft$bj_residual,
+                                                                 RNAi=dat$RNAi, 
+                                                                 Censored = dat$C)
+       if (death_not_VMC){
+        aft_residuals_cross_rep[[cur_tf_day]][[cur_RNAi]] <<- res
+       }else aft_residuals_cross_rep_VMC[[cur_tf_day]][[cur_RNAi]] <<- res
+        
+        #browser()
+     #   r = saft$coefficients
+        r$transfer_day=cur_tf_day
+        r$RNAi = cur_RNAi
+        r$log_rank_pval=pchisq(sdif$chisq, length(sdif$n)-1, lower.tail = FALSE)
+      }else{
+      
+        dat$C2 = 1-dat$C
+        ref_group = "EV"
+        if ("QZ0"%in%dat$RNAi)
+          ref_group = "QZ0"
+        devices = unique(dat[RNAi == cur_RNAi,Device])
+        dat = dat[Device %in% devices,]
+        saft = ns_multiple_bj(data.frame(dat),bj_group_column="RNAi",bj_group_2_column="Device",time_column="day",censored_column="C2",reference_group=ref_group)
+        res <<-   saft$bj_residual
+          if (death_not_VMC){
+        aft_residuals[[cur_tf_day]][[cur_RNAi]] <<- res;
+          }else aft_residuals_VMC[[cur_tf_day]][[cur_RNAi]] <<- res;
+       # browser()
+        r = data.frame(bj_group = cur_RNAi,
+                       coefficient=saft$group_coefficients[["Contrast"]],
+                       se=saft$group_coefficients[["SE"]],
+                       lower=saft$group_coefficients[["Lower"]],
+                       upper=saft$group_coefficients[["Upper"]],
+                       p=saft$group_coefficients[["Pvalue"]])
+        r$transfer_day=cur_tf_day
+        r$RNAi = cur_RNAi
+        r$log_rank_pval=pchisq(sdif$chisq, length(sdif$n)-1, lower.tail = FALSE)
+        
+      }
+      r
+    }))
+  }))
+    if (death_not_VMC){
+    knockdown_aft_results_cross_rep = res;
+  }else knockdown_aft_results_cross_rep_VMC = res;
+  
+}
+#knockdown_aft_results$GeneSymbol = lifespan_GeneSymbol_lookup[knockdown_aft_results$RNAi]
+write.csv(knockdown_aft_results_cross_rep,"../data/lifespan/scaling_hits_survival_cross_rep_summary.csv")
+write.csv(knockdown_aft_results_cross_rep_VMC,"../data/lifespan/scaling_hits_survival_cross_rep_summary_VMC.csv")
+```
+```{r}
+EVs = rnai_hits_long[RNAi=="EV"]
+res = survfit(Surv(EVs$day,1-EVs$C)~EVs$experiment+EVs$transfer_day)
+means = ns_survival_mean(res)
+a = hist(means)
+plot(a,xlab="Mean lifespan",main="")
+png("../figures/R2R/mean_histogram.png",width=300,height=200)
+plot(a,xlab="Mean lifespan",main="")
+dev.off()
+```
+
+
+#plot effects of each RNAi with replicates separate
+```{r,fig.width=20,fig.height=8}
+
+
+
+for (i in 1:2){
+  if (i == 2)
+    pdf("../figures/04/S_hits_lifespan.pdf",width=20,height=8)
+RNAis = unique(rnai_hits_long$RNAi)
+RNAis = RNAis[RNAis!="EV"]
+#layout(matrix(c(0,1,2,0,3,4,0,5,6,0,7,8,0,9,10,0,0,0),nrow=6,ncol=3,byrow=T))
+
+layout(matrix(c(0,1,2,3,4,5,6,7,
+                0,8,9,10,11,12,13,14,
+                0,15,16,17,18,19,20,21,
+                0,22,23,24,25,26,27,28,
+                0,0,0,0,0,0,0,0),nrow=5,ncol=8,byrow=T))
+par(mai=c(0,0,.1,0)) 
+
+row_id = 0;
+graph_id = 0
+lapply(RNAis,function(cur_RNAi){
+  print(cur_RNAi)
+  cur_exp = unique(rnai_hits_long[RNAi == cur_RNAi ,experiment])
+  lapply(cur_exp, function(ex){
+    dat = rnai_hits_long[RNAi%in%c(cur_RNAi,"EV") & experiment ==ex ,]
+    s <- Surv(dat$day,1-dat$C)
+    srv <<- survfit(s~dat$transfer_day+dat$RNAi+dat$experiment)
+    
+    is_EV = grepl("EV",names(srv$strata))
+    day_0 = grepl("transfer_day=0",names(srv$strata))
+    
+    colors=rep("black",8)
+    colors[!is_EV & day_0] = 'blue'
+    colors[!is_EV & !day_0] = 'red'
+    ltys = rep(1,8);
+    ltys[is_EV & day_0] = 2
+    plot(srv,col=colors,lty=ltys,lwd=1.5,bty="n",
+         xlab=ifelse(graph_id>=12,"Age (days)",""),
+         ylab=ifelse(row_id==0,"Fraction surviving",""), 
+         yaxt = "n",
+         xaxt = "n",
+         xlim=c(0,max(rnai_hits_long$day)+5),ylim=c(0,1))
+    if(row_id==0){
+      axis(side = 2,las = 1,ylab="Fraction Surviving", tck=-0.025)
+    }else{
+      axis(side = 2,las = 1,at=seq(0,1,by=.2),labels=rep("",6),lwd.ticks=1, tck=-0.025)
+    }
+    if (graph_id>=19){
+          axis(side = 1, las = 1,at=seq(0,40,by=5), tck=-0.025)
+    }else{
+          axis(side = 1, las = 1,at=seq(0,40,by=5),labels=rep("",9),lwd.ticks=1, tck=-0.025)
+    }
+    print(cur_RNAi)
+    leg = NULL
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="L4",b="light blue",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Day 4",b="red",c=1),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="mutant",b="red",c=1),leg)
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Ev R1",b="black",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="EV R2",b="black",c=2),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Wild type",b="black",c=2),leg)
+    
+    leg = leg[nrow(leg):1,]
+    # legend("topright",title =ex,legend="",
+    #       bty="n")
+    legend("bottomleft",title =cur_RNAi,
+            title.adj=.1,
+           legend=leg[,1],
+           col=leg[,2],
+           lty=leg[,3],bty="n")
+    row_id <<- row_id + 1;
+    graph_id <<- graph_id + 1;
+    if (row_id == 7)
+      row_id <<- 0;
+  })
+})
+  if (i==2) dev.off()
+}
+
+```
+
+#plot effects of each RNAi with replicates separate VMC
+```{r,fig.width=20,fig.height=8}
+
+
+
+for (i in 1:2){
+  if (i == 2)
+    pdf("../figures/04/S_hits_VMC.pdf",width=20,height=8)
+RNAis = unique(rnai_hits_long[!is.na(day_VMC),]$RNAi)
+RNAis = RNAis[RNAis!="EV"]
+#layout(matrix(c(0,1,2,0,3,4,0,5,6,0,7,8,0,9,10,0,0,0),nrow=6,ncol=3,byrow=T))
+
+layout(matrix(c(0,1,2,3,4,5,6,7,
+                0,8,9,10,11,12,13,14,
+                0,15,16,17,18,19,20,21,
+                0,22,23,24,25,26,27,28,
+                0,0,0,0,0,0,0,0),nrow=5,ncol=8,byrow=T))
+par(mai=c(0,0,.1,0)) 
+
+row_id = 0;
+graph_id = 0
+lapply(RNAis,function(cur_RNAi){
+  print(cur_RNAi)
+  cur_exp = unique(rnai_hits_long[RNAi == cur_RNAi &!is.na(day_VMC),experiment])
+  lapply(cur_exp, function(ex){
+    dat = rnai_hits_long[RNAi%in%c(cur_RNAi,"EV") & experiment ==ex & !is.na(day_VMC),]
+    s <- Surv(dat$day_VMC,1-dat$C)
+    srv <<- survfit(s~dat$transfer_day+dat$RNAi+dat$experiment)
+    
+    is_EV = grepl("EV",names(srv$strata))
+    day_0 = grepl("transfer_day=0",names(srv$strata))
+    
+    colors=rep("black",8)
+    colors[!is_EV & day_0] = 'blue'
+    colors[!is_EV & !day_0] = 'red'
+    ltys = rep(1,8);
+    ltys[is_EV & day_0] = 2
+    plot(srv,col=colors,lty=ltys,lwd=1.5,bty="n",
+         xlab=ifelse(graph_id>=12,"Age (days)",""),
+         ylab=ifelse(row_id==0,"Fraction surviving",""), 
+         yaxt = "n",
+         xaxt = "n",
+         xlim=c(0,max(rnai_hits_long$day)+5),ylim=c(0,1))
+    if(row_id==0){
+      axis(side = 2,las = 1,ylab="Fraction Surviving", tck=-0.025)
+    }else{
+      axis(side = 2,las = 1,at=seq(0,1,by=.2),labels=rep("",6),lwd.ticks=1, tck=-0.025)
+    }
+    if (graph_id>=19){
+          axis(side = 1, las = 1,at=seq(0,40,by=5), tck=-0.025)
+    }else{
+          axis(side = 1, las = 1,at=seq(0,40,by=5),labels=rep("",9),lwd.ticks=1, tck=-0.025)
+    }
+    print(cur_RNAi)
+    leg = NULL
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="L4",b="light blue",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Day 4",b="red",c=1),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="mutant",b="red",c=1),leg)
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Ev R1",b="black",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="EV R2",b="black",c=2),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Wild type",b="black",c=2),leg)
+    
+    leg = leg[nrow(leg):1,]
+    # legend("topright",title =ex,legend="",
+    #       bty="n")
+    legend("bottomleft",title =cur_RNAi,
+            title.adj=.1,
+           legend=leg[,1],
+           col=leg[,2],
+           lty=leg[,3],bty="n")
+    row_id <<- row_id + 1;
+    graph_id <<- graph_id + 1;
+    if (row_id == 7)
+      row_id <<- 0;
+  })
+})
+  if (i==2) dev.off()
+}
+
+```
+
+#plot effects of each RNAi with replicates separate BJ RESIDUAL
+```{r,fig.width=20,fig.height=8}
+
+
+
+for (i in 1:2){
+  if (i == 2)
+    pdf("../figures/04/S_hits_lifespan_bj_residual.pdf",width=20,height=8)
+RNAis = unique(rnai_hits_long$RNAi)
+RNAis = RNAis[RNAis!="EV"]
+#layout(matrix(c(0,1,2,0,3,4,0,5,6,0,7,8,0,9,10,0,0,0),nrow=6,ncol=3,byrow=T))
+
+layout(matrix(c(0,1,2,3,4,5,6,7,
+                0,8,9,10,11,12,13,14,
+                0,15,16,17,18,19,20,21,
+                0,22,23,24,25,26,27,28,
+                0,0,0,0,0,0,0,0),nrow=5,ncol=8,byrow=T))
+par(mai=c(0,0,.1,0)) 
+
+row_id = 0;
+graph_id = 0
+lapply(RNAis,function(cur_RNAi){
+  print(cur_RNAi)
+  cur_exp = unique(rnai_hits_long[RNAi == cur_RNAi,experiment])
+  lapply(cur_exp, function(ex){
+    dat = rnai_hits_long[RNAi%in%c(cur_RNAi,"EV") & experiment ==ex,]
+    dat2 = rbindlist(lapply(unique(dat$transfer_day),function(trans_day){
+      dat2 = dat[trans_day == transfer_day,]
+      saft = ns_single_bj_group(Surv(dat2$day,1-dat2$C)~dat2$`Plate Name`,reference_group=dat2$`Plate Name`[1])
+      dat2$bj_residual = saft$bj_residual
+      dat2
+    }))
+     # browser()
+    s <- Surv(dat2$bj_residual,1-dat2$C)
+    srv <<- survfit(s~dat2$transfer_day+dat2$RNAi+dat2$experiment)
+    
+    is_EV = grepl("EV",names(srv$strata))
+
+    day_0 = grepl("transfer_day=0",names(srv$strata))
+    
+    colors=rep("black",8)
+    colors[!is_EV & day_0] = 'blue'
+    colors[!is_EV & !day_0] = 'red'
+    ltys = rep(1,8);
+    ltys[is_EV & day_0] = 2
+    plot(srv,col=colors,lty=ltys,lwd=1.5,bty="n",
+         xlab=ifelse(graph_id>=12,"Age (days)",""),
+         ylab=ifelse(row_id==0,"Fraction surviving",""), 
+         yaxt = "n",
+         xaxt = "n",
+        # xlim=c(0,max(saft$bj_residual)+.2),
+        ylim=c(0,1))
+    if(row_id==0){
+      axis(side = 2,las = 1,ylab="Fraction Surviving", tck=-0.025)
+    }else{
+      axis(side = 2,las = 1,at=seq(0,1,by=.2),labels=rep("",6),lwd.ticks=1, tck=-0.025)
+    }
+    if (graph_id>=19){
+          axis(side = 1, las = 1,at=seq(0,2,by=.2), tck=-0.025)
+    }else{
+          axis(side = 1, las = 1,at=seq(0,2,by=.2),labels=rep("",length(seq(0,2,by=.2))),lwd.ticks=1, tck=-0.025)
+    }
+    print(cur_RNAi)
+    leg = NULL
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="L4",b="light blue",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Day 4",b="red",c=1),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="mutant",b="red",c=1),leg)
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Ev R1",b="black",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="EV R2",b="black",c=2),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Wild type",b="black",c=2),leg)
+    
+    leg = leg[nrow(leg):1,]
+   #  legend("topright",title =ex,legend="",
+   #        bty="n")
+    legend("bottomleft",title =cur_RNAi,
+            title.adj=.1,
+           legend=leg[,1],
+           col=leg[,2],
+           lty=leg[,3],bty="n")
+    row_id <<- row_id + 1;
+    graph_id <<- graph_id + 1;
+    if (row_id == 7)
+      row_id <<- 0;
+  })
+})
+  if (i==2) dev.off()
+}
+```
+
+#plot effects of each RNAi with replicates separate BJ RESIDUAL *VMC*
+```{r,fig.width=20,fig.height=8}
+
+
+
+for (i in 1:2){
+  if (i == 2)
+    pdf("../figures/04/S_hits_lifespan_bj_residual_VMC.pdf",width=20,height=8)
+RNAis = unique(rnai_hits_long[!is.na(day_VMC),]$RNAi)
+RNAis = RNAis[RNAis!="EV"]
+#layout(matrix(c(0,1,2,0,3,4,0,5,6,0,7,8,0,9,10,0,0,0),nrow=6,ncol=3,byrow=T))
+
+layout(matrix(c(0,1,2,3,4,5,6,7,
+                0,8,9,10,11,12,13,14,
+                0,15,16,17,18,19,20,21,
+                0,22,23,24,25,26,27,28,
+                0,0,0,0,0,0,0,0),nrow=5,ncol=8,byrow=T))
+par(mai=c(0,0,.1,0)) 
+
+row_id = 0;
+graph_id = 0
+lapply(RNAis,function(cur_RNAi){
+  print(cur_RNAi)
+  cur_exp = unique(rnai_hits_long[RNAi == cur_RNAi & !is.na(day_VMC),experiment])
+  lapply(cur_exp, function(ex){
+    devices = unique(rnai_hits_long[RNAi%in%c(cur_RNAi) & experiment ==ex & !is.na(day_VMC),]$Device)
+    
+    dat = rnai_hits_long[RNAi%in%c(cur_RNAi,"EV") & experiment ==ex & !is.na(day_VMC) & Device %in% devices,]
+    dat2 = rbindlist(lapply(unique(dat$transfer_day),function(trans_day){
+      dat2 = dat[trans_day == transfer_day,]
+      saft = ns_single_bj_group(Surv(dat2$day_VMC,1-dat2$C)~dat2$`Plate Name`,reference_group=dat2$`Plate Name`[1])
+      dat2$bj_residual = saft$bj_residual
+      dat2
+    }))
+     # browser()
+    s <- Surv(dat2$bj_residual,1-dat2$C)
+    srv <<- survfit(s~dat2$transfer_day+dat2$RNAi+dat2$experiment)
+    
+    is_EV = grepl("EV",names(srv$strata))
+
+    day_0 = grepl("transfer_day=0",names(srv$strata))
+    
+    colors=rep("black",8)
+    colors[!is_EV & day_0] = 'blue'
+    colors[!is_EV & !day_0] = 'red'
+    ltys = rep(1,8);
+    ltys[is_EV & day_0] = 2
+    plot(srv,col=colors,lty=ltys,lwd=1.5,bty="n",
+         xlab=ifelse(graph_id>=12,"Age (days)",""),
+         ylab=ifelse(row_id==0,"Fraction surviving",""), 
+         yaxt = "n",
+         xaxt = "n",
+        # xlim=c(0,max(saft$bj_residual)+.2),
+        ylim=c(0,1))
+    if(row_id==0){
+      axis(side = 2,las = 1,ylab="Fraction Surviving", tck=-0.025)
+    }else{
+      axis(side = 2,las = 1,at=seq(0,1,by=.2),labels=rep("",6),lwd.ticks=1, tck=-0.025)
+    }
+    if (graph_id>=19){
+          axis(side = 1, las = 1,at=seq(0,2,by=.2), tck=-0.025)
+    }else{
+          axis(side = 1, las = 1,at=seq(0,2,by=.2),labels=rep("",length(seq(0,2,by=.2))),lwd.ticks=1, tck=-0.025)
+    }
+    print(cur_RNAi)
+    leg = NULL
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="L4",b="light blue",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Day 4",b="red",c=1),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="mutant",b="red",c=1),leg)
+    if ("0" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Ev R1",b="black",c=1),leg)
+    if ("4" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="EV R2",b="black",c=2),leg)
+    if ("mutant" %in% dat$transfer_day)
+      leg = rbind(data.frame(a="Wild type",b="black",c=2),leg)
+    
+    leg = leg[nrow(leg):1,]
+   #  legend("topright",title =ex,legend="",
+   #        bty="n")
+    legend("bottomleft",title =cur_RNAi,
+            title.adj=.1,
+           legend=leg[,1],
+           col=leg[,2],
+           lty=leg[,3],bty="n")
+    row_id <<- row_id + 1;
+    graph_id <<- graph_id + 1;
+    if (row_id == 7)
+      row_id <<- 0;
+  })
+})
+  if (i==2) dev.off()
+}
+```
+```{r}
+#plot nice aft effect figure REPS separate
+strain_ls = aggregate(coefficient~RNAi,knockdown_aft_results,min)
+strain_ls = strain_ls[order(strain_ls$coefficient),]
+knockdown_aft_results$RNAi_factor = factor(knockdown_aft_results$RNAi,levels=strain_ls$RNAi)
+knockdown_aft_results$x_position = as.integer(knockdown_aft_results$RNAi_factor)+ifelse(knockdown_aft_results$transfer_day==0,0,.25)
+setkey(knockdown_aft_results,RNAi)
+break_info = data.frame(RNAi=factor(strain_ls$RNAi,levels=strain_ls$RNAi))
+break_info$x_position = as.integer(break_info$RNAi)
+break_info = break_info[order(break_info$x_position),]
+knockdown_aft_results$label = ifelse(knockdown_aft_results$p<.05,"*","")
+knockdown_aft_results$label_x = ifelse(knockdown_aft_results$coefficient>0,log(1.35),log(.75))
+ggplot(knockdown_aft_results,aes(y=x_position,x=exp(coefficient),xmin=exp(lower),xmax=exp(upper),color=factor(transfer_day),label=knockdown_aft_results$label))+ 
+  geom_vline(xintercept=1,lty=2,col="gray") + 
+  geom_point()+
+  geom_errorbar(width=.2)+
+  geom_text(aes(x=exp(label_x)))+
+  scale_y_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + ylab("")+xlab("Effect on lifespan")+
+  scale_x_continuous(trans="log2",breaks=seq(.5,1.5,by=.1))+
+   theme(axis.text.y = element_text(face="italic"),legend.position="none")
+
+library(RColorBrewer)
+colors = brewer.pal(7, "Set1")[c(1,2,7)]
+colors[3] = "black"
+names(colors) = c("0","4","mutant")
+
+ggplot(knockdown_aft_results,aes(x=x_position,y=exp(coefficient),ymin=exp(lower),ymax=exp(upper),
+                                 color=factor(transfer_day),
+                                 fill=factor(transfer_day),
+                                 label=knockdown_aft_results$label))+ 
+  geom_hline(yintercept=1,lty=2,col="gray") + 
+  geom_errorbar(width=.2)+
+  geom_point(color="black",pch=21,size=2,color="black")+
+  geom_text(aes(y=exp(label_x)),cex=6,color="black")+
+  scale_color_manual(values=colors)+
+  scale_fill_manual(values=colors)+
+  scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on lifespan")+
+  scale_y_continuous(trans="log2",breaks=seq(.5,1.5,by=.1))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")
+ggsave("../figures/04/survival_summary_all_reps.pdf",height=4,width=5.5)
+
+```
+
+
+```{r}
+#plot nice aft effect figure ALL REPS COMBINED
+#knockdown_aft_results_cross_rep$coefficient = knockdown_aft_results_cross_rep$Contrast
+#knockdown_aft_results_cross_rep$upper = knockdown_aft_results_cross_rep$Upper
+#knockdown_aft_results_cross_rep$lower = knockdown_aft_results_cross_rep$Lower
+#knockdown_aft_results_cross_rep$p = knockdown_aft_results_cross_rep$Pvalue
+strain_ls = aggregate(coefficient~RNAi,knockdown_aft_results_cross_rep,min)
+strain_ls = strain_ls[order(strain_ls$coefficient),]
+knockdown_aft_results_cross_rep$RNAi_factor = factor(knockdown_aft_results_cross_rep$RNAi,levels=strain_ls$RNAi)
+knockdown_aft_results_cross_rep$x_position = as.integer(knockdown_aft_results_cross_rep$RNAi_factor)+ifelse(knockdown_aft_results_cross_rep$transfer_day==0,0,.25)
+setkey(knockdown_aft_results_cross_rep,RNAi)
+break_info = data.frame(RNAi=factor(strain_ls$RNAi,levels=strain_ls$RNAi))
+break_info$x_position = as.integer(break_info$RNAi)
+break_info = break_info[order(break_info$x_position),]
+knockdown_aft_results_cross_rep$label = ifelse(knockdown_aft_results_cross_rep$p<.05,"*","")
+knockdown_aft_results_cross_rep$label_x = ifelse(knockdown_aft_results_cross_rep$coefficient>0,log(1.35),log(.75))
+ggplot(knockdown_aft_results_cross_rep,aes(y=x_position,x=exp(coefficient),xmin=exp(lower),xmax=exp(upper),color=factor(transfer_day),label=knockdown_aft_results_cross_rep$label))+ 
+  geom_vline(xintercept=1,lty=2,col="gray") + 
+  geom_point()+
+  geom_errorbar(width=.2)+
+  geom_text(aes(x=exp(label_x)))+
+  scale_y_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + ylab("")+xlab("Effect on lifespan")+
+  scale_x_continuous(trans="log2",breaks=seq(.5,1.5,by=.1))+
+   theme(axis.text.y = element_text(face="italic"),legend.position="none")
+
+library(RColorBrewer)
+colors = brewer.pal(7, "Set1")[c(1,2,7)]
+colors[3] = "black"
+names(colors) = c("0","4","mutant")
+
+ggplot(knockdown_aft_results_cross_rep,aes(x=x_position,y=exp(coefficient),ymin=exp(lower),ymax=exp(upper),
+                                 color=factor(transfer_day),
+                                 fill=factor(transfer_day),
+                                 label=knockdown_aft_results_cross_rep$label))+ 
+  geom_hline(yintercept=1,lty=2,col="gray") + 
+  geom_errorbar(width=.2)+
+  geom_point(color="black",pch=21,size=2,color="black")+
+  geom_text(aes(y=exp(label_x)),cex=6,color="black")+
+  scale_color_manual(values=colors)+
+  scale_fill_manual(values=colors)+
+  scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on lifespan")+
+  scale_y_continuous(trans="log2",breaks=seq(.5,1.5,by=.1))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")
+ggsave("../figures/04/survival_summary_combined_reps.pdf",height=4,width=5.5)
+
+```
+```{r}
+#plot nice aft effect figure ALL REPS COMBINED VMC
+#knockdown_aft_results_cross_rep$coefficient = knockdown_aft_results_cross_rep$Contrast
+#knockdown_aft_results_cross_rep$upper = knockdown_aft_results_cross_rep$Upper
+#knockdown_aft_results_cross_rep$lower = knockdown_aft_results_cross_rep$Lower
+#knockdown_aft_results_cross_rep$p = knockdown_aft_results_cross_rep$Pvalue
+strain_ls = aggregate(coefficient~RNAi,knockdown_aft_results_cross_rep_VMC,min)
+strain_ls = strain_ls[order(strain_ls$coefficient),]
+knockdown_aft_results_cross_rep_VMC$RNAi_factor = factor(knockdown_aft_results_cross_rep_VMC$RNAi,levels=strain_ls$RNAi)
+knockdown_aft_results_cross_rep_VMC$x_position = as.integer(knockdown_aft_results_cross_rep_VMC$RNAi_factor)+ifelse(knockdown_aft_results_cross_rep_VMC$transfer_day==0,0,.25)
+setkey(knockdown_aft_results_cross_rep_VMC,RNAi)
+break_info = data.frame(RNAi=factor(strain_ls$RNAi,levels=strain_ls$RNAi))
+break_info$x_position = as.integer(break_info$RNAi)
+break_info = break_info[order(break_info$x_position),]
+knockdown_aft_results_cross_rep_VMC$label = ifelse(knockdown_aft_results_cross_rep_VMC$p<.05,"*","")
+knockdown_aft_results_cross_rep_VMC$label_x = ifelse(knockdown_aft_results_cross_rep_VMC$coefficient>0,log(1.35),log(.75))
+ggplot(knockdown_aft_results_cross_rep_VMC,aes(y=x_position,x=exp(coefficient),xmin=exp(lower),xmax=exp(upper),color=factor(transfer_day),label=knockdown_aft_results_cross_rep_VMC$label))+ 
+  geom_vline(xintercept=1,lty=2,col="gray") + 
+  geom_point()+
+  geom_errorbar(width=.2)+
+  geom_text(aes(x=exp(label_x)))+
+  scale_y_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + ylab("")+xlab("Effect on VMC time")+
+  scale_x_continuous(trans="log2",breaks=seq(.5,1.5,by=.1))+
+   theme(axis.text.y = element_text(face="italic"),legend.position="none")
+
+library(RColorBrewer)
+colors = brewer.pal(7, "Set1")[c(1,2,7)]
+colors[3] = "black"
+names(colors) = c("0","4","mutant")
+
+ggplot(knockdown_aft_results_cross_rep_VMC,aes(x=x_position,y=exp(coefficient),ymin=exp(lower),ymax=exp(upper),
+                                 color=factor(transfer_day),
+                                 fill=factor(transfer_day),
+                                 label=knockdown_aft_results_cross_rep_VMC$label))+ 
+  geom_hline(yintercept=1,lty=2,col="gray") + 
+  geom_errorbar(width=.2)+
+  geom_point(color="black",pch=21,size=2,color="black")+
+  geom_text(aes(y=exp(label_x)),cex=6,color="black")+
+  scale_color_manual(values=colors)+
+  scale_fill_manual(values=colors)+
+  scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on VMC time")+
+  scale_y_continuous(trans="log2",breaks=seq(.5,1.5,by=.1))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")
+ggsave("../figures/04/survival_summary_combined_reps_VMC.pdf",height=4,width=5.5)
+
+```
+#plot fecundity data
+```{r}
+hatch = fread("../data/fecundity/from_hatching.csv")
+hatch$timing = "hatch"
+hatch[,last_timepoint:=`Stop [h]`==max(`Stop [h]`)]
+hatch$rep=1
+l4 = fread("../data/fecundity/from_l4.csv")
+l4$timing = "l4"
+l4[,last_timepoint:=`Stop [h]`==max(`Stop [h]`)]
+l4$rep=1
+
+l4_2 = fread("../data/fecundity/egglaying_230428.csv")
+l4_2 = l4_2[!is.na(`Stop [h]`) & !is.na(Progeny),]
+l4_2$timing = "l4"
+l4_2[,last_timepoint:=`Stop [h]`==max(`Stop [h]`)]
+l4_2$rep=2;
+egg_data = rbind(hatch,l4,l4_2)
+egg_data = egg_data[!is.na(`Progeny total`),]
+
+
+pop_sizes = aggregate(`Worm`~Condition+timing,egg_data,FUN=length)
+write.csv(pop_sizes,"../tables/fucundity_pop_sizes.csv")
+
+```
+
+#Main text Fig. 4g
+```{r,fig.width=4,fig.height=8}
+dat = egg_data[last_timepoint==T,]
+res = aggregate(`Progeny total`~Condition,dat[timing=="l4",],median)
+res = res[order(res$`Progeny total`,decreasing=T),]
+ord = rev(c("EV",res$Condition[res$Condition!="EV"]))
+dat$grp = factor(dat$Condition,levels=ord)
+
+glm_res = rbindlist(lapply(unique(dat$timing),function(cur_t){
+  dat2 = dat[timing==cur_t,]
+  dat2$pt=dat2$`Progeny total`
+  dat2$grp = relevel(dat2$grp,ref="EV")
+  glm_res = glm(pt~grp,dat2,family=gaussian)
+  s = summary(glm_res)$coefficients
+  r = as.data.frame(s)
+  r$timing=cur_t;
+  r$grp = factor(substring(rownames(s),4,100),levels=ord)
+  r = r[2:nrow(r),]
+  r
+}))
+
+ord = c("EV",res$Condition[res$Condition!="EV"])
+dat$grp = factor(dat$Condition,levels=ord)
+dat$x = as.numeric(dat$grp)
+dat$x_j = dat$x+ rnorm(nrow(dat),0,.05)
+glm_res$grp = factor(glm_res$grp,levels=ord)
+glm_res$x = as.numeric(glm_res$grp)
+glm_res$`Progeny total` = max(dat$`Progeny total`,na.rm=T)+30;
+glm_res$label = ifelse(glm_res$`Pr(>|t|)`<.05,"*","")
+ 
+gps = lapply(unique(dat$timing),function(cur_t){
+  dat2 =  dat[timing==cur_t,]
+  ggplot(dat2,aes(x=x,y=`Progeny total`,color=grp)) + 
+    geom_boxplot(outlier.size=0,lwd=.5) + 
+    geom_point(aes(x=x_j),color="black") + 
+    geom_text(aes(label=label),data=glm_res,cex=6)+
+    #facet_grid(~timing,scales="free_x") + 
+    scale_x_continuous(breaks=1:length(ord),labels=ord)+ 
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1),legend.position="none")+
+    xlab("") + geom_hline(yintercept=0,color="gray",lty=2)+
+    coord_flip()
+})
+  names(gps) = unique(dat$timing)
+
+
+gps = lapply(unique(dat$timing),function(cur_t){
+  dat2 =  dat[timing==cur_t,]
+  mean_ev = mean(dat2[Condition=="EV",`Progeny total`])
+ # browser()
+  ggplot(dat2,aes(y=x,x=`Progeny total`,grouping=grp)) + geom_vline(xintercept=mean_ev,lty=2,col="gray")+
+    geom_boxplot(outlier.size=0,lwd=.75,color="red") + 
+    geom_point(aes(y=x_j),color="black") + 
+    geom_text(aes(label=label),data=glm_res,cex=6)+
+    #facet_grid(~timing,scales="free_x") + 
+    scale_y_continuous(breaks=1:length(ord),labels=ord)+ 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none")+
+    ylab("") + 
+    coord_flip()
+})
+  names(gps) = unique(dat$timing)
+  
+#Main text Fig. 4g
+  plot(gps[["l4"]])
+  
+  ggsave("../figures/04/fecundity_from_l4.pdf",width=5.5,height=4)
+  ggsave("../figures/04/fecundity_from_l4.png",width=5,height=4)
+  plot(gps[["hatch"]])
+  ggsave("../figures/04/S_fecundity_from_hatching.pdf",width=5,height=4)
+
+```
+```{r,fig.width=12,fig.height=12}
+dat = egg_data[,]
+ggplot(dat[timing=="l4",],aes(`Stop [h]`,Progeny,color=Condition)) + geom_point() + geom_smooth() + geom_vline(xintercept=97,lty=2,col="gray")
+```
+
+
+
+#plot lifespan and AFT for glp-1 daf2
+```{r,fig.width=8,fig.height=8}
+
+daf2_glp1_epistasis_data = read.csv("../data/lifespan/2022_09_03_daf2_scaling=survival=machine_hand_jmp_days.csv")
+#rpb2_glp1_epistasis_data = read.csv("../data/lifespan/2022_09_03_rpb2_scaling=survival=machine_hand_jmp_days.csv")
+
+daf2_glp1_epistasis_data = daf2_glp1_epistasis_data[!is.na(daf2_glp1_epistasis_data$Age.at.Death..d.),] #WHY ARE THERE NA's?
+#rpb2_glp1_epistasis_data = rpb2_glp1_epistasis_data[!is.na(rpb2_glp1_epistasis_data$Age.at.Death..d.),] #WHY ARE THERE NA's?
+
+
+pop_size = aggregate(Censored~Condition.1+Strain,daf2_glp1_epistasis_data,FUN=length)
+write.csv(pop_size,"../tables/daf2_glp1_pop_size.csv")
+
+#make nice plot comparing all four curves
+for (i in 1:2){
+  if (i==2)
+    pdf("../figures/05/glp1_lifespan_scaling.pdf",width=5.33,height=5.33)
+  par(mai=c(.5,.5,0,0))
+  layout(matrix(c(1,2,3,4,5,5),nrow=3,ncol=2,byrow=T))
+  data_ed = daf2_glp1_epistasis_data;
+  colors = col=c("black","red","gray","red")
+  col_background = "dark green"
+  lty = c(1,1,2,2)
+  lwd=2
+  data_ed$Strain_f = factor(data_ed$Animal.Description,levels=c("AMP101::0 uM","AMP116::0 uM","AMP101::500 uM","AMP116::500 uM"))
+
+  lapply(c("0 uM","500 uM"),function(condition){  
+    dat = data_ed[data_ed$Condition.1 == condition,]
+    surv= Surv(dat$Age.at.Death..d. ,1-dat$Censored)
+    fit = survfit(surv~dat$Strain_f)
+    
+    print(ns_survival_mean(fit))
+    if (condition == "0 uM"){
+      plot(fit,col=col_background,bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",xlim=c(0,30),lwd=lwd,lty=1);
+      lines(fit,col=colors,bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",lwd=lwd,lty=lty[1:2]);
+      legend("topright",title="daf-2(+);",legend=c("glp-1(+)","glp-1(-)"),col=colors[1:2],lwd=lwd,bty="n",lty=lty[1:2])
+    }else{
+      plot(fit,col=col_background,bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",xlim=c(0,30),lwd=lwd,lty=1);
+      lines(fit,col=colors[3:4],bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",lwd=lwd,lty=lty[3:4]);
+      legend("bottomleft",title="daf-2(-);",legend=c("glp-1(+)","glp-1(-)"),col=colors[3:4],lwd=lwd,bty="n",lty=lty[3:4])
+    }
+			#	abline(h=.95,lty=2)
+		#		abline(v=11,lty=2)
+    axis(side = 2,
+     las = 2,)
+    NULL
+  })
+  
+  
+  lapply(c("0 uM","500 uM"),function(condition){  
+    dat = data_ed[data_ed$Condition.1 == condition,]
+    surv= Surv(dat$Age.at.Death..d. ,1-dat$Censored)
+
+    fit = ns_single_bj_group (surv~dat$Plate.Name)
+    
+    surv= Surv(fit$bj_residual ,1-dat$Censored)
+    fit2 = survfit(surv~dat$Strain_f)
+    xlim = c(0,1.8)
+    if (condition == "0 uM"){
+      plot(fit2,col=col_background,bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",xlim=xlim,lwd=lwd,lty=1);
+      lines(fit2,col=colors,bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",lwd=lwd,lty=lty[1:2]);
+      legend("topright",title="daf-2(+);",legend=c("glp-1(+)","glp-1(-)"),col=colors[1:2],lwd=lwd,bty="n",lty=lty[1:2])
+    }else{
+      plot(fit2,col=col_background,bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",xlim=xlim,lwd=lwd,lty=1);
+      lines(fit2,col=colors[3:4],bty="n",yaxt="n",xlab="Age (Days of adulthood)",ylab="Fraction Surviving",lwd=lwd,lty=lty[3:4]);
+      legend("bottomleft",title="daf-2(-);",legend=c("glp-1(+)","glp-1(-)"),col=colors[3:4],lwd=lwd,bty="n",lty=lty[3:4])
+    }
+			#	abline(h=.95,lty=2)
+		#		abline(v=11,lty=2)
+    axis(side = 2,
+     las = 2,)
+    NULL
+  })
+  
+  dat = data_ed
+  surv= Surv(dat$Age.at.Death..d. ,1-dat$Censored)
+
+  fit = ns_single_bj_group (surv~dat$Plate.Name)
+  
+  surv= Surv(fit$bj_residual ,1-dat$Censored)
+  fit2 = survfit(surv~dat$Strain_f)
+ 
+  plot(fit2,col=col_background,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=1);
+  lines(fit2,col=colors,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=lty);
+    axis(side = 2,
+     las = 2,)
+  legend("bottomleft",legend=c("glp-1(+);daf-2(+)","glp-1(-);daf-2(+)","glp-1(-);daf-2(-)","glp-1(+);daf-2(-)"),col=colors,lwd=lwd,bty="n",lty=lty)
+
+  if (i==2) {
+  ks_res1 = ns_ks_test_group(surv~dat$Strain_f,reference_group="AMP101::0 uM")
+  ks_res2=  ns_ks_test_group(surv~dat$Strain_f,reference_group="AMP101::500 uM")
+  ks_res3=  ns_ks_test_group(surv~dat$Strain_f,reference_group="AMP116::0 uM")
+  print(ks_res1)
+  print(ks_res2)
+   dev.off()
+  }
+}
+```
+
+
+
+#plot glp-1 effect on variance in wt background 
+```{r,fig.width=3,fig.height=4}
+layout(matrix(c(1,2),nrow=2,ncol=1,byrow=T))
+
+dat = glp1_effect_lifespan_data
+#dat$Age.at.Death..d. = dat$Age.at.Death..d.- dat$Age.at.Final.Vigorous.Movement..d.
+dat = dat[dat$Age.at.Death..d.>0,]
+dat$Genotype_f = factor(dat$Genotype,levels=c("glp-1(+)","glp-1(e2141)"))
+
+surv= Surv(dat$Age.at.Death..d. ,1-dat$Censored)
+
+fits = survfit(surv~dat$Genotype_f)
+fit = ns_single_bj_group (surv~dat$Plate.Name)
+
+tmp = cbind(fit$bj_residual,dat)
+surv2= Surv(fit$bj_residual ,1-dat$Censored)
+fit2 = survfit(surv2~dat$Genotype_f)
+
+for (i in 1:2){
+  if (i==2){
+   pdf("../figures/02/glp1_survival.pdf",width=4,height=2)
+  }
+ par(mai=c(.5,.5,0,0))
+  plot(fits,col=col_background,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=1);
+  lines(fits,col=colors,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=lty);
+  axis(side = 2,las = 2,at=seq(0,1,by=.25),labels=c("0","","0.5","","1"))
+  legend("bottomleft",legend=c("glp-1(+)","glp-1(e2141)"),col=colors,lwd=lwd,bty="n",lty=lty)
+  
+  
+  plot(fit2,col=col_background,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=1);
+  lines(fit2,col=colors,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=lty);
+  axis(side = 2,las = 2,at=seq(0,1,by=.25),labels=c("0","","0.5","","1"))
+  legend("bottomleft",legend=c("glp-1(+)","glp-1(e2141)"),col=colors,lwd=lwd,bty="n",lty=lty)
+  if (i==2){
+    dev.off();
+  }
+}
+  
+```
+
+
+#plot glp-1 effect on VIGOROUS MOVEMENT (VMC) variance in wt background
+```{r,fig.width=8,fig.height=6}
+dat = glp1_effect_lifespan_data[ !is.na(glp1_effect_lifespan_data$`Age.at.Final.Vigorous.Movement..d.`) & !is.na(glp1_effect_lifespan_data$`Age.at.Death..d.`),]
+                                  
+dat = dat[dat$`Age.at.Final.Vigorous.Movement..d.`<=
+                                  dat$`Age.at.Death..d.`,]
+dat$Genotype_f = factor(dat$Genotype,levels=c("glp-1(+)","glp-1(e2141)"))
+aggregate(Age.at.Death..d.-Age.at.Final.Vigorous.Movement..d.~Genotype_f,dat,mean)
+
+
+dat2 = melt(dat,measure.vars=c("Age.at.Death..d.","Age.at.Final.Vigorous.Movement..d."))
+
+for (i in 1:2){
+  if (i==2)
+    pdf("../figures/02/lifespan_vs_VMC.pdf",width=4,height=4)
+layout(matrix(c(1,2),nrow=2,ncol=1,byrow=T))
+
+ par(mai=c(.5,.5,0,0))
+dat3 = dat2[dat2$Genotype_f != "glp-1(+)",]
+surv= Surv(dat3$value ,1-dat3$Censored)
+fits = survfit(surv~dat3$variable)
+plot(fits,lty=c(1,2),bty="n",xlab="Fraction Surviving",lwd=2)
+legend("bottomleft",title="wild-type",legend=c("VMC","Death"),lty=c(1,2),bty="n")
+
+dat3 = dat2[dat2$Genotype_f == "glp-1(+)",]
+surv= Surv(dat3$value ,1-dat3$Censored)
+fits = survfit(surv~dat3$variable)
+plot(fits,lty=c(1,2),bty="n",lwd=2)
+legend("bottomleft",title="glp-1(e2141)",legend=c("VMC","Death"),lty=c(1,2),bty="n")
+ if (i==2)
+   dev.off();
+}
+
+dat4 = dat
+dat4$Age.at.Death..d. = dat4$Age.at.Final.Vigorous.Movement..d.
+
+surv= Surv(dat4$Age.at.Death..d. ,1-dat4$Censored)
+
+fits = survfit(surv~dat4$Genotype_f)
+fit = ns_single_bj_group (surv~dat4$Plate.Name)
+
+tmp = cbind(fit$bj_residual,dat4)
+surv2= Surv(fit$bj_residual ,1-dat4$Censored)
+fit2 = survfit(surv2~dat4$Genotype_f)
+
+for (i in 1:2){
+  if (i==2){
+   pdf("../figures/02/glp1_VMC_survival_AFT.pdf",width=4,height=4)
+  }
+  
+layout(matrix(c(1,2),nrow=2,ncol=1,byrow=T))
+ par(mai=c(.5,.5,0,0))
+  plot(fits,col=col_background,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=1);
+  lines(fits,col=colors,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=lty);
+  axis(side = 2,las = 2,at=seq(0,1,by=.25),labels=c("0","","0.5","","1"))
+  legend("bottomleft",legend=c("glp-1(+)","glp-1(e2141)"),col=colors,lwd=lwd,bty="n",lty=lty)
+  
+  
+  plot(fit2,col=col_background,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=1);
+  lines(fit2,col=colors,bty="n",yaxt="n",xlab="Time (days)",ylab="Fraction Surviving",lwd=lwd,lty=lty);
+  axis(side = 2,las = 2,at=seq(0,1,by=.25),labels=c("0","","0.5","","1"))
+  legend("bottomleft",legend=c("glp-1(+)","glp-1(e2141)"),col=colors,lwd=lwd,bty="n",lty=lty)
+  if (i==2){
+    dev.off();
+  }
+}
+  library(ggrastr)
+dat$Genotype2_f = ifelse(dat$Genotype=="glp-1(+)","glp-1(+)",ifelse(dat$Genotype=="glp-1(e2141)","glp-1(e2141)","?"))
+colors=c("glp-1(+)"="black","glp-1(e2141)"="red")
+ggplot(dat,aes(Age.at.Final.Vigorous.Movement..d.,dat$Age.at.Death..d.,color=Genotype2_f)) + geom_point_rast(size=.5,raster.dpi=600)+scale_color_manual(values=colors)+
+  geom_abline(slope=1,intercept=0,lty=2,color="gray")+ xlab("VMC Time (days)")+ylab("Death Time (days)")
+ggsave("../figures/02/vmc_vs_survival.pdf",width=4,height=4)
+```
+
+#fit variance of glp-1 effect on variance in wt background
+```{r}
+
+SEPARATE_REPLICATES = F
+RECALC=T
+num_boot_reps = 250
+
+
+ to_calc = list("0" = list("0" = list("0"=glp1_effect_lifespan_data)))
+
+if(RECALC){
+library("boot")
+
+ st = function(d_all,x){
+   str = unique(d_all$RNAi)
+    res = lapply(str,function(strain){
+      d =  d_all[x,][RNAi==strain,] 
+      #print(strain)
+      #print(dim(d))
+      if (nrow(d) == 0){
+        browser()
+      }
+      surv= Surv(d$Age.at.Death..d. ,1-d$Censored)
+      fits = survfit(surv~d$Genotype_f)
+      fit = ns_single_bj_group (surv~d$Plate.Name)
+      
+      surv= survfit(Surv(fit$bj_residual,1-d$Censored)~d$RNAi)
+      mn = ns_survival_mean(surv);
+      deaths = fit$bj_residual[d$Censored==0]
+      sum((deaths-mn)^2/length(deaths))
+    })
+    if (str[2] == "glp-1(+)"){
+     v = c(res[[1]]/res[[2]])
+     names(v) = paste(str[1],"/",str[2])
+    }else{
+     v = c(res[[2]]/res[[1]])
+     names(v) = paste(str[2],"/",str[1])
+    }
+   v
+ }
+run_boot=T
+ #to_calc = aft_residuals["mutant"];
+ #to_calc[["mutant"]] = aft_residuals[["mutant"]]["mig-6(sa580)"]
+res = rbindlist(lapply(rev(names(to_calc)),function(cur_day){
+    print(cur_day)
+    rbindlist(lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      if (SEPARATE_REPLICATES){
+        data_to_fit = to_calc[[cur_day]][[cur_RNAi]];
+      }else{
+        data_to_fit = list(all_reps = rbindlist(to_calc[[cur_day]][[cur_RNAi]]))
+        print(paste("Combining ",length(to_calc[[cur_day]][[cur_RNAi]]), "replicates into",length(data_to_fit)))
+      }
+      rbindlist(lapply(names(data_to_fit),function(cur_replicate){
+        print(cur_RNAi)
+        flush.console()
+        dat = data_to_fit[[cur_replicate]]
+        dat$RNAi = factor(dat$Genotype_f)
+        dat$RNAi = relevel(dat$Genotype_f,ref="glp-1(+)")
+      
+        mn = st(dat,1:nrow(dat))[1] #mean value
+        if(run_boot){
+          res = boot(data=dat,strata=as.numeric(as.factor(dat$RNAi)),statistic=st,R=num_boot_reps)
+          r = boot.ci(boot.out = res,type="perc")$percent[4:5]
+        }else{
+         r = c(mn,mn)
+            
+        } 
+        data.frame(`mean`=mn,`ci.l` = r[1],`ci.u` = r[2],RNai=cur_RNAi,day=cur_day,rep=cur_replicate)
+    }))
+  }))
+}))
+if (SEPARATE_REPLICATES){
+  fwrite(res,"../figures/04/raw_variance_bootstrap_data_glp1.csv")
+}else{
+   fwrite(res,"../figures/04/raw_variance_bootstrap_data_glp1_grouped_replicates.csv")
+}
+}else{
+  if (SEPARATE_REPLICATES){
+res = fread("../figures/04/raw_variance_bootstrap_data_glp1.csv")
+}else{res = fread("../figures/04/raw_variance_bootstrap_data_glp1_grouped_replicates.csv")
+}
+res$background = "glp-1(e2141)"
+ggplot(res,aes(background,mean))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=`ci.l`,ymax=`ci.u`),width=.1,lwd=1)+
+  geom_hline(yintercept=1,col="dark gray",lty=2)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+      strip.placement = "outside")+ylab("Fold-change in variance")+scale_y_continuous(trans="log2")
+ggsave("../figures/04/glp1_variance.pdf",width=2,height=4)
+```
+
+
+#fit variance of glp-1 effect on variance in wt background VIGOROUS MOVEMENT
+```{r}
+
+SEPARATE_REPLICATES = F
+RECALC=T
+num_boot_reps = 250
+dat = glp1_effect_lifespan_data[!is.na(glp1_effect_lifespan_data$Age.at.Final.Vigorous.Movement..d.) & glp1_effect_lifespan_data$Age.at.Final.Vigorous.Movement..d.>0,]
+
+dat$Genotype_f = factor(dat$Genotype,levels=c("glp-1(+)","glp-1(e2141)"))
+ to_calc = list("0" = list("0" = list("0"=dat)))
+
+if(RECALC){
+library("boot")
+
+ st = function(d_all,x){
+   str = unique(d_all$RNAi)
+    res = lapply(str,function(strain){
+      d =  d_all[x,][RNAi==strain,] 
+      #print(strain)
+      #print(dim(d))
+      if (nrow(d) == 0){
+        browser()
+      }
+      
+      surv= Surv(d$Age.at.Final.Vigorous.Movement..d.,1-d$Censored)
+      fits = survfit(surv~d$Genotype_f)
+      fit = ns_single_bj_group (surv~d$Plate.Name)
+      
+      surv= survfit(Surv(fit$bj_residual,1-d$Censored)~d$RNAi)
+      mn = ns_survival_mean(surv);
+      deaths = fit$bj_residual[d$Censored==0]
+      sum((deaths-mn)^2/length(deaths))
+    })
+    if (str[2] == "glp-1(+)"){
+     v = c(res[[1]]/res[[2]])
+     names(v) = paste(str[1],"/",str[2])
+    }else{
+     v = c(res[[2]]/res[[1]])
+     names(v) = paste(str[2],"/",str[1])
+    }
+   v
+ }
+run_boot=T
+ #to_calc = aft_residuals["mutant"];
+ #to_calc[["mutant"]] = aft_residuals[["mutant"]]["mig-6(sa580)"]
+res = rbindlist(lapply(rev(names(to_calc)),function(cur_day){
+    print(cur_day)
+    rbindlist(lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      if (SEPARATE_REPLICATES){
+        data_to_fit = to_calc[[cur_day]][[cur_RNAi]];
+      }else{
+        data_to_fit = list(all_reps = rbindlist(to_calc[[cur_day]][[cur_RNAi]]))
+        print(paste("Combining ",length(to_calc[[cur_day]][[cur_RNAi]]), "replicates into",length(data_to_fit)))
+      }
+      rbindlist(lapply(names(data_to_fit),function(cur_replicate){
+        print(cur_RNAi)
+        flush.console()
+        dat = data_to_fit[[cur_replicate]]
+        dat$RNAi = factor(dat$Genotype_f)
+        dat$RNAi = relevel(dat$Genotype_f,ref="glp-1(+)")
+      
+        mn = st(dat,1:nrow(dat))[1] #mean value
+        if(run_boot){
+          res = boot(data=dat,strata=as.numeric(as.factor(dat$RNAi)),statistic=st,R=num_boot_reps)
+          r = boot.ci(boot.out = res,type="perc")$percent[4:5]
+        }else{
+         r = c(mn,mn)
+            
+        } 
+        data.frame(`mean`=mn,`ci.l` = r[1],`ci.u` = r[2],RNai=cur_RNAi,day=cur_day,rep=cur_replicate)
+    }))
+  }))
+}))
+if (SEPARATE_REPLICATES){
+  fwrite(res,"../figures/04/raw_variance_bootstrap_data_glp1_VMC.csv")
+}else{
+   fwrite(res,"../figures/04/raw_variance_bootstrap_data_glp1_grouped_replicates_VMC.csv")
+}
+}else{
+  if (SEPARATE_REPLICATES){
+  res = fread("../figures/04/raw_variance_bootstrap_data_glp1_VMC.csv")
+  }else{
+    res = fread("../figures/04/raw_variance_bootstrap_data_glp1_grouped_replicates_VMC.csv")}
+}
+res$background = "glp-1(e2141)"
+ggplot(res,aes(background,mean))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=`ci.l`,ymax=`ci.u`),width=.1,lwd=1)+
+  geom_hline(yintercept=1,col="dark gray",lty=2)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+      strip.placement = "outside")+ylab("Fold-change in variance")+scale_y_continuous(trans="log2")
+ggsave("../figures/04/glp1_variance_VMC.pdf",width=2,height=2)
+
+```
+
+#Fit weibull parameters of glp-1 effect on variance in wt background: EACH POPULATION SEPARATELY
+```{r}
+library(flexsurv)
+ min_mllogis_theta <<- .00000001;
+
+parametric_fits=c("inverse_gaussian","weibull_gamma_frailty","weibull","gompertz","gompertz_gamma_frailty")
+plo=T
+weibul_parameter_fits =
+  rbindlist(lapply(unique(glp1_effect_lifespan_data$Genotype),function(geno){
+    dat = glp1_effect_lifespan_data[glp1_effect_lifespan_data$Genotype == geno,]
+    surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+     fit = ns_single_bj_group (surv~dat$Plate.Name)
+    dat$bj_residual = fit$bj_residual
+			f = ns_fit_parameterization(dat,parametric_fits=parametric_fits,death_column="Age.at.Death..d.",censored_column="Censored");
+			 rn = range(dat$Age.at.Death..d.)
+			  newx = seq(rn[1],rn[2],.1);
+			param_surv = ns_get_parametric_survival(newx,f$fits,"gompertz_gamma_frailty");
+			
+			srv =Surv(dat$Age.at.Death..d.,1-dat$Censored)
+			if (plo){
+		#	  pdf(paste0("parametric_fits/",ex,"=",group,"=vmc_and_death_param_fit.pdf"),width=7,height=7)
+			 
+				plot(survfit(srv~1),xlim=c(0,rn[2]),conf.int=F)
+				lines(newx,param_surv,col="red");
+				if ("weibull_gamma_frailty" %in% f$successful_fits){
+					param_surv_gw = ns_get_parametric_survival(newx,f$fits,"weibull_gamma_frailty");
+					lines(newx,param_surv_gw,col="green");
+				}
+				title(paste(geno))
+				legend("topright",bty="n",paste(geno),legend=".")
+				abline(h=.95,lty=2)
+			}
+			  
+			 inverse_gaussian_columns = c("inverse_gaussian_mu","inverse_gaussian_mu_95_conf_l","inverse_gaussian_mu_95_conf_h","inverse_gaussian_sigma2","inverse_gaussian_sigma_95_conf_l","inverse_gaussian_sigma_95_conf_h","inverse_gaussian_AIC")
+			weibul_frailty_columns = c("weibull_gamma_frailty_scale","weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_scale_95_conf_h","weibull_gamma_frailty_shape","weibull_gamma_frailty_shape_95_conf_l","weibull_gamma_frailty_shape_95_conf_h","weibull_gamma_frailty_theta","weibull_gamma_frailty_theta_95_conf_l","weibull_gamma_frailty_theta_95_conf_h","weibull_gamma_frailty_AIC")
+			weibul_columns = c("weibull_scale","weibull_scale_95_conf_l","weibull_scale_95_conf_h","weibull_shape","weibull_shape_95_conf_l","weibull_shape_95_conf_h","weibull_AIC")
+			gompertz_columns = c("gompertz_shape","gompertz_shape_95_conf_l","gompertz_shape_95_conf_h","gompertz_rate","gompertz_rate_95_conf_l","gompertz_rate_95_conf_h","gompertz_AIC");
+			gompertz_frailty_columns = c("gompertz_gamma_frailty_shape","gompertz_gamma_frailty_shape_95_conf_l","gompertz_gamma_frailty_shape_95_conf_h",
+			                             "gompertz_gamma_frailty_rate","gompertz_gamma_frailty_rate_95_conf_l","gompertz_gamma_frailty_rate_95_conf_h",
+			                              "gompertz_gamma_frailty_theta","gompertz_gamma_frailty_theta_95_conf_l","gompertz_gamma_frailty_theta_95_conf_h","gompertz_gamma_frailty_AIC");
+			all_columns = c(inverse_gaussian_columns,weibul_frailty_columns,weibul_columns,gompertz_columns,gompertz_frailty_columns);
+			res = f$fits[,all_columns];
+			res$Genotype=geno
+			res
+}))
+
+```
+
+#Fit weibull parameters of glp-1 effect on variance in wt background: EACH POPULATION SEPARATELY  VMC VIGOROUS MOVMEENT
+```{r}
+library(flexsurv)
+ min_mllogis_theta <<- .00000001;
+
+parametric_fits=c("weibull","weibull_gamma_frailty")
+plo=T
+weibul_parameter_fits_VMC =
+  rbindlist(lapply(unique(glp1_effect_lifespan_data$Genotype),function(geno){
+    dat = glp1_effect_lifespan_data[glp1_effect_lifespan_data$Genotype == geno,]
+    dat$Age.at.Death..d. = dat$Age.at.Final.Vigorous.Movement..d.
+    dat = dat[!is.na(dat$Age.at.Death..d.) & dat$Age.at.Death..d.>0,]
+    surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+   #  fit = ns_single_bj_group (surv~dat$Plate.Name)
+    #dat$bj_residual = fit$bj_residual
+    
+			f = ns_fit_parameterization(dat,parametric_fits=parametric_fits,death_column="Age.at.Death..d.",censored_column="Censored");
+			
+			 rn = range(dat$Age.at.Death..d.)
+			  newx = seq(rn[1],rn[2],.1);
+		
+			srv =Surv(dat$Age.at.Death..d.,1-dat$Censored)
+			if (plo){
+		#	  pdf(paste0("parametric_fits/",ex,"=",group,"=vmc_and_death_param_fit.pdf"),width=7,height=7)
+			 
+				plot(survfit(srv~1),xlim=c(0,rn[2]),conf.int=F)
+				#lines(newx,param_surv,col="red");
+				if ("weibull_gamma_frailty" %in% f$successful_fits){
+					param_surv_gw = ns_get_parametric_survival(newx,f$fits,"weibull_gamma_frailty");
+					lines(newx,param_surv_gw,col="green");
+				}
+				title(paste(geno))
+				legend("topright",bty="n",paste(geno),legend=".")
+				abline(h=.95,lty=2)
+			}
+			  
+			 inverse_gaussian_columns = c("inverse_gaussian_mu","inverse_gaussian_mu_95_conf_l","inverse_gaussian_mu_95_conf_h","inverse_gaussian_sigma2","inverse_gaussian_sigma_95_conf_l","inverse_gaussian_sigma_95_conf_h","inverse_gaussian_AIC")
+			weibul_frailty_columns = c("weibull_gamma_frailty_scale","weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_scale_95_conf_h","weibull_gamma_frailty_shape","weibull_gamma_frailty_shape_95_conf_l","weibull_gamma_frailty_shape_95_conf_h","weibull_gamma_frailty_theta","weibull_gamma_frailty_theta_95_conf_l","weibull_gamma_frailty_theta_95_conf_h","weibull_gamma_frailty_AIC")
+			weibul_columns = c("weibull_scale","weibull_scale_95_conf_l","weibull_scale_95_conf_h","weibull_shape","weibull_shape_95_conf_l","weibull_shape_95_conf_h","weibull_AIC")
+		#	gompertz_columns = c("gompertz_shape","gompertz_shape_95_conf_l","gompertz_shape_95_conf_h","gompertz_rate","gompertz_rate_95_conf_l","gompertz_rate_95_conf_h","gompertz_AIC");
+		#	gompertz_frailty_columns = c("gompertz_gamma_frailty_shape","gompertz_gamma_frailty_shape_95_conf_l","gompertz_gamma_frailty_shape_95_conf_h",
+		#                             "gompertz_gamma_frailty_rate","gompertz_gamma_frailty_rate_95_conf_l","gompertz_gamma_frailty_rate_95_conf_h",
+		#	                              "gompertz_gamma_frailty_theta","gompertz_gamma_frailty_theta_95_conf_l","gompertz_gamma_frailty_theta_95_conf_h","gompertz_gamma_frailty_AIC");
+			all_columns = c(weibul_frailty_columns,weibul_columns);#,inverse_gaussian_columns,gompertz_columns,gompertz_frailty_columns);
+			res = f$fits[,all_columns];
+			res$Genotype=geno
+			res
+}))
+
+```
+
+#calculate change in variance in VMC
+```{r}
+parametric_variance = function(scale,shape){
+  (scale^2)*(gamma(1+2/shape)-gamma(1+1/shape)^2)
+}
+
+parametric_mean = function(scale,shape){
+  scale*gamma(1+1/shape)
+}
+#weibul_parameter_fits_VMC$variation = apply(weibul_parameter_fits_VMC[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape")],1,function(x)parametric_variance(x[1],x[2]))
+#weibul_parameter_fits_VMC$variation_ul = apply(weibul_parameter_fits_VMC[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape_95_conf_l")],1,function(x)parametric_variance(x[1],x[2]))
+#weibul_parameter_fits_VMC$variation_hl = apply(weibul_parameter_fits_VMC[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape_95_conf_h")],1,function(x)parametric_variance(x[1],x[2]))
+
+weibul_parameter_fits_VMC$variation = apply(weibul_parameter_fits_VMC[,c("weibull_scale","weibull_shape")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits_VMC$variation_ul = apply(weibul_parameter_fits_VMC[,c("weibull_scale","weibull_shape_95_conf_l")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits_VMC$variation_hl = apply(weibul_parameter_fits_VMC[,c("weibull_scale","weibull_shape_95_conf_h")],1,function(x)parametric_variance(x[1],x[2]))
+
+weibul_parameter_fits_VMC$mean = apply(weibul_parameter_fits_VMC[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape")],1,function(x)parametric_mean(x[1],x[2]))
+weibul_parameter_fits_VMC$mean_ul = apply(weibul_parameter_fits_VMC[,c("weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_shape")],1,function(x)parametric_mean(x[1],x[2]))
+weibul_parameter_fits_VMC$mean_hl = apply(weibul_parameter_fits_VMC[,c("weibull_gamma_frailty_scale_95_conf_h","weibull_gamma_frailty_shape")],1,function(x)parametric_mean(x[1],x[2]))
+
+
+to_plot = weibul_parameter_fits_VMC[!grepl("mu86",Genotype),]
+to_plot$genotype = factor(substring(to_plot$Genotype,0,regexpr(";",to_plot$Genotype)[1:2]-1))
+
+
+gp1 = ggplot(to_plot,aes(genotype,weibull_gamma_frailty_shape,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=weibull_gamma_frailty_shape_95_conf_l ,ymax=weibull_gamma_frailty_shape_95_conf_h),width=.1,lwd=1)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Weibul Shape")+ylim(0,max(to_plot$weibull_gamma_frailty_shape_95_conf_h))
+
+gp2 = ggplot(to_plot,aes(genotype,variation,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=variation_ul,ymax=variation_hl),width=.1,lwd=1)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Weibul Variance")+ylim(0,max(to_plot$variation_ul))
+
+
+ggpubr::ggarrange(plotlist=list(gp1,gp2))
+#ggsave("../figures/04/S_glp1_alone_weibul_variance_fits.pdf",width=6,height=4)
+
+lapply(unique(to_plot$background),function(backg){
+  dat = to_plot[background==backg,]
+  return(dat[strain=="AMP116",]$variation/dat[strain=="AMP101",]$variation)
+})
+
+a = to_plot[,.(weibull_scale,weibull_scale_95_conf_l,weibull_scale_95_conf_h,genotype)]
+names(a)=c("val","l","u","genotype")
+a$var = "scale"
+b = to_plot[,.(weibull_shape,weibull_shape_95_conf_l,weibull_shape_95_conf_h,genotype)]
+names(b)=c("val","l","u","genotype")
+b$var = "shape"
+c = to_plot[,.(variation,variation_ul,variation_hl,genotype)]
+names(c)=c("val","l","u","genotype")
+c$var = "variance"
+to_plot2 = rbind(a,b,c)
+
+ggplot(to_plot2,aes(genotype,val,color=var)) + geom_point(cex=3)+
+  geom_errorbar(aes(ymin=l ,ymax=u),width=.1,lwd=1)+
+  facet_wrap(~var,scale="free")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")
+
+ggsave("../figures/02/S_glp1_alone_weibul_weibul_fits_VMC.pdf",width=6,height=4)
+
+```
+#calculate change in variance glp1 in a wildtype background
+```{r}
+library(ggpubr)
+parametric_variance = function(scale,shape){
+  (scale^2)*(gamma(1+2/shape)-gamma(1+1/shape)^2)
+}
+parametric_mean = function(scale,shape){
+  scale*gamma(1+1/shape)
+}
+
+weibul_parameter_fits$variation = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits$variation_ul = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape_95_conf_l")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits$variation_hl = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape_95_conf_h")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits$mean = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape")],1,function(x)parametric_mean(x[1],x[2]))
+weibul_parameter_fits$mean_ul = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_shape")],1,function(x)parametric_mean(x[1],x[2]))
+weibul_parameter_fits$mean_hl = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale_95_conf_h","weibull_gamma_frailty_shape")],1,function(x)parametric_mean(x[1],x[2]))
+
+
+to_plot = weibul_parameter_fits
+to_plot$genotype = factor(substring(to_plot$Genotype,0,regexpr(";",to_plot$Genotype)[1:2]-1))
+
+
+gp1 = ggplot(to_plot,aes(genotype,weibull_gamma_frailty_shape,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=weibull_gamma_frailty_shape_95_conf_l ,ymax=weibull_gamma_frailty_shape_95_conf_h),width=.1,lwd=1)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Weibul Shape")+ylim(0,max(to_plot$weibull_gamma_frailty_shape_95_conf_h))
+
+gp2 = ggplot(to_plot,aes(genotype,variation,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=variation_ul,ymax=variation_hl),width=.1,lwd=1)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Weibul Variance")+ylim(0,max(to_plot$variation_ul))
+
+
+ggpubr::ggarrange(plotlist=list(gp1,gp2))
+ggsave("../figures/04/S_glp1_alone_weibul_variance_fits.pdf",width=6,height=4)
+
+lapply(unique(to_plot$background),function(backg){
+  dat = to_plot[background==backg,]
+  return(dat[strain=="AMP116",]$variation/dat[strain=="AMP101",]$variation)
+})
+
+a = to_plot[,.(weibull_scale,weibull_scale_95_conf_l,weibull_scale_95_conf_h,genotype)]
+names(a)=c("val","l","u","genotype")
+a$var = "scale"
+b = to_plot[,.(weibull_shape,weibull_shape_95_conf_l,weibull_shape_95_conf_h,genotype)]
+names(b)=c("val","l","u","genotype")
+b$var = "shape"
+c = to_plot[,.(variation,variation_ul,variation_hl,genotype)]
+names(c)=c("val","l","u","genotype")
+c$var = "variance"
+to_plot2 = rbind(a,b,c)
+
+ggplot(to_plot2,aes(genotype,val,color=var)) + geom_point(cex=3)+
+  geom_errorbar(aes(ymin=l ,ymax=u),width=.1,lwd=1)+
+  facet_wrap(~var,scale="free")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")
+
+ggsave("../figures/04/S_glp1_alone_weibul_weibul_fits.pdf",width=6,height=4)
+
+
+
+```
+
+
+
+
+#Estimate change in variance by calculating the empirical variance of the buckley james residuals
+```{r}
+library(flexsurv)
+library(boot)
+ st = function(d,x){
+    surv= survfit(Surv(d$bj_residual[x],1-d$Censored[x])~1)
+    mn = ns_survival_mean(surv);
+
+    deaths = d$bj_residual[x][d$Censored[x]==0]
+    c(m=mn,v=sum((deaths-mn)^2/length(deaths)))
+ }
+   
+individual_variance_fits = rbindlist(lapply(unique(data$Strain),function(strain){
+  rbindlist(lapply(unique(data$Condition.1),function(auxin){
+    dat = data[data$Strain == strain & data$Condition.1 == auxin,]
+    surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+     fit = ns_single_bj_group (surv~dat$Plate.Name)
+    dat$bj_residual = fit$bj_residual
+    res = boot(data=dat,statistic=st,R=200)
+    r = boot.ci(boot.out = res,type="perc",index=2)$percent[4:5]
+    mn = st(dat,1:nrow(dat))[2]
+    data.frame(`mean`=mn,`ci.l` = r[1],`ci.u` = r[2],Strain=strain,auxin=auxin)
+  }))
+}))
+
+ st = function(d_all,x){
+   str = unique(d_all$Strain)
+    res = lapply(str,function(strain){
+      d =  d_all[x,][Strain==strain,] 
+      #print(strain)
+      #print(dim(d))
+      if (nrow(d) == 0){
+        browser()
+      }
+      surv= survfit(Surv(d$bj_residual,1-d$Censored)~d$Strain)
+      mn = ns_survival_mean(surv);
+      deaths = d$bj_residual[d$Censored==0]
+      sum((deaths-mn)^2/length(deaths))
+    })
+   v = c(res[[2]]/res[[1]])
+   names(v) = paste(str[2],"/",str[1])
+   v
+ }
+ 
+fold_change_fits = rbindlist(lapply(unique(data$Condition.1),function(auxin){
+    resid_data = rbindlist(lapply(unique(data$Strain),function(strain){
+      dat = data[data$Strain == strain & data$Condition.1 == auxin,]
+      surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+       fit = ns_single_bj_group (surv~dat$Plate.Name)
+      dat$bj_residual = fit$bj_residual
+      dat
+    }))
+    res = boot(data=resid_data,strata=as.numeric(as.factor(resid_data$Strain)),statistic=st,R=200)
+    r = boot.ci(boot.out = res,type="perc")$percent[4:5]
+    mn = st(resid_data,1:nrow(dat))[1]
+   
+    data.frame(`mean`=mn,`ci.l` = r[1],`ci.u` = r[2],auxin=auxin)
+  }))
+ggplot(individual_variance_fits,aes(x=Strain,y=mean,ymin=ci.l,ymax=ci.u))+geom_point()+geom_errorbar() + facet_wrap(~auxin) 
+
+individual_variance_fits$background = factor(ifelse(individual_variance_fits$auxin == "0 uM","daf-2 (+)","daf-2 (-)"),levels=c("daf-2 (+)","daf-2 (-)"))
+individual_variance_fits$genotype = factor(ifelse(individual_variance_fits$Strain == "AMP116","glp-1 (-)","glp-1 (+)"),levels=c("glp-1 (+)","glp-1 (-)"))
+
+gp1 = ggplot(individual_variance_fits,aes(genotype,mean,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=`ci.l`,ymax=`ci.u`),width=.1,lwd=1)+
+  facet_wrap(~background)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Variance in Residual Lifespan")+ylim(0,max(individual_variance_fits$ci.u))
+
+
+fold_change_fits$background = factor(ifelse(fold_change_fits$auxin == "0 uM","daf-2 (+)","daf-2 (-)"),levels=c("daf-2 (+)","daf-2 (-)"))
+
+
+fold_change_fits$sig = "*"
+
+gp2 = ggplot(fold_change_fits,aes(background,mean,label=sig))+
+  geom_text(aes(y=`ci.u`*1.03),color="black")+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=`ci.l`,ymax=`ci.u`),width=.1,lwd=1)+
+  geom_hline(yintercept=1,col="dark gray",lty=2)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Background")+ylab("Fold-change in variance")+scale_y_continuous(trans="log2")
+
+ggpubr::ggarrange(plotlist=list(gp1,gp2),nrow=2)
+ggsave("../figures/04/change_in_glp1_lifespan_variance.pdf",width=3,height=5.5)
+print(mean(fold_change_fits$mean))
+
+```
+
+#Fit weibull parameters for each population separately
+```{r}
+library(flexsurv)
+ min_mllogis_theta <<- .00000001;
+
+parametric_fits=c("inverse_gaussian","weibull_gamma_frailty","weibull","gompertz","gompertz_gamma_frailty")
+plo=T
+weibul_parameter_fits = rbindlist(lapply(unique(daf2_glp1_epistasis_data$Strain),function(strain){
+  rbindlist(lapply(unique(daf2_glp1_epistasis_data$Condition.1),function(auxin){
+    dat = daf2_glp1_epistasis_data[daf2_glp1_epistasis_data$Strain == strain & daf2_glp1_epistasis_data$Condition.1 == auxin,]
+    surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+    # fit = ns_single_bj_group (surv~dat$Plate.Name)
+   # dat$bj_residual = fit$bj_residual
+			f = ns_fit_parameterization(dat,parametric_fits=parametric_fits,death_column="Age.at.Death..d.",censored_column="Censored");
+			 rn = range(dat$Age.at.Death..d.)
+			  newx = seq(rn[1],rn[2],.1);
+			param_surv = ns_get_parametric_survival(newx,f$fits,"gompertz_gamma_frailty");
+			
+			srv =Surv(dat$Age.at.Death..d.,1-dat$Censored)
+			if (plo){
+		#	  pdf(paste0("parametric_fits/",ex,"=",group,"=vmc_and_death_param_fit.pdf"),width=7,height=7)
+			 
+				plot(survfit(srv~1),xlim=c(0,rn[2]),conf.int=F)
+				lines(newx,param_surv,col="red");
+				if ("weibull_gamma_frailty" %in% f$successful_fits){
+					param_surv_gw = ns_get_parametric_survival(newx,f$fits,"weibull_gamma_frailty");
+					lines(newx,param_surv_gw,col="green");
+				}
+				title(paste(strain,auxin))
+				legend("topright",bty="n",paste(strain,auxin),legend=".")
+				abline(h=.95,lty=2)
+			}
+			  
+			 inverse_gaussian_columns = c("inverse_gaussian_mu","inverse_gaussian_mu_95_conf_l","inverse_gaussian_mu_95_conf_h","inverse_gaussian_sigma2","inverse_gaussian_sigma_95_conf_l","inverse_gaussian_sigma_95_conf_h","inverse_gaussian_AIC")
+			weibul_frailty_columns = c("weibull_gamma_frailty_scale","weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_scale_95_conf_h","weibull_gamma_frailty_shape","weibull_gamma_frailty_shape_95_conf_l","weibull_gamma_frailty_shape_95_conf_h","weibull_gamma_frailty_theta","weibull_gamma_frailty_theta_95_conf_l","weibull_gamma_frailty_theta_95_conf_h","weibull_gamma_frailty_AIC")
+			weibul_columns = c("weibull_scale","weibull_scale_95_conf_l","weibull_scale_95_conf_h","weibull_shape","weibull_shape_95_conf_l","weibull_shape_95_conf_h","weibull_AIC")
+			gompertz_columns = c("gompertz_shape","gompertz_shape_95_conf_l","gompertz_shape_95_conf_h","gompertz_rate","gompertz_rate_95_conf_l","gompertz_rate_95_conf_h","gompertz_AIC");
+			gompertz_frailty_columns = c("gompertz_gamma_frailty_shape","gompertz_gamma_frailty_shape_95_conf_l","gompertz_gamma_frailty_shape_95_conf_h",
+			                             "gompertz_gamma_frailty_rate","gompertz_gamma_frailty_rate_95_conf_l","gompertz_gamma_frailty_rate_95_conf_h",
+			                              "gompertz_gamma_frailty_theta","gompertz_gamma_frailty_theta_95_conf_l","gompertz_gamma_frailty_theta_95_conf_h","gompertz_gamma_frailty_AIC");
+			all_columns = c(inverse_gaussian_columns,weibul_frailty_columns,weibul_columns,gompertz_columns,gompertz_frailty_columns);
+			res = f$fits[,all_columns];
+			res$auxin = auxin;
+			res$strain = strain;
+			res
+  }))
+}))
+
+```
+
+#calculate change in variance in LIFESPAN
+```{r}
+parametric_variance = function(scale,shape){
+  (scale^2)*(gamma(1+2/shape)-gamma(1+1/shape)^2)
+}
+
+weibul_parameter_fits$variation = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits$variation_ul = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape_95_conf_l")],1,function(x)parametric_variance(x[1],x[2]))
+weibul_parameter_fits$variation_hl = apply(weibul_parameter_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_shape_95_conf_h")],1,function(x)parametric_variance(x[1],x[2]))
+
+to_plot = weibul_parameter_fits
+to_plot$background = factor(ifelse(to_plot$auxin == "0 uM","daf-2 (+)","daf-2 (-)"),levels=c("daf-2 (+)","daf-2 (-)"))
+to_plot$genotype = factor(ifelse(to_plot$strain == "AMP116","glp-1 (-)","glp-1 (+)"),levels=c("glp-1 (+)","glp-1 (-)"))
+
+
+gp1 = ggplot(to_plot,aes(genotype,weibull_gamma_frailty_shape,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=weibull_gamma_frailty_shape_95_conf_l ,ymax=weibull_gamma_frailty_shape_95_conf_h),width=.1,lwd=1)+
+  facet_wrap(~background)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Weibul Shape")+ylim(0,max(to_plot$weibull_gamma_frailty_shape_95_conf_h))
+
+gp2 = ggplot(to_plot,aes(genotype,variation,color= genotype))+
+  geom_point(cex=3)+
+  geom_errorbar(aes(ymin=variation_ul,ymax=variation_hl),width=.1,lwd=1)+
+  facet_wrap(~background)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+xlab("Genotype")+ylab("Weibul Variance")+ylim(0,max(to_plot$variation_ul))
+
+lapply(unique(to_plot$background),function(backg){
+  dat = to_plot[background==backg,]
+  return(dat[strain=="AMP116",]$variation/dat[strain=="AMP101",]$variation)
+})
+
+ggpubr::ggarrange(plotlist=list(gp1,gp2))
+ggsave("../figures/04/S_weibul_variance_fits.pdf",width=6,height=3)
+
+
+```
+
+
+
+
+#Fit effect sizes using parametric method
+```{r}
+library(flexsurv)
+ min_mllogis_theta <<- .00000001;
+source("D:\\Dropbox (Personal)\\work\\data_analysis\\ns.survival.code\\R\\ns_mllogis2.r")
+
+effect_sizes = rbindlist(lapply(unique(data$Condition.1),function(auxin){
+    dat = data[data$Condition.1 == auxin,]
+    dat$Strain_f = factor(dat$Animal.Description,levels=c("AMP101::0 uM","AMP116::0 uM","AMP101::500 uM","AMP116::500 uM"))
+    #surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+    # fit = ns_single_bj_group (surv~dat$Plate.Name)
+    # fit_2 = ns_single_bj_group (surv~dat$Strain_f)
+    # dat$bj_residual = fit$bj_residual
+      #res = flexsurvreg(Surv(dat$bj_residual,1-dat$Censored)~dat$Strain_f dat$Plate.Name+  shape(dat$Strain_f) + theta(dat$Strain_f),dist = custom.mllogis,method="Nelder-Mead")
+      res = flexsurvreg(Surv(dat$Age.at.Death..d.,1-dat$Censored)~dat$Strain_f +dat$Device+  shape(dat$Strain_f) + theta(dat$Strain_f),dist = custom.mllogis,method="Nelder-Mead")
+  
+    coeffs = res$res[!grepl("Device",rownames(res$res)),]
+    intercepts= data.frame(coeffs[1:3,])
+    intercepts$var = rownames(intercepts)
+    intercepts$type = "intercept"
+    effects= data.frame(coeffs[4:6,])
+    effects$var = c("scale","shape","theta")
+    effects$type = "effect"
+    res2 = rbind(intercepts,effects)
+    res2$auxin = auxin;
+		res2
+}))
+
+```
+#plot effect sizes
+```{r, fig.width=2.66,fig.height=5.33}
+to_plot = effect_sizes[type == "effect",]
+to_plot$genotype = factor(ifelse(to_plot$auxin == "0 uM","daf-2 (+)","daf-2 (-)"),levels=c("daf-2 (+)","daf-2 (-)"))
+wald_s <- unlist(to_plot[,"est"]/to_plot[,"se"])
+to_plot$wald_s.p <- 2*pnorm(-abs(wald_s))
+to_plot$sig = ifelse(to_plot$wald_s.p <.05,"*","")
+scaleFUN <- function(x) sprintf("%.2f", x)
+ggplot(to_plot,aes(genotype,exp(est),color= genotype,label=sig))+geom_hline(yintercept=1,lty=2,col="gray")+
+  geom_point(cex=3)+
+  geom_text(aes(y=exp(`U95.`)*1.03),color="black")+
+  geom_errorbar(aes(ymin=exp(`L95.`),ymax=exp(`U95.`)),width=.1,lwd=1)+
+  facet_wrap(~var,scale="free_y",nrow=1,switch="y")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),legend.position="none",
+    strip.background = element_blank(),
+    strip.placement = "outside")+
+  scale_y_continuous(trans="log10")+xlab("Background")+ylab("Effect of removing germline")
+ggsave("../figures/04/S_weibul_paramterization_daf2_glp1.pdf",width=6,height=4)
+
+```
+
+```{r}
+if (0){
+  detach("package:ns.survival.code", unload=TRUE)
+install.packages("D:\\Dropbox (Personal)\\work\\data_analysis\\ns.survival.code", 
+repos = NULL, 
+type = "source")
+library(ns.survival.code)
+}
+ min_mllogis_theta <<- .00000001;
+
+parametric_fits=c("inverse_gaussian","weibull_gamma_frailty","weibull","gompertz","gompertz_gamma_frailty")
+plo=T
+p_fits2 = rbindlist(lapply(unique(data2$Strain),function(strain){
+  rbindlist(lapply(unique(data2$Condition.1),function(auxin){
+    dat = data2[data2$Strain == strain & data2$Condition.1 == auxin,]
+  
+			f = ns_fit_parameterization(dat,parametric_fits=parametric_fits,death_column="Age.at.Death..d.",censored_column="Censored");
+			 rn = range(dat$Age.at.Death..d.)
+			  newx = seq(rn[1],rn[2],.1);
+			param_surv = ns_get_parametric_survival(newx,f$fits,"inverse_gaussian");
+			
+			srv =Surv(dat$Age.at.Death..d.,1-dat$Censored)
+			if (plo){
+		#	  pdf(paste0("parametric_fits/",ex,"=",group,"=vmc_and_death_param_fit.pdf"),width=7,height=7)
+			 
+				plot(survfit(srv~1),xlim=c(0,rn[2]),conf.int=F)
+				lines(newx,param_surv,col="red");
+				if ("weibull_gamma_frailty" %in% f$successful_fits){
+					param_surv_gw = ns_get_parametric_survival(newx,f$fits,"weibull_gamma_frailty");
+					lines(newx,param_surv_gw,col="green");
+				}
+				title(paste(strain,auxin))
+				legend("topright",bty="n",paste(strain,auxin),legend=".")
+			}
+			  
+			 inverse_gaussian_columns = c("inverse_gaussian_mu","inverse_gaussian_mu_95_conf_l","inverse_gaussian_mu_95_conf_h","inverse_gaussian_sigma2","inverse_gaussian_sigma_95_conf_l","inverse_gaussian_sigma_95_conf_h","inverse_gaussian_AIC")
+			weibul_frailty_columns = c("weibull_gamma_frailty_scale","weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_scale_95_conf_h","weibull_gamma_frailty_shape","weibull_gamma_frailty_shape_95_conf_l","weibull_gamma_frailty_shape_95_conf_h","weibull_gamma_frailty_theta","weibull_gamma_frailty_theta_95_conf_l","weibull_gamma_frailty_theta_95_conf_h","weibull_gamma_frailty_AIC")
+			weibul_columns = c("weibull_scale","weibull_scale_95_conf_l","weibull_scale_95_conf_h","weibull_shape","weibull_shape_95_conf_l","weibull_shape_95_conf_h","weibull_AIC")
+			gompertz_columns = c("gompertz_shape","gompertz_shape_95_conf_l","gompertz_shape_95_conf_h","gompertz_rate","gompertz_rate_95_conf_l","gompertz_rate_95_conf_h","gompertz_AIC");
+			gompertz_frailty_columns = c("gompertz_gamma_frailty_shape","gompertz_gamma_frailty_shape_95_conf_l","gompertz_gamma_frailty_shape_95_conf_h",
+			                             "gompertz_gamma_frailty_rate","gompertz_gamma_frailty_rate_95_conf_l","gompertz_gamma_frailty_rate_95_conf_h",
+			                              "gompertz_gamma_frailty_theta","gompertz_gamma_frailty_theta_95_conf_l","gompertz_gamma_frailty_theta_95_conf_h","gompertz_gamma_frailty_AIC");
+			all_columns = c(inverse_gaussian_columns,weibul_frailty_columns,weibul_columns,gompertz_columns,gompertz_frailty_columns);
+			res = f$fits[,all_columns];
+			res$auxin = auxin;
+			res$strain = strain;
+			res
+  }))
+}))
+
+```
+
+#plot parameter estimates
+```{r}
+wscale = p_fits[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_scale_95_conf_h")]
+names(wscale) = c("estimate","l","h")
+wscale$var = "scale"
+wscale$auxin = p_fits$auxin
+wscale$strain = p_fits$strain
+wshape = p_fits[,c("weibull_gamma_frailty_shape","weibull_gamma_frailty_shape_95_conf_l","weibull_gamma_frailty_shape_95_conf_h")]
+names(wshape) = c("estimate","l","h")
+wshape$var = "shape"
+wshape$auxin = p_fits$auxin
+wshape$strain = p_fits$strain
+wtheta = p_fits[,c("weibull_gamma_frailty_theta","weibull_gamma_frailty_theta_95_conf_l","weibull_gamma_frailty_theta_95_conf_h")]
+names(wtheta) = c("estimate","l","h")
+wtheta$var = "theta"
+wtheta$auxin = p_fits$auxin
+wtheta$strain = p_fits$strain
+p_fits_long = rbind(wscale,wshape,wtheta)
+p_fits_long$group = apply(p_fits_long,1,function(x)paste(x[["strain"]],x[["auxin"]]))
+
+ggplot(p_fits_long,aes(group,estimate,color= group,label=group))+geom_point()+
+  geom_errorbar(aes(ymin=l,ymax=h))+
+  #geom_label_repel()+
+  scale_y_continuous(trans="log")+facet_wrap(~var,scale="free")+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+```{r}
+wscale = p_fits[,c("gompertz_gamma_frailty_rate","gompertz_gamma_frailty_rate_95_conf_l","gompertz_gamma_frailty_rate_95_conf_h")]
+names(wscale) = c("estimate","l","h")
+wscale$var = "rate"
+wscale$auxin = p_fits$auxin
+wscale$strain = p_fits$strain
+wshape = p_fits[,c("gompertz_gamma_frailty_shape","gompertz_gamma_frailty_shape_95_conf_l","gompertz_gamma_frailty_shape_95_conf_h")]
+names(wshape) = c("estimate","l","h")
+wshape$var = "shape"
+wshape$auxin = p_fits$auxin
+wshape$strain = p_fits$strain
+wtheta = p_fits[,c("gompertz_gamma_frailty_theta","gompertz_gamma_frailty_theta_95_conf_l","gompertz_gamma_frailty_theta_95_conf_h")]
+names(wtheta) = c("estimate","l","h")
+wtheta$var = "theta"
+wtheta$auxin = p_fits$auxin
+wtheta$strain = p_fits$strain
+p_fits_long = rbind(wscale,wshape,wtheta)
+p_fits_long$group = apply(p_fits_long,1,function(x)paste(x[["strain"]],x[["auxin"]]))
+
+ggplot(p_fits_long,aes(group,estimate,color= group,label=group))+geom_point()+
+  geom_errorbar(aes(ymin=l,ymax=h))+
+  #geom_label_repel()+
+  scale_y_continuous(trans="log")+facet_wrap(~var,scale="free")+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+wscale = p_fits[,c("weibull_scale","weibull_scale_95_conf_l","weibull_scale_95_conf_h")]
+names(wscale) = c("estimate","l","h")
+wscale$var = "scale"
+wscale$auxin = p_fits$auxin
+wscale$strain = p_fits$strain
+wshape = p_fits[,c("weibull_shape","weibull_shape_95_conf_l","weibull_shape_95_conf_h")]
+names(wshape) = c("estimate","l","h")
+wshape$var = "shape"
+wshape$auxin = p_fits$auxin
+wshape$strain = p_fits$strain
+p_fits_long = rbind(wscale,wshape)
+p_fits_long$group = apply(p_fits_long,1,function(x)paste(x[["strain"]],x[["auxin"]]))
+
+ggplot(p_fits_long,aes(group,estimate,color= group,label=group))+geom_point()+
+  geom_errorbar(aes(ymin=l,ymax=h))+
+  #geom_label_repel()+
+  scale_y_continuous(trans="log")+facet_wrap(~var,scale="free")+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+wscale = p_fits2[,c("weibull_gamma_frailty_scale","weibull_gamma_frailty_scale_95_conf_l","weibull_gamma_frailty_scale_95_conf_h")]
+names(wscale) = c("estimate","l","h")
+wscale$var = "scale"
+wscale$auxin = p_fits2$auxin
+wscale$strain = p_fits2$strain
+wshape = p_fits2[,c("weibull_gamma_frailty_shape","weibull_gamma_frailty_shape_95_conf_l","weibull_gamma_frailty_shape_95_conf_h")]
+names(wshape) = c("estimate","l","h")
+wshape$var = "shape"
+wshape$auxin = p_fits2$auxin
+wshape$strain = p_fits2$strain
+wtheta = p_fits2[,c("weibull_gamma_frailty_theta","weibull_gamma_frailty_theta_95_conf_l","weibull_gamma_frailty_theta_95_conf_h")]
+names(wtheta) = c("estimate","l","h")
+wtheta$var = "theta"
+wtheta$auxin = p_fits2$auxin
+wtheta$strain = p_fits2$strain
+p_fits_long2 = rbind(wscale,wshape,wtheta)
+p_fits_long2$group = apply(p_fits_long2,1,function(x)paste(x[["strain"]],x[["auxin"]]))
+
+ggplot(p_fits_long2,aes(group,estimate,color= group,label=group))+geom_point()+
+  geom_errorbar(aes(ymin=l,ymax=h))+
+  #geom_label_repel()+
+  scale_y_continuous(trans="log")+facet_wrap(~var,scale="free")+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+```{r}
+
+
+ to_calc = aft_results
+#plot aft residuals
+lapply(names(to_calc),function(cur_day){
+    print(cur_day)
+    lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      print(cur_RNAi)
+      flush.console()
+      dat = to_calc[[cur_day]][[cur_RNAi]]
+      browser()
+      dat$RNAi = factor(dat$RNAi)
+      dat$RNAi = relevel(dat$RNAi,ref="EV")
+      srv = Surv(dat$bj_residual,1-dat$Censored);
+      srvf = survfit(srv~dat$RNAi)
+      colors= c("black","red")
+      plot(srvf,col=colors)
+      legend("topright",names(srvf$strata),bty="n",col=colors,lty=1)
+    })
+})
+```
+
+
+#fit variance across all RNAis non-parametrically 
+```{r,fig.width=}
+SEPARATE_REPLICATES = T
+RECALC=F
+num_boot_reps = 250
+if(RECALC){
+library("boot")
+
+ st = function(d_all,x){
+   str = unique(d_all$RNAi)
+    res = lapply(str,function(strain){
+      d =  d_all[x,][RNAi==strain,] 
+      #print(strain)
+      #print(dim(d))
+      if (nrow(d) == 0){
+        browser()
+      }
+      surv= survfit(Surv(d$bj_residual,1-d$Censored)~d$RNAi)
+      mn = ns_survival_mean(surv);
+      deaths = d$bj_residual[d$Censored==0]
+      sum((deaths-mn)^2/length(deaths))
+    })
+    if (str[2] == "EV"){
+     v = c(res[[1]]/res[[2]])
+     names(v) = paste(str[1],"/",str[2])
+    }else{
+     v = c(res[[2]]/res[[1]])
+     names(v) = paste(str[2],"/",str[1])
+    }
+   #print(v)
+   v
+ }
+ to_calc = structured_aft_results
+run_boot=T
+ #to_calc = aft_residuals["mutant"];
+ #to_calc[["mutant"]] = aft_residuals[["mutant"]]["mig-6(sa580)"]
+res = rbindlist(lapply(rev(names(to_calc)),function(cur_day){
+    print(cur_day)
+    rbindlist(lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      if (SEPARATE_REPLICATES){
+        data_to_fit = to_calc[[cur_day]][[cur_RNAi]];
+      }else{
+        data_to_fit = list(all_reps = rbindlist(to_calc[[cur_day]][[cur_RNAi]]))
+        print(paste("Combining ",length(to_calc[[cur_day]][[cur_RNAi]]), "replicates into",length(data_to_fit)))
+      }
+      rbindlist(lapply(names(data_to_fit),function(cur_replicate){
+        print(cur_RNAi)
+        flush.console()
+        dat = data_to_fit[[cur_replicate]]
+        dat$RNAi = factor(dat$RNAi)
+        dat$RNAi = relevel(dat$RNAi,ref="EV")
+        srv = Surv(dat$bj_residual,1-dat$Censored);
+        srvf = survfit(srv~dat$RNAi)
+        colors= c("black","red")
+       # plot(srvf,col=colors)
+       # legend("topright",names(srvf$strata),bty="n",col=colors,lty=1)
+        
+        mn = st(dat,1:nrow(dat))[1] #mean value
+        if(run_boot){
+          res = boot(data=dat,strata=as.numeric(as.factor(dat$RNAi)),statistic=st,R=num_boot_reps)
+          r = boot.ci(boot.out = res,type="perc")$percent[4:5]
+        }else{
+         r = c(mn,mn)
+            
+        } 
+        data.frame(`mean`=mn,`ci.l` = r[1],`ci.u` = r[2],RNai=cur_RNAi,day=cur_day,rep=cur_replicate)
+    }))
+  }))
+}))
+if (SEPARATE_REPLICATES){
+  fwrite(res,"../figures/04/raw_variance_bootstrap_data.csv")
+}else{
+   fwrite(res,"../figures/04/raw_variance_bootstrap_data_grouped_replicates.csv")
+}
+}else{
+  if (SEPARATE_REPLICATES){
+res = fread("../figures/04/raw_variance_bootstrap_data.csv")
+}else{res = fread("../figures/04/raw_variance_bootstrap_data_grouped_replicates.csv")
+}
+}
+vals = aggregate(`ci.u`~RNai+day,res,FUN=max)
+to_use = aggregate(day~RNai,res,FUN=function(x)min((x)))
+vals = vals[apply(vals[,c("day","RNai")],1,FUN=function(x)paste(x[[1]],x[[2]])) %in% apply(to_use[,c("day","RNai")],1,FUN=function(x)paste(x[[1]],x[[2]])),]
+vals = vals[order(vals$day,vals$`ci.u`),]
+res$RNAi_factor = factor(res$RNai,levels=vals$RNai)
+res$sig = ifelse(res$`ci.u` < 1,"sig","nosig")
+colors = list(sig="red",nosig="black")
+g1=ggplot(res[day=="0"],aes(RNAi_factor,mean,color=sig)) + geom_point(size=2) + 
+  geom_errorbar(aes(ymin=ci.l,ymax=ci.u),width=.5) + 
+  geom_hline(yintercept=1,lty=2,col="dark gray") +  
+  theme(axis.text.x = element_text(face="italic",angle = 90, vjust = 1, hjust=1),legend.position="top")+scale_y_continuous(trans="log2") + ylab("Variance")+
+ # scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on lifespan")+
+  scale_y_continuous(trans="log2",breaks=c(seq(.2,1.2,by=.1),seq(1.5,2.5,by=.25)))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")+scale_color_manual(values=colors)+xlab("")+ylab("Relative Variance")
+g1
+g2=ggplot(res[day=="4"],aes(RNAi_factor,mean,color=sig)) + geom_point(size=2) + 
+  geom_errorbar(aes(ymin=ci.l,ymax=ci.u),width=.5) + 
+  geom_hline(yintercept=1,lty=2,col="dark gray") +  
+  theme(axis.text.x = element_text(face="italic",angle = 90, vjust = 1, hjust=1),legend.position="top")+scale_y_continuous(trans="log2") + ylab("Variance")+
+ # scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on lifespan")+
+  scale_y_continuous(trans="log2",breaks=c(seq(.2,1.2,by=.1),seq(1.5,2.5,by=.25)))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")+scale_color_manual(values=colors)+xlab("")+ylab("Relative Variance")
+g2
+
+suffix = ifelse(SEPARATE_REPLICATES,"","_grouped_replicates");
+#ggsave(paste0("../figures/04/survival_summary_combined_reps_day_0",suffix,".pdf"),g1,height=4,width=5.5)
+#ggsave(paste0("../figures/04/survival_summary_combined_reps_day_4",suffix,".pdf"),g2,height=4,width=5.5)
+
+```
+
+#fit variance across all RNAis non-parametrically  VMC
+```{r,fig.width=}
+SEPARATE_REPLICATES = F
+RECALC=F
+num_boot_reps = 250
+if(RECALC){
+library("boot")
+
+ st = function(d_all,x){
+   str = unique(d_all$RNAi)
+    res = lapply(str,function(strain){
+      d =  d_all[x,][RNAi==strain,] 
+      #print(strain)
+      #print(dim(d))
+      if (nrow(d) == 0){
+        browser()
+      }
+      surv= survfit(Surv(d$bj_residual,1-d$Censored)~d$RNAi)
+      mn = ns_survival_mean(surv);
+      deaths = d$bj_residual[d$Censored==0]
+      sum((deaths-mn)^2/length(deaths))
+    })
+    if (str[2] == "EV"){
+     v = c(res[[1]]/res[[2]])
+     names(v) = paste(str[1],"/",str[2])
+    }else{
+     v = c(res[[2]]/res[[1]])
+     names(v) = paste(str[2],"/",str[1])
+    }
+   #print(v)
+   v
+ }
+ to_calc = structured_aft_results_VMC
+run_boot=T
+ #to_calc = aft_residuals["mutant"];
+ #to_calc[["mutant"]] = aft_residuals[["mutant"]]["mig-6(sa580)"]
+res = rbindlist(lapply(rev(names(to_calc)),function(cur_day){
+    print(cur_day)
+    rbindlist(lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      if (SEPARATE_REPLICATES){
+        data_to_fit = to_calc[[cur_day]][[cur_RNAi]];
+      }else{
+        data_to_fit = list(all_reps = rbindlist(to_calc[[cur_day]][[cur_RNAi]]))
+        print(paste("Combining ",length(to_calc[[cur_day]][[cur_RNAi]]), "replicates into",length(data_to_fit)))
+      }
+      rbindlist(lapply(names(data_to_fit),function(cur_replicate){
+        print(cur_RNAi)
+        flush.console()
+        dat = data_to_fit[[cur_replicate]]
+        dat$RNAi = factor(dat$RNAi)
+        dat$RNAi = relevel(dat$RNAi,ref="EV")
+        srv = Surv(dat$bj_residual,1-dat$Censored);
+        srvf = survfit(srv~dat$RNAi)
+        colors= c("black","red")
+       # plot(srvf,col=colors)
+       # legend("topright",names(srvf$strata),bty="n",col=colors,lty=1)
+        
+        mn = st(dat,1:nrow(dat))[1] #mean value
+        if(run_boot){
+          res = boot(data=dat,strata=as.numeric(as.factor(dat$RNAi)),statistic=st,R=num_boot_reps)
+          r = boot.ci(boot.out = res,type="perc")$percent[4:5]
+        }else{
+         r = c(mn,mn)
+            
+        } 
+        data.frame(`mean`=mn,`ci.l` = r[1],`ci.u` = r[2],RNai=cur_RNAi,day=cur_day,rep=cur_replicate)
+    }))
+  }))
+}))
+if (SEPARATE_REPLICATES){
+  fwrite(res,"../figures/04/raw_variance_bootstrap_data_VMC.csv")
+}else{
+   fwrite(res,"../figures/04/raw_variance_bootstrap_data_grouped_replicates_VMC.csv")
+}
+}else{
+  if (SEPARATE_REPLICATES){
+res = fread("../figures/04/raw_variance_bootstrap_data_VMC.csv")
+}else{res = fread("../figures/04/raw_variance_bootstrap_data_grouped_replicates_VMC.csv")
+}
+}
+vals = aggregate(`ci.u`~RNai+day,res,FUN=max)
+to_use = aggregate(day~RNai,res,FUN=function(x)min((x)))
+vals = vals[apply(vals[,c("day","RNai")],1,FUN=function(x)paste(x[[1]],x[[2]])) %in% apply(to_use[,c("day","RNai")],1,FUN=function(x)paste(x[[1]],x[[2]])),]
+vals = vals[order(vals$day,vals$`ci.u`),]
+res$RNAi_factor = factor(res$RNai,levels=vals$RNai)
+res$sig = ifelse(res$`ci.u` < 1,"sig","nosig")
+colors = list(sig="red",nosig="black")
+g1=ggplot(res[day=="0"],aes(RNAi_factor,mean,color=sig)) + geom_point(size=2) + 
+  geom_errorbar(aes(ymin=ci.l,ymax=ci.u),width=.5) + 
+  geom_hline(yintercept=1,lty=2,col="dark gray") +  
+  theme(axis.text.x = element_text(face="italic",angle = 90, vjust = 1, hjust=1),legend.position="top")+scale_y_continuous(trans="log2") + ylab("Variance")+
+ # scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on lifespan")+
+  scale_y_continuous(trans="log2",breaks=c(seq(.2,1.2,by=.1),seq(1.5,2.5,by=.25)))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")+scale_color_manual(values=colors)+xlab("")+ylab("Relative Variance")
+g1
+g2=ggplot(res[day=="4"],aes(RNAi_factor,mean,color=sig)) + geom_point(size=2) + 
+  geom_errorbar(aes(ymin=ci.l,ymax=ci.u),width=.5) + 
+  geom_hline(yintercept=1,lty=2,col="dark gray") +  
+  theme(axis.text.x = element_text(face="italic",angle = 90, vjust = 1, hjust=1),legend.position="top")+scale_y_continuous(trans="log2") + ylab("Variance")+
+ # scale_x_continuous(breaks=break_info$x_position,labels=break_info$RNAi) + xlab("")+ylab("Effect on lifespan")+
+  scale_y_continuous(trans="log2",breaks=c(seq(.2,1.2,by=.1),seq(1.5,2.5,by=.25)))+
+   theme(axis.text.x = element_text(face="italic",angle = 45, vjust = 1, hjust=1),legend.position="none")+scale_color_manual(values=colors)+xlab("")+ylab("Relative Variance")
+g2
+
+suffix = ifelse(SEPARATE_REPLICATES,"","_grouped_replicates");
+ggsave(paste0("../figures/04/survival_summary_combined_reps_day_0",suffix,"_VMC.pdf"),g1,height=4,width=5.5)
+ggsave(paste0("../figures/04/survival_summary_combined_reps_day_4",suffix,"_VMC.pdf"),g2,height=4,width=5.5)
+
+```
+
+#Fit effect sizes using parametric method USING ABSOUTE TIME
+```{r}
+library(flexsurv)
+ min_mllogis_theta <<- .00000001;
+source("D:\\Dropbox (Personal)\\work\\data_analysis\\ns.survival.code\\R\\ns_mllogis2.r")
+
+to_calc = structured_aft_results
+param_fits = rbindlist(lapply(names(to_calc),function(cur_day){
+    print(cur_day)
+    rbindlist(lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      print(cur_RNAi)
+      flush.console()
+      dat = to_calc[[cur_day]][[cur_RNAi]]
+      dat$RNAi = factor(dat$RNAi)
+      dat$RNAi = relevel(dat$RNAi,ref="EV")
+    #surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+    # fit = ns_single_bj_group (surv~dat$Plate.Name)
+    # fit_2 = ns_single_bj_group (surv~dat$Strain_f)
+    # dat$bj_residual = fit$bj_residual
+      #res = flexsurvreg(Surv(dat$bj_residual,1-dat$Censored)~dat$Strain_f dat$Plate.Name+  shape(dat$Strain_f) + theta(dat$Strain_f),dist = custom.mllogis,method="Nelder-Mead")
+      if (unique(dat$Device) == "by_hand"){
+      res = flexsurvreg(Surv(dat$death,1-dat$Censored)~dat$RNAi+ shape(dat$RNAi) ,dist = custom.mllogis,method="Nelder-Mead")
+    coeffs = res$res
+      }else{
+          res = flexsurvreg(Surv(dat$death,1-dat$Censored)~dat$RNAi +dat$Device+  shape(dat$RNAi) ,dist = custom.mllogis,method="Nelder-Mead")
+    coeffs = res$res[!grepl("Device",rownames(res$res)),]
+      }
+    intercepts= data.frame(coeffs[1:3,])
+    intercepts$var = rownames(intercepts)
+    intercepts$type = "intercept"
+    effects= data.frame(coeffs[4:5,])
+    effects$var = c("scale","shape")
+    effects$type = "effect"
+    res2 = rbind(intercepts,effects)
+    res2$RNAi = cur_RNAi
+    res2$day = cur_day
+    rownames(res2) = NULL
+		res2
+}))
+}))
+if (0){
+param_fits_norm_time = rbindlist(lapply(names(to_calc),function(cur_day){
+    print(cur_day)
+    rbindlist(lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+      print(cur_RNAi)
+      flush.console()
+      dat = to_calc[[cur_day]][[cur_RNAi]]
+      dat$RNAi = factor(dat$RNAi)
+      dat$RNAi = relevel(dat$RNAi,ref="EV")
+    #surv= Surv(dat$Age.at.Death..d.,1-dat$Censored)
+    # fit = ns_single_bj_group (surv~dat$Plate.Name)
+    # fit_2 = ns_single_bj_group (surv~dat$Strain_f)
+    # dat$bj_residual = fit$bj_residual
+      #res = flexsurvreg(Surv(dat$bj_residual,1-dat$Censored)~dat$Strain_f dat$Plate.Name+  shape(dat$Strain_f) + theta(dat$Strain_f),dist = custom.mllogis,method="Nelder-Mead")
+    if (unique(dat$Device) == "by_hand"){
+      res = flexsurvreg(Surv(dat$bj_residual,1-dat$Censored)~dat$RNAi+ shape(dat$RNAi) ,dist = custom.mllogis,method="Nelder-Mead")
+    coeffs = res$res
+      }else{
+          res = flexsurvreg(Surv(dat$bj_residual,1-dat$Censored)~dat$RNAi +dat$Device+  shape(dat$RNAi) ,dist = custom.mllogis,method="Nelder-Mead")
+    coeffs = res$res[!grepl("Device",rownames(res$res)),]
+      }
+    intercepts= data.frame(coeffs[1:3,])
+    intercepts$var = rownames(intercepts)
+    intercepts$type = "intercept"
+    effects= data.frame(coeffs[4:5,])
+    effects$var = c("scale","shape")
+    effects$type = "effect"
+    res2 = rbind(intercepts,effects)
+    res2$RNAi = cur_RNAi
+    res2$day = cur_day
+    rownames(res2) = NULL
+		res2
+}))
+}))
+}
+```
+```{r}
+ggplot(param_fits[type=="effect" & var != "theta"],aes(RNAi,est)) + geom_point() + geom_errorbar(aes(ymin=L95.,ymax=U95.)) + facet_grid(var~day,scale="free_x",space="free")+geom_hline(yintercept=0,lty=2,col="dark gray")+
+  theme(axis.text.x = element_text(face="italic",angle = 90, vjust = 1, hjust=1),legend.position="none") 
+ggsave("../figures/04/S_additional_gene_parametric_fits.pdf",width=8,height=6)
+ggplot(param_fits_norm_time[type=="effect" & var != "theta"],aes(RNAi,est)) + geom_point() + geom_errorbar(aes(ymin=L95.,ymax=U95.)) + facet_grid(var~day,scale="free_x",space="free")+geom_hline(yintercept=0,lty=2,col="dark gray")+
+  theme(axis.text.x = element_text(face="italic",angle = 90, vjust = 1, hjust=1),legend.position="none") + ggtitle("On device-corrected AFT residuals")
+```
+
+
+```{r,fig.width=16,fig.height=8}
+layout(matrix(c(0,1,2,3,4,5,6,7,
+                0,8,9,10,11,12,13,14,
+                0,15,16,17,18,19,20,21,
+                0,22,23,24,25,26,27,27,
+                0,0,0,0,0,0,0,0),nrow=5,ncol=8,byrow=T))
+par(mai=c(0,0,.1,0)) 
+for(i in 1:2){
+  if (i == 2)
+    pdf("../figures/04
+  lapply(names(to_calc),function(cur_day){
+      print(cur_day)
+     lapply(names(to_calc[[cur_day]]),function(cur_RNAi){
+        # print(cur_RNAi)
+        #flush.console()
+        dat = to_calc[[cur_day]][[cur_RNAi]]
+        dat$RNAi = factor(dat$RNAi)
+        dat$RNAi = relevel(dat$RNAi,ref="EV")
+        res = survfit(Surv(dat$bj_residual,1-dat$Censored)~dat$RNAi)
+        colors=c("black","red")
+        plot(res,col=colors,bty="n",xlim=c(0,2.2))
+        legend("bottomleft",legend=c("EV",cur_RNAi),col=colors,lty=1,bty='n')
+  })
+  })
+}
+```
+

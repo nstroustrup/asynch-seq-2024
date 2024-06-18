@@ -1,0 +1,295 @@
+---
+title: "PCA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(Rtsne)
+
+dir.create("../figures/main_figure_2/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_2/", showWarnings = FALSE)
+
+theme_set(theme_cowplot())
+
+source("../scripts/helpers/preprocess.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load data
+
+```{r}
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+```
+
+
+```{r}
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+data <- c(data, setNames(bc$batch_counts_list, paste0("counts_", names(bc$batch_counts_list))))
+rm(bc)
+```
+
+```{r}
+counts_list <- data[grepl("counts", names(data))]
+counts_list <- counts_list[! sapply(counts_list, is.null)]
+
+norm_list <- lapply(counts_list, function(x) {
+  # filterGenes(x, data$annots[colnames(x)]$Group)
+  k <- normalizationFactor(x, groups = data$annots[colnames(x)]$Group)
+  normalizeCounts(x, k)
+})
+
+pca_list <- lapply(norm_list, function(norm) {
+  norm <- filterGenes(norm, min_count = 5, min_prop = 0.8)
+  pca <- prcomp(log(t(norm+1)), scale = TRUE, center = TRUE)
+  pca_df <- cbind(data$annots[colnames(norm), on = "Sample"], pca$x[, 1:2])
+  pca_df
+})
+```
+
+```{r}
+pw_da <- fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_pw.csv.gz")
+sw_da <- fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_sw.csv.gz")
+```
+
+## Compare mean pooled and single
+
+```{r}
+sw_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & NumberOfWorms == 1 & Genotype == "N2"]$Sample])
+pw_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & NumberOfWorms != 1 & Genotype == "N2"]$Sample])
+
+plot(sw_mu+1, pw_mu+1, log="xy", size = .5)
+abline(b=1, a=0)
+```
+
+```{r}
+sw_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & NumberOfWorms == 1 & Genotype == "daf-2(e1368)"]$Sample])
+pw_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & NumberOfWorms != 1 & Genotype == "daf-2(e1368)"]$Sample])
+
+plot(sw_mu+1, pw_mu+1, log="xy")
+abline(b=1, a=0)
+```
+
+```{r}
+br1_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & BiologicalReplicate == 1 & Genotype == "N2"]$Sample])
+br5_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & BiologicalReplicate == 5 & Genotype == "N2"]$Sample])
+
+plot(br1_mu+1, br5_mu+1, log="xy")
+abline(b=1, a=0)
+```
+
+```{r}
+br1_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & BiologicalReplicate == 1 & Genotype == "daf-2(e1368)"]$Sample])
+br5_mu <- rowMeans(norm_list$counts_d8_aw[, data$annots[Day == 8 & BiologicalReplicate == 5 & Genotype == "daf-2(e1368)"]$Sample])
+
+plot(br1_mu+1, br5_mu+1, log="xy")
+abline(b=1, a=0)
+```
+
+## All conditions
+
+### Day 1 N2
+
+```{r}
+br1_mu <- rowMeans(norm_list$counts_bd_sw[, data$annots[Day == 1 & BiologicalReplicate == 1 &
+                                                          Genotype == "N2" & NumberOfWorms == 1]$Sample])
+br5_mu <- rowMeans(norm_list$counts_bd_sw[, data$annots[Day == 1 & BiologicalReplicate == 5 & 
+                                                          Genotype == "N2" & NumberOfWorms == 1]$Sample])
+
+plot(br1_mu+1, br5_mu+1, log="xy")
+abline(b=1, a=0)
+```
+### Day 8 N2
+
+```{r}
+br1_mu <- rowMeans(norm_list$counts_bd_sw[, data$annots[Day == 8 & BiologicalReplicate == 1 & 
+                                                          Genotype == "N2" & NumberOfWorms == 1]$Sample])
+br5_mu <- rowMeans(norm_list$counts_bd_sw[, data$annots[Day == 8 & BiologicalReplicate == 5 & 
+                                                          Genotype == "N2" & NumberOfWorms == 1]$Sample])
+
+plot(br1_mu+1, br5_mu+1, log="xy")
+abline(b=1, a=0)
+```
+
+### Day 8 daf-2
+
+```{r}
+br1_mu <- rowMeans(norm_list$counts_bd_sw[, data$annots[Day == 8 & BiologicalReplicate == 1 & 
+                                                          Genotype == "daf-2(e1368)" & NumberOfWorms == 1]$Sample])
+br5_mu <- rowMeans(norm_list$counts_bd_sw[, data$annots[Day == 8 & BiologicalReplicate == 5 & 
+                                                          Genotype == "daf-2(e1368)" & NumberOfWorms == 1]$Sample])
+
+plot(br1_mu+1, br5_mu+1, log="xy")
+abline(b=1, a=0)
+```
+
+## Do all PCAs to check if batch correction is working
+
+```{r, fig.width=9, fig.height=8}
+for (i in names(pca_list)) {
+  pca_df <- copy(pca_list[[i]])
+  pca_df[, SingleWorm := NumberOfWorms == 1]
+  gp <- ggplot(pca_df, aes(PC1, PC2, color = BiologicalReplicate, shape = SingleWorm)) +
+    geom_point() +
+    facet_wrap(paste("Day", Day) ~ Genotype, scales = "free") +
+    ggtitle(i) +
+    theme(legend.position = "top") +
+    scale_shape_manual(values = c(16, 1))
+  plot(gp)
+}
+```
+
+## Single worm and pooled worm PCA
+
+```{r}
+nosel_counts <- counts_list$counts_d8_aw
+annots <- data$annots[colnames(nosel_counts)]
+nf <- normalizationFactor(nosel_counts, groups = annots$Group)
+
+sel_counts <- nosel_counts[sw_da[Strain_QZ120_vs_QZ0_padj < 1e-2]$GeneName, annots$Sample]
+
+nosel_norm <- normalizeCounts(nosel_counts, nf)
+sel_norm <- normalizeCounts(sel_counts, nf)
+
+nosel_lognorm <- scale(t(log(nosel_norm+1)))
+sel_lognorm <- scale(t(log(sel_norm+1)))
+
+pw_samples <- annots[NumberOfWorms != 1]$Sample
+sw_samples <- annots[NumberOfWorms == 1]$Sample
+```
+
+### Select genes
+
+#### Run PCA on pooled worms, and project single worms
+
+```{r}
+pca <- prcomp(sel_lognorm[pw_samples, ])
+pca_df <- cbind(annots, sel_lognorm %*% pca$rotation)
+varexp <- matrixStats::colVars(pca$x)
+
+ggplot(pca_df, aes(PC1, PC2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("Principal Component 1 (", round(100 * varexp[1]/sum(varexp), 1), "%)")) +
+  ylab(paste0("Principal Component 2 (", round(100 * varexp[2]/sum(varexp), 2), "%)"))
+ggsave("../figures/main_figure_2/pca_single_worm_day8_projection_from_pooled_worms.pdf", width = 7, height = 6)
+```
+
+#### Run PCA on single worms, and project pooled worms
+
+```{r}
+pca <- prcomp(sel_lognorm[sw_samples, ])
+pca_df <- cbind(annots, sel_lognorm %*% pca$rotation)
+varexp <- matrixStats::colVars(pca$x)
+
+ggplot(pca_df, aes(PC1, PC2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("Principal Component 1 (", round(100 * varexp[1]/sum(varexp), 1), "%)")) +
+  ylab(paste0("Principal Component 2 (", round(100 * varexp[2]/sum(varexp), 2), "%)"))
+ggsave("../figures/main_figure_2/pca_single_worm_day8_projection_from_single_worms.pdf", width = 7, height = 6)
+```
+
+#### Run PCA on all worms
+
+```{r}
+pca <- prcomp(sel_lognorm)
+pca_df <- cbind(annots, pca$x[, 1:2])
+varexp <- pca$sdev^2
+
+ggplot(pca_df, aes(PC1, PC2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("Principal Component 1 (", round(100 * varexp[1]/sum(varexp), 1), "%)")) +
+  ylab(paste0("Principal Component 2 (", round(100 * varexp[2]/sum(varexp), 2), "%)"))
+ggsave("../figures/sup_figure_2/pca_single_worm_day8_all_samples.pdf", width = 7, height = 6)
+```
+
+#### Run t-SNE on all worms
+
+```{r}
+tsne_out <- Rtsne(sel_lognorm, k = 2, perplexity = 50, theta = 0, initial_dims = 50, max_iter = 10000)
+tsne_df <- cbind(annots, tsne_out$Y[, 1:2])
+
+ggplot(tsne_df, aes(V1, V2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("t-SNE Dimension 1")) +
+  ylab(paste0("t-SNE Dimension 2"))
+ggsave("../figures/sup_figure_2/tsne_single_worm_day8_all_samples.pdf", width = 7, height = 6)
+```
+
+### No selection of genes
+
+#### Run PCA on pooled worms, and project single worms
+
+```{r}
+pca <- prcomp(nosel_lognorm[pw_samples, ])
+pca_df <- cbind(annots, nosel_lognorm %*% pca$rotation)
+varexp <- matrixStats::colVars(pca$x)
+
+ggplot(pca_df, aes(PC1, PC2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("Principal Component 1 (", round(100 * varexp[1]/sum(varexp), 1), "%)")) +
+  ylab(paste0("Principal Component 2 (", round(100 * varexp[2]/sum(varexp), 2), "%)"))
+ggsave("../figures/sup_figure_2/pca_single_worm_day8_projection_from_pooled_worms_all_genes.pdf", width = 7, height = 6)
+```
+
+#### Run PCA on single worms, and project pooled worms
+
+```{r}
+pca <- prcomp(nosel_lognorm[sw_samples, ])
+pca_df <- cbind(annots, nosel_lognorm %*% pca$rotation)
+pca_df[, SingleWorm := NumberOfWorms == 1]
+varexp <- matrixStats::colVars(pca$x)
+
+ggplot(pca_df, aes(PC1, PC2, color = Genotype, size =SingleWorm)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  geom_point(data = pca_df[SingleWorm == TRUE, .(PC1 = mean(PC1), PC2 = mean(PC2)), by = .(Genotype)], pch = 1, size = 4) + 
+  xlab(paste0("Principal Component 1 (", round(100 * varexp[1]/sum(varexp), 1), "%)")) +
+  ylab(paste0("Principal Component 2 (", round(100 * varexp[2]/sum(varexp), 2), "%)"))
+ggsave("../figures/sup_figure_2/pca_single_worm_day8_projection_from_single_worms_all_genes_with_mean.pdf", width = 7, height = 6)
+```
+
+#### Run PCA on all worms
+
+```{r}
+pca <- prcomp(nosel_lognorm)
+pca_df <- cbind(annots, pca$x[, 1:2])
+varexp <- pca$sdev^2
+
+ggplot(pca_df, aes(PC1, PC2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("Principal Component 1 (", round(100 * varexp[1]/sum(varexp), 1), "%)")) +
+  ylab(paste0("Principal Component 2 (", round(100 * varexp[2]/sum(varexp), 2), "%)"))
+ggsave("../figures/sup_figure_2/pca_single_worm_day8_all_samples_all_genes.pdf", width = 7, height = 6)
+```
+
+#### Run t-SNE on all worms
+
+```{r}
+tsne_out <- Rtsne(nosel_lognorm, k = 2, perplexity = 50, theta = 0, initial_dims = 50, max_iter = 10000)
+tsne_df <- cbind(annots, tsne_out$Y[, 1:2])
+
+ggplot(tsne_df, aes(V1, V2, color = Genotype, size = NumberOfWorms == 1)) +
+  geom_point() +
+  scale_color_manual(values = genotype_colors) +
+  scale_size_manual(values = c(1.7, .5), name = "Number of Worms", labels = c("Pooled", "Single")) + 
+  xlab(paste0("t-SNE Dimension 1")) +
+  ylab(paste0("t-SNE Dimension 2"))
+ggsave("../figures/sup_figure_2/tsne_single_worm_day8_all_samples_all_genes.pdf", width = 7, height = 6)
+```

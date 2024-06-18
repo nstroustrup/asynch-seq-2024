@@ -1,0 +1,1454 @@
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(BASiCS)
+library(dendextend)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+require(scales)
+library(RColorBrewer)
+library(gridExtra)
+library(qs)
+theme_set(theme_cowplot())
+
+dir.create("../figures/main_figure_3/", showWarnings = FALSE)
+dir.create("../figures/main_figure_4/", showWarnings = FALSE)
+dir.create("../figures/main_figure_7/", showWarnings = FALSE)
+
+dir.create("../figures/sup_figure_3/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_4/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_7/", showWarnings = FALSE)
+
+source("../scripts/notebooks_helpers/gene_variability.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/basics.R")
+source("../scripts/helpers/clustering.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/notebooks_helpers/gene_network.R")
+source("../scripts/helpers/heatmap.R")
+
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+
+#BiocManager::install("fCCAC")
+
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-4 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+cluster_colors <- c("firebrick", "sienna1", "cornflowerblue", "darkorchid", "black")
+```
+
+## Load data
+
+### Gene names
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+
+
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+
+if (0){
+to_remove = c("WBGene00006434", #also expressed in gut
+            "WBGene00010131",   #also expressed in pharynx
+            "WBGene00012463", #also expressed in neurons
+            "WBGene00021114",#expressed in multiple tissues
+            "WBGene00016977",#gonad and neurons
+            "WBGene00011128",#intestine and neurons
+            "WBGene00010130",#excretory cell and intestine
+            "WBGene00006918",#excretory cell and intestine
+            "WBGene00013025",#excretory cell and intestine
+            "WBGene00010911",#also in neurons
+            "WBGene00010756",#also in body wall muscle
+            "WBGene00013127",#also in germline
+            "WBGene00004930",#also coelomocytes
+            "WBGene00011172",#and neuron
+            "WBGene00013926",#and neuron
+            "WBGene00002130",#also in germline
+            "WBGene00001130",#also intestine
+            "WBGene00001480",#also in neurons
+            "WBGene00002106", #also in germline
+            "WBGene00006919", #also in neurons,
+            "WBGene00007924", #also distal tip cell
+            "WBGene00009349", #also in neurons and embryos
+            "WBGene00009724", #also in neurons
+            "WBGene00010681", #also in muscle
+            "WBGene00010759", #also pharynx
+            "WBGene00012107", #also germline precursor cell
+            "WBGene00012592", #also germline
+            "WBGene00012592", #also germline
+            "WBGene00013008", #also in neurons
+            "WBGene00020209", #also seam cells
+            "WBGene00000176"#also in germline
+);
+tissues_df = tissues_df[!tissues_df$GeneName %in% to_remove];
+fwrite(tissues_df,"../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz", 
+       row.names = FALSE, quote = FALSE)
+}
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+### Set up model comparison structures to guide analysis
+
+
+
+
+```{r}
+if (0){#calculate correlation matricies
+filter_tissue_rho_list <- lapply(filter_tissue_norm_list, function(x) lapply(x,function(y)cor(t(y), method = "s")))
+names(filter_tissue_rho_list)= names(filter_tissue_norm_list)
+
+filter_tissue_combined_rho_list <- lapply(filter_tissue_norm_list, function(x){ 
+                                          y = do.call("cbind",x);
+                                          cor(t(y), method = "s")})
+names(filter_tissue_combined_rho_list)= names(filter_tissue_norm_list)
+}
+```
+
+#load community data
+```{r}
+#community_info = readRDS("../data/gene_network/model_specific_community_info.rds")
+#merged_community_info = readRDS("../data/gene_network/global_community_info.rds")
+
+community_membership = fread("../data/gene_network/model_specific_community_membership_core_genes.csv")
+merged_community_membership = fread("../data/gene_network/global_community_membership_core_genes.csv")
+
+community_networks = qread(("../data/gene_network/community_networks.qs"))
+filter_tissue_rho_list =community_networks[["filter_tissue_rho_list"]]
+community_info = community_networks[["community_info"]]
+merged_community_info = community_networks[["merged_community_info"]]
+rm(community_networks)
+gc()
+```
+
+#load tissue_specific community data
+```{r}
+#community_info = readRDS("../data/gene_network/model_specific_community_info.rds")
+#merged_community_info = readRDS("../data/gene_network/global_community_info.rds")
+
+community_membership_tissue_specific = fread("../data/gene_network/model_specific_community_membership_core_genes_tissue_specific.csv")
+merged_community_membership_tissue_specific = fread("../data/gene_network/global_community_membership_core_genes_tissue_specific.csv")
+
+community_networks_tissue_specific = qread(("../data/gene_network/community_networks_tissue_specific.qs"))
+filter_tissue_rho_list_tissue_specific =community_networks_tissue_specific[["filter_tissue_rho_list"]]
+community_info_tissue_specific = community_networks_tissue_specific[["community_info"]]
+merged_community_info_tissue_specific = community_networks_tissue_specific[["merged_community_info"]]
+#qsave(community_networks_tissue_specific, "../data/gene_network/community_networks_tissue_specific.qs",preset = "archive")
+rm(community_networks_tissue_specific)
+
+gc()
+```
+
+```{r}
+mean_and_variance_lookup = data.table(group = unique(merged_community_membership$group))
+mean_and_variance_lookup$source_file = mean_and_variance_lookup$group;
+mean_and_variance_lookup[group=="d8_n2_da_nlp28",source_file := "d8_sw"] 
+mean_and_variance_lookup[group=="d1_n2_da_atp5",source_file := "d1_sw"] 
+mean_and_variance_lookup[group=="d1_n2_da_atp5",source_file := "d1_sw"] 
+mean_and_variance_lookup[grepl("n2_series",group),source_file := "n2_series"] 
+mean_and_variance_lookup[group=="d1_20v25C",source_file := NA]   #temporary until job runs
+setkey(mean_and_variance_lookup,group)
+```
+
+
+```{r,fig.width=15,fig.height=5}
+if (0){
+#load differential_expression_data
+da <- rbindlist(lapply(rev(names(community_info)), function(filename) {
+  
+  fname = mean_and_variance_lookup[filename,source_file]
+  if (is.na(fname))return(NULL)
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", fname,".csv.gz"))
+ 
+  prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+  prefix = substring(names(df)[3],0,prefix_N-2)
+  names(df)[3:6] = paste0(substring(names(df)[3:6],prefix_N),"_mean")
+ 
+  df$comparison = prefix;
+  df$group = filename;
+  print(paste(filename,nrow(df),ncol(df)))
+  df_mean = df[, .(GeneName,GeneSymbol,log2FoldChange_mean,pvalue_mean,padj_mean,comparison,group)]
+  
+  fname2 = paste0("../data/gene_variability/regression_effects_",fname,"_shared_tech.csv.gz")
+  df <- fread(fname2)
+
+  prefix_N = gregexpr("logFold",names(df)[7])[[1]][[1]];
+  prefix = substring(names(df)[7],0,prefix_N-2)
+  names(df)[7:10] = paste0(substring(names(df)[7:10],prefix_N),"_overdispersion")
+  df_overdispersion = df[, .(GeneName,logFoldChange_overdispersion,pvalue_overdispersion,padj_overdispersion)]
+  merge(df_mean,df_overdispersion,by="GeneName")
+}))
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+if (1){
+#plot correlation matrix with communities highlight overlaid SORTED BY COMMUNITY
+coexp_ID_from_number = function(i){
+  sapply(i,function(x){ifelse(x<10,paste0("G0",x),paste0("G",x))})
+}
+
+plot_genes_outside_groups = F
+source("../scripts/helpers/heatmap.r")
+
+library(RColorBrewer)
+communities_to_plot = merged_community_info
+to_plot = names(communities_to_plot)
+to_plot = c("daf2_sw")
+#to_plot = c("d8_glp1_da_nlp28")
+#to_plot = "n2_sw"
+gp = lapply(to_plot,function(cur_group){
+  subgroup_to_plot = subgroups = unique(community_membership[group==cur_group,fit_subgroup])
+  print(cur_group)
+     
+     
+     
+      rho_1 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[1]]] 
+      rho_2 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[2]]] 
+      if (!plot_genes_outside_groups){
+        all_genes_in_any_community = do.call("c",sapply(communities_to_plot[[cur_group]],function(x)x$all_genes))
+        genes_to_plot = rownames(rho_1) %in% all_genes_in_any_community
+        
+        rho_1 = rho_1[genes_to_plot,genes_to_plot]
+        rho_2 = rho_2[genes_to_plot,genes_to_plot]
+      }
+    
+      
+      #we now load the genes in each coexpression group across the two subgroups fit
+      coexpression_groups_for_each_gene = lapply(subgroups,rho_1,FUN=function(cur_fit_subgroup,rho_1){
+    
+        gene_groups = rbindlist(lapply(1:length(communities_to_plot[[cur_group]]),function(i){
+          com = communities_to_plot[[cur_group]][[i]];
+          sg = com$source_gene_info$GeneName[com$source_gene_info$fit_subgroup == cur_fit_subgroup]
+          if (length(sg) > 0){
+            return(data.frame(GeneName = sg, group=rep(i,length(sg))));
+          }else return(data.frame(GeneName = NA,group=NA))
+          
+        }
+        ))
+        gene_groups = gene_groups[!is.na(gene_groups$GeneName),]
+          
+        #Genes can appear in multiple groups.  We assign multi-mapped genes to the largest group of which they are a member (the lowest group ID) 
+        gene_labels = data.table(GeneName=rownames(rho_1)); 
+       # if(!("GeneName" %in% names(gene_groups)))browser()
+        val = aggregate(group~GeneName,gene_groups,FUN=function(x)min(x))
+        names(val) = c("GeneName","group")
+      
+        val$group = coexp_ID_from_number(val$group)
+        gene_labels = merge(gene_labels,val,by="GeneName",all.x=T)
+     
+        gene_labels$group[is.na(gene_labels$group)] = "NG"
+        setkey(gene_labels,GeneName)
+        
+        gene_labels 
+      })
+      names(coexpression_groups_for_each_gene) = subgroups;
+
+      
+   
+      
+      
+      
+      if (is.null(rho_1) || is.null(rho_2)) browser()
+      
+      #prepare list with which to split heatmaps into co-expression groups
+      gene_split = lapply(subgroups,function(subgroup){
+        grps = unique(coexpression_groups_for_each_gene[[subgroup]]$group)
+        res = lapply(grps,function(x){
+          gene_list = coexpression_groups_for_each_gene[[subgroup]];
+          gene_list$GeneName[gene_list$group==x & gene_list$GeneName %in% rownames(rho_1)]
+        })
+        names(res) = grps;
+        res
+        })
+      names(gene_split) = subgroups;
+      
+      setkey(tissues_df,GeneName)
+      tissue_split = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+      names(tissue_split) = unique(tissues)
+   
+       #prepare colors--we want each coexpression group to get its own color across the two subgroups fit
+       colors = c(brewer.pal(12,"Paired"),brewer.pal(12,"Set3"))
+       colors = c(colors,colors)
+
+       colors = colors[1:(length(gene_split[[subgroup_to_plot[[1]]]])+length(gene_split[[subgroup_to_plot[[2]]]]))]
+       subgroup_1_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[1]]]]),2,4)
+       subgroup_2_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[2]]]]),2,4)
+       
+       subgroup_1_coexpression_groups = as.integer(subgroup_1_coexpression_groups[subgroup_1_coexpression_groups!="G"])
+       subgroup_2_coexpression_groups = as.integer(subgroup_2_coexpression_groups[subgroup_2_coexpression_groups!="G"])
+       
+       if ("NG" %in% c(names(gene_split[[subgroup_to_plot[[1]]]]),names(gene_split[[subgroup_to_plot[[2]]]]))){
+        colors_1 = c("black",colors[subgroup_1_coexpression_groups])
+        colors_2 = c("black",colors[subgroup_2_coexpression_groups])
+       }else{
+        colors_1 = c(colors[subgroup_1_coexpression_groups])
+        colors_2 = c(colors[subgroup_2_coexpression_groups])
+      }
+       #browser()
+    separate_plots = F
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                          gene_labels_1=coexpression_groups_for_each_gene[[subgroup_to_plot[[1]]]][rownames(rho_1),]$group,
+                                          gene_labels_2=coexpression_groups_for_each_gene[[subgroup_to_plot[[2]]]][rownames(rho_2),]$group,
+                                          #split_list_1=tissue_split, 
+                                          #split_list_2=tissue_split, 
+                                          #split_colors_1 = tissue_colors,
+                                          #split_colors_2 = tissue_colors,
+                                          split_list_1=gene_split[[subgroup_to_plot[[1]]]],
+                                          split_list_2=gene_split[[subgroup_to_plot[[2]]]],
+                                          split_colors_1 = colors_1,
+                                          split_colors_2 = colors_2,
+                                          show_dendrogram=F,
+                                          separate_plots=separate_plots,)
+       
+       for (i in 1:2){
+         if (i == 1)
+         pdf(paste0("../figures/communities/coex_group_heatmap_",cur_group,".pdf"),width = 18, height = 15)
+       if (!separate_plots){
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(cur_group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(cur_group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+        }else draw(gp);
+         if (i == 1)
+           dev.off()
+       }
+   })
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+if(1){
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE (only show tissue-specific)
+
+coexp_ID_from_number = function(i){
+  sapply(i,function(x){ifelse(x<10,paste0("G0",x),paste0("G",x))})
+}
+
+plot_genes_outside_groups = F
+source("../scripts/helpers/heatmap.r")
+library(RColorBrewer)
+communities_to_plot = merged_community_info
+to_plot = names(communities_to_plot);
+to_plot = "d8_sw"
+
+include_only_group_members=F
+include_only_tissue_specific=T
+gp = lapply(to_plot,function(cur_group){
+  subgroup_to_plot = subgroups = names(filter_tissue_rho_list[[cur_group]])
+     print(cur_group)
+     
+     
+     
+      rho_1 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[1]]] 
+      rho_2 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[2]]] 
+      if (!plot_genes_outside_groups){
+        all_genes_in_any_community = do.call("c",sapply(communities_to_plot[[1]],function(x)x$all_genes))
+        if (include_only_group_members){
+          genes_to_plot = rownames(rho_1)[rownames(rho_1) %in% all_genes_in_any_community]
+        }else genes_to_plot = rownames(rho_1) ;
+        if (include_only_tissue_specific)
+          genes_to_plot = genes_to_plot[genes_to_plot %in% tissues_df$GeneName]
+        rho_1 = rho_1[genes_to_plot,genes_to_plot]
+        rho_2 = rho_2[genes_to_plot,genes_to_plot]
+      }
+    
+      
+      #we now load the genes in each coexpression group across the two subgroups fit
+      coexpression_groups_for_each_gene = lapply(subgroups,rho_1,FUN=function(cur_fit_subgroup,rho_1){
+    
+        gene_groups = rbindlist(lapply(1:length(communities_to_plot[[cur_group]]),function(i){
+          com = communities_to_plot[[cur_group]][[i]];
+          sg = com$source_gene_info$GeneName[com$source_gene_info$fit_subgroup == cur_fit_subgroup]
+          if (length(sg) > 0){
+            return(data.frame(GeneName = sg, group=rep(i,length(sg))));
+          }else return(data.frame(GeneName = NA,group=NA))
+          
+        }
+        ))
+        gene_groups = gene_groups[!is.na(gene_groups$GeneName),]
+          
+        #Genes can appear in multiple groups.  We assign multi-mapped genes to the largest group of which they are a member (the lowest group ID) 
+        gene_labels = data.table(GeneName=rownames(rho_1)); 
+       # if(!("GeneName" %in% names(gene_groups)))browser()
+        val = aggregate(group~GeneName,gene_groups,FUN=function(x)min(x))
+        names(val) = c("GeneName","group")
+      
+        val$group = coexp_ID_from_number(val$group)
+        gene_labels = merge(gene_labels,val,by="GeneName",all.x=T)
+     
+        gene_labels$group[is.na(gene_labels$group)] = "NG"
+        setkey(gene_labels,GeneName)
+        
+        gene_labels 
+      })
+      names(coexpression_groups_for_each_gene) = subgroups;
+
+      
+      
+      
+      if (is.null(rho_1) || is.null(rho_2)) browser()
+      
+      #prepare list with which to split heatmaps into co-expression groups
+      gene_split = lapply(subgroups,function(subgroup){
+        grps = unique(coexpression_groups_for_each_gene[[subgroup]]$group)
+        res = lapply(grps,function(x){
+          gene_list = coexpression_groups_for_each_gene[[subgroup]];
+          gene_list$GeneName[gene_list$group==x & gene_list$GeneName %in% rownames(rho_1)]
+        })
+        names(res) = grps;
+        res
+        })
+      names(gene_split) = subgroups;
+      
+      setkey(tissues_df,GeneName)
+      tissue_split = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+      names(tissue_split) = unique(tissues)
+      
+   
+       #prepare colors--we want each coexpression group to get its own color across the two subgroups fit
+       colors = c(brewer.pal(12,"Paired"),brewer.pal(12,"Set3"))
+       colors = c(colors,colors)
+
+       colors = colors[1:(length(gene_split[[subgroup_to_plot[[1]]]])+length(gene_split[[subgroup_to_plot[[2]]]]))]
+       subgroup_1_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[1]]]]),2,4)
+       subgroup_2_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[2]]]]),2,4)
+       
+       subgroup_1_coexpression_groups = as.integer(subgroup_1_coexpression_groups[subgroup_1_coexpression_groups!="G"])
+       subgroup_2_coexpression_groups = as.integer(subgroup_2_coexpression_groups[subgroup_2_coexpression_groups!="G"])
+       
+       if ("NG" %in% c(names(gene_split[[subgroup_to_plot[[1]]]]),names(gene_split[[subgroup_to_plot[[2]]]]))){
+        colors_1 = c("black",colors[subgroup_1_coexpression_groups])
+        colors_2 = c("black",colors[subgroup_2_coexpression_groups])
+       }else{
+        colors_1 = c(colors[subgroup_1_coexpression_groups])
+        colors_2 = c(colors[subgroup_2_coexpression_groups])
+      }
+       #browser()
+    separate_plots = F
+   
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                         # gene_labels_1=coexpression_groups_for_each_gene[[subgroup_to_plot[[1]]]][rownames(rho_1),]$group,
+                                         # gene_labels_2=coexpression_groups_for_each_gene[[subgroup_to_plot[[2]]]][rownames(rho_2),]$group,
+                                          split_list_1=tissue_split, 
+                                          split_list_2=tissue_split, 
+                                          #split_colors_1 = tissue_colors,
+                                          #split_colors_2 = tissue_colors,
+                                         #split_list_1=gene_split[[subgroup_to_plot[[1]]]],
+                                         # split_list_2=gene_split[[subgroup_to_plot[[2]]]],
+                                          split_colors_1 = colors_1,
+                                          split_colors_2 = colors_2,
+                                          show_dendrogram=F,beta=1,
+                                          separate_plots=separate_plots,border=T)
+       if (!separate_plots){
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(cur_group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(cur_group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+        }else draw(gp);
+      
+   })
+}
+```
+```{r}
+ rho_1 = filter_tissue_rho_list[["d8_sw"]][["QZ120"]] 
+measured_genes = rownames(rho_1)
+germline_genes = intersect(tissues_df[Tissue=="germ_line",GeneName],measured_genes);
+somatic_genes = intersect(tissues_df[Tissue!="germ_line",GeneName],measured_genes)
+
+gs_cor = rho_1[somatic_genes,germline_genes]
+gs_cor_mean = apply(gs_cor,1,median)
+plot(hist(gs_cor_mean))
+ht = gs_cor_mean[gs_cor_mean>=.1]
+setkey(geneid,GeneName)
+setkey(tissues_df,GeneName)
+res = data.frame(GeneName=names(ht),val=ht,GeneSymbol=geneid[names(ht),GeneSymbol],tissue=tissues_df[names(ht),Tissue])
+res
+```
+
+
+```{r}
+
+load_from_disk = T
+if (!load_from_disk){
+#calcualte the changes in communities produced by each intervention
+coexp_ID_from_number = function(i){
+  sapply(i,function(x){ifelse(x<10,paste0("G0",x),paste0("G",x))})
+}
+correlation_change_across_interventions = list()
+for (source_type in c("merged","not_merged")){
+  print(source_type)
+  com_info = community_info;
+  if (source_type == "merged")
+    com_info = merged_community_info;
+  
+  #look at covariance of the population in respect to each community group
+  community_gene_correlations = list();
+  to_fit = names(com_info);
+  #we calculate the change in correlation strength betwen subgroups
+  correlation_change_across_interventions[[source_type]] = rbindlist(lapply(to_fit,function(cur_group){
+    print(cur_group)
+    community_names = names(com_info[[cur_group]]);
+   
+    subgroups_to_characterize = unique(community_membership[group==cur_group,fit_subgroup])
+    #browser()
+    genes_in_any_community = do.call("c",lapply(community_names,function(x)com_info[[cur_group]][[x]]$all_genes))
+    
+    #estimate the correlation among genes inside each community and between community members and all genes
+    per_gene_community_correlation = rbindlist(lapply(community_names,function(community_name){
+      genes_in_community = com_info[[cur_group]][[community_name]]$all_genes;
+      #calculate per-gene correlation
+      res = rbindlist(lapply(subgroups_to_characterize,function(subgroup_2){
+       
+         per_gene_correl_community = filter_tissue_rho_list[[cur_group]][[subgroup_2]][genes_in_community,genes_in_community] 
+         per_gene_correl_all = filter_tissue_rho_list[[cur_group]][[subgroup_2]][genes_in_community,]
+         
+         per_gene_correl_community =  apply(abs(per_gene_correl_community),1,function(x)mean(x[!is.na(x)]))
+         per_gene_correl_all = apply(abs(per_gene_correl_all),1,function(x)mean(x[!is.na(x)]))
+        
+         res = data.frame(GeneName = genes_in_community, 
+                          per_gene_correlation=per_gene_correl_community,
+                          per_gene_correl_all=per_gene_correl_all)
+      
+         res$community=community_name
+         res$subgroup = subgroup_2;
+         res$fit_subgroup = com_info[[cur_group]][[community_name]]$fit_subgroup
+         res
+      }))
+      res;
+    }))
+       
+     
+     #estimate fold change in correlation across subgroups for each community
+     stats = rbindlist(lapply(community_names,function(cur_community){
+          dat = per_gene_community_correlation[per_gene_community_correlation$community == cur_community,];
+         print(cur_community)
+          rbindlist(lapply(unique(dat$fit_subgroup),function(sub2){
+              dat2 = dat[dat$fit_subgroup == sub2,];
+            if (any(is.infinite(dat2$per_gene_correlation)))
+              browser()
+            if (length(unique(dat2$subgroup))<2)
+                browser()
+            dat2$subgroup = factor(dat2$subgroup)
+                print(sub2)
+            fit_community = glm(per_gene_correlation~subgroup,dat2,family=gaussian(link="log"))
+            fit_community_s = summary(fit_community)
+            fit_all = glm(per_gene_correl_all~subgroup,dat2,family=gaussian(link="log"))
+            fit_all_s = summary(fit_all)
+          #  browser()
+            cf = data.frame(community_est = exp(coef(fit_community_s)[2,"Estimate"]),
+                            community_stderr =exp(coef(fit_community_s)[2,"Std. Error"]),
+                            community_pvalue=coef(fit_community_s)[2,"Pr(>|t|)"],
+                            community_intercept = exp(coef(fit_community_s)[1,"Estimate"]),
+                            community_intercept_stderr =exp(coef(fit_community_s)[1,"Std. Error"]),
+                            community_group_1_mean = mean(dat2$per_gene_correlation[dat2$subgroup == levels(dat2$subgroup)[1]]),
+                            community_group_2_mean = mean(dat2$per_gene_correlation[dat2$subgroup == levels(dat2$subgroup)[2]]),
+                            all_est = exp(coef(fit_all_s)[2,"Estimate"]),
+                            all_stderr =exp(coef(fit_all_s)[2,"Std. Error"]),
+                            all_pvalue=coef(fit_all_s)[2,"Pr(>|t|)"],
+                            all_intercept = exp(coef(fit_community_s)[1,"Estimate"]),
+                            all_intercept_stderr =exp(coef(fit_community_s)[1,"Std. Error"]),
+                            all_group_1_mean = mean(dat2$per_gene_correl_all[dat2$subgroup == dat2$subgroup[1]]),
+                            all_group_2_mean = mean(dat2$per_gene_correl_all[dat2$subgroup == dat2$subgroup[2]]),
+                            group_1=levels(dat2$subgroup)[1],
+                            group_2=levels(dat2$subgroup)[2],
+                            gene_N=length(which(dat2$subgroup == levels(dat2$subgroup)[1])),
+                            fit_subgroup=sub2,
+                            community=cur_community,
+                            group=cur_group)
+         }))
+     }))
+     
+      #assign names in descending order of gene membership
+      stats = stats[order(stats$gene_N,decreasing=T),]
+      stats$coexp_group_name =  apply(stats,1,function(x)paste(x[["fit_subgroup"]],x[["community"]]))
+      stats$coexp_group_name = factor( stats$coexp_group_name,levels= stats$coexp_group_name)
+      stats$coexp_group_ID = coexp_ID_from_number(as.integer(stats$coexp_group_name))
+      
+      per_gene_community_correlation$coexp_group_name = apply(per_gene_community_correlation,1,function(x)paste(x[["fit_subgroup"]],x[["community"]]))
+      per_gene_community_correlation$coexp_group_name = factor(per_gene_community_correlation$coexp_group_name,levels=as.character(stats$coexp_group_name))
+      per_gene_community_correlation$coexp_group_ID = coexp_ID_from_number(as.integer(per_gene_community_correlation$coexp_group_name))
+      
+      #convert to characters so we can combine tables without problem
+      stats$coexp_group_name = as.character(stats$coexp_group_name );
+      per_gene_community_correlation$coexp_group_name = as.character(per_gene_community_correlation$coexp_group_name );
+      
+      community_gene_correlations[[cur_group]] <<- per_gene_community_correlation;
+      stats;
+  }))
+}
+
+d1 = correlation_change_across_interventions[["merged"]]
+d1$group_type = "merged"
+d2 = correlation_change_across_interventions[["not_merged"]]
+d2$group_type = "not_merged"
+correlation_change_across_interventions_merged = rbind(d1,d2)
+write.csv(correlation_change_across_interventions_merged,"../data/gene_network/correlation_change_across_interventions.csv")
+}else{
+  correlation_change_across_interventions_merged = fread("../data/gene_network/correlation_change_across_interventions.csv")
+  }
+```
+
+```{r,fig.width=16,fig.height=4}
+gb = correlation_change_across_interventions_merged[group_type=="merged" & group %in% c("d8_glp1","d8_glp1_da_nlp28"),]
+ggplot(gb,aes(community,1/community_est,color=group)) + geom_point() + scale_y_log10() +ylab("Effect of glp-1 on community")
+gb = correlation_change_across_interventions_merged[group_type=="merged" & group %in% c("d8_glp1","d8_glp1_da_atp5"),]
+ggplot(gb,aes(community,1/community_est,color=group)) + geom_point()  + scale_y_log10() +ylab("Effect of glp-1 on community")
+gb = correlation_change_across_interventions_merged[group_type=="merged" & group %in% c("d8_glp1","d8_glp1_da_d8_glp1"),]
+ggplot(gb,aes(community,1/community_est,color=group)) + geom_point()  + scale_y_log10() +ylab("Effect of glp-1 on community")
+
+
+
+```
+
+```{r}
+source("../scripts/helpers/heatmap.R")
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue = function(cur_group,genes_to_plot,border=F,explicit_subgroups=NULL,rho_to_use = filter_tissue_rho_list){
+  if (is.null(explicit_subgroups)){
+    subgroup_to_plot = subgroups = names(filter_tissue_rho_list[[cur_group]])
+  }else subgroup_to_plot = subgroups = explicit_subgroups
+  
+  
+      rho_1 = rho_to_use[[cur_group]][[subgroup_to_plot[1]]]
+      rho_2 = rho_to_use[[cur_group]][[subgroup_to_plot[2]]]
+      
+      gtp = intersect(intersect(genes_to_plot,rownames(rho_1)),rownames(rho_2))
+      rho_1 =  rho_1[gtp,gtp]
+      rho_2 =  rho_2[gtp,gtp]
+     
+      setkey(tissues_df,GeneName)
+      tissue_split = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue & names(tissues) %in% gtp])
+      names(tissue_split) = unique(tissues)
+   
+       #prepare colors--we want each coexpression group to get its own color across the two subgroups fit
+       colors = c(brewer.pal(12,"Paired"),brewer.pal(12,"Set3"))
+       colors = c(colors,colors)
+
+       colors = colors[1:length(tissue_split)]
+      
+       #browser()
+    separate_plots = F
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                          split_list_1=tissue_split, 
+                                          split_list_2=tissue_split,  
+                                          split_colors_1 = colors,
+                                          split_colors_2 = colors,
+                                          show_dendrogram=F,
+                                          separate_plots=F,border=border)
+       if (!separate_plots){
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(cur_group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(cur_group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+        }else draw(gp);
+
+}
+```
+
+
+```{r}
+#complicated lookup scheme
+if (0){
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group = function(cur_group,genes_to_plot,community_membership_to_use,border=F){
+  
+  
+  subgroup_to_plot = subgroups = unique(community_membership[group==cur_group,fit_subgroup])
+
+     
+      rho_1 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[1]]] 
+      rho_2 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[2]]] 
+      
+      gtp = intersect(intersect(genes_to_plot,rownames(rho_1)),rownames(rho_2))
+      rho_1 =  rho_1[gtp,gtp]
+      rho_2 =  rho_2[gtp,gtp]
+      
+
+      #we now load the genes in each coexpression group across the two subgroups fit
+      coexpression_groups_for_each_gene = lapply(subgroups,rho_1,FUN=function(cur_fit_subgroup,rho_1){
+    
+        gene_groups = rbindlist(lapply(1:length(communities_to_plot[[cur_group]]),function(i){
+          com = communities_to_plot[[cur_group]][[i]];
+          sg = com$source_gene_info$GeneName[com$source_gene_info$fit_subgroup == cur_fit_subgroup]
+          if (length(sg) > 0){
+            return(data.frame(GeneName = sg, group=rep(i,length(sg))));
+          }else return(data.frame(GeneName = NA,group=NA))
+          
+        }
+        ))
+        gene_groups = gene_groups[!is.na(gene_groups$GeneName),]
+          
+        #Genes can appear in multiple groups.  We assign multi-mapped genes to the largest group of which they are a member (the lowest group ID) 
+        gene_labels = data.table(GeneName=rownames(rho_1)); 
+       # if(!("GeneName" %in% names(gene_groups)))browser()
+        val = aggregate(group~GeneName,gene_groups,FUN=function(x)min(x))
+        names(val) = c("GeneName","group")
+      
+        val$group = coexp_ID_from_number(val$group)
+        gene_labels = merge(gene_labels,val,by="GeneName",all.x=T)
+     
+        gene_labels$group[is.na(gene_labels$group)] = "NG"
+        setkey(gene_labels,GeneName)
+        
+        gene_labels 
+      })
+      names(coexpression_groups_for_each_gene) = subgroups;
+     
+
+      
+      if (is.null(rho_1) || is.null(rho_2)) browser()
+      
+      #prepare list with which to split heatmaps into co-expression groups
+      gene_split = lapply(subgroups,function(subgroup){
+        grps = unique(coexpression_groups_for_each_gene[[subgroup]]$group)
+        res = lapply(grps,function(x){
+          gene_list = coexpression_groups_for_each_gene[[subgroup]];
+          gene_list$GeneName[gene_list$group==x & gene_list$GeneName %in% rownames(rho_1)]
+        })
+        names(res) = grps;
+        res
+        })
+      names(gene_split) = subgroups;
+      
+      setkey(tissues_df,GeneName)
+      tissue_split = lapply(unique(tissues),function(tissue)names(tissues)[tissues==tissue])
+      names(tissue_split) = unique(tissues)
+   
+       #prepare colors--we want each coexpression group to get its own color across the two subgroups fit
+       colors = c(brewer.pal(12,"Paired"),brewer.pal(12,"Set3"))
+       colors = c(colors,colors)
+
+       colors = colors[1:(length(gene_split[[subgroup_to_plot[[1]]]])+length(gene_split[[subgroup_to_plot[[2]]]]))]
+       subgroup_1_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[1]]]]),2,4)
+       subgroup_2_coexpression_groups = substring(names(gene_split[[subgroup_to_plot[[2]]]]),2,4)
+       
+       subgroup_1_coexpression_groups = as.integer(subgroup_1_coexpression_groups[subgroup_1_coexpression_groups!="G"])
+       subgroup_2_coexpression_groups = as.integer(subgroup_2_coexpression_groups[subgroup_2_coexpression_groups!="G"])
+       
+       if ("NG" %in% c(names(gene_split[[subgroup_to_plot[[1]]]]),names(gene_split[[subgroup_to_plot[[2]]]]))){
+        colors_1 = c("black",colors[subgroup_1_coexpression_groups])
+        colors_2 = c("black",colors[subgroup_2_coexpression_groups])
+       }else{
+        colors_1 = c(colors[subgroup_1_coexpression_groups])
+        colors_2 = c(colors[subgroup_2_coexpression_groups])
+      }
+       #browser()
+    separate_plots = F
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                          gene_labels_1=coexpression_groups_for_each_gene[[subgroup_to_plot[[1]]]][rownames(rho_1),]$group,
+                                          gene_labels_2=coexpression_groups_for_each_gene[[subgroup_to_plot[[2]]]][rownames(rho_2),]$group,
+                                          split_list_1=gene_split[[subgroup_to_plot[[1]]]],
+                                          split_list_2=gene_split[[subgroup_to_plot[[2]]]],
+                                          split_colors_1 = colors_1,
+                                          split_colors_2 = colors_2,
+                                          show_dendrogram=F,
+                                          separate_plots=separate_plots,)
+       
+       if (!separate_plots){
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(cur_group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(cur_group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+       }
+       
+      }
+}
+```
+
+
+```{r}
+source("../scripts/helpers/heatmap.R")
+#simple lookup scheme
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group = function(cur_group,genes_and_communities,border=F,min_group_size_to_plot = 50,explicit_subgroups=NULL,rho_to_use = filter_tissue_rho_list){
+  
+  
+      if (is.null(explicit_subgroups)){
+        subgroup_to_plot = subgroups = names(filter_tissue_rho_list[[cur_group]])
+      }else subgroup_to_plot = subgroups =explicit_subgroups
+
+     
+      rho_1 = rho_to_use[[cur_group]][[subgroup_to_plot[1]]] 
+      rho_2 = rho_to_use[[cur_group]][[subgroup_to_plot[2]]] 
+      
+      genes_to_plot = genes_and_communities$GeneName;
+      gtp = intersect(intersect(genes_to_plot,rownames(rho_1)),rownames(rho_2))
+      
+      #remove groups with only 1 member
+      cnt = aggregate(GeneName~coexp_group_ID+group,genes_and_communities[genes_and_communities$GeneName %in% gtp,],length)
+      groups_to_remove = cnt$coexp_group_ID[cnt$GeneName < min_group_size_to_plot];
+     # print (groups_to_remove)
+      
+  
+      gtp = genes_and_communities[genes_and_communities$GeneName%in% gtp & ! (genes_and_communities$coexp_group_ID %in% groups_to_remove),GeneName]
+      rho_1 =  rho_1[gtp,gtp]
+      rho_2 =  rho_2[gtp,gtp]
+      #if genes appear in multiple groups, only include the group with the lowest number
+      coexp_groups = aggregate(coexp_group_ID~GeneName,genes_and_communities[GeneName %in% gtp,],function(x)x[order(x)][1])
+     # print(coexp_groups)
+     # stop()
+      cg = unique(coexp_groups$coexp_group_ID)
+      gene_split = lapply(cg,function(cur_group)
+          coexp_groups[coexp_groups$coexp_group_ID==cur_group & coexp_groups$GeneName %in% gtp,"GeneName"])
+      names(gene_split) = cg;
+    
+       #prepare colors--we want each coexpression group to get its own color across the two subgroups fit
+       colors = c(brewer.pal(12,"Paired"),brewer.pal(12,"Set3"))
+       colors = c(colors,colors)
+        
+       if ("NG" %in% names(gene_split)){
+        colors = c("black",colors[1:(length(gene_split)-1)])
+       }else{
+         colors = colors[1:(length(gene_split))]
+       }
+    separate_plots = F
+      #browser()
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                          split_list_1=gene_split,
+                                          split_list_2=gene_split,
+                                          split_colors_1 = colors,
+                                          split_colors_2 = colors,
+                                          show_dendrogram=F,
+                                          separate_plots=separate_plots,border=border)
+       
+       if (!separate_plots){
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(cur_group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(cur_group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+       }
+       
+      }
+  
+```
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY GROUP
+
+source("../scripts/helpers/heatmap.R")
+
+
+genes = merged_community_membership[group==("d8_glp1") & !is.na(Tissue),]
+genes2 = merged_community_membership[group==c("d8_glp1_da_d8_glp1_DC") & !is.na(Tissue),]
+ genes = rbind(genes,genes2[!GeneName %in% genes$GeneName,] )
+                            
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1",genes,border=T,min_group_size_to_plot=50)
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1_da_d8_glp1_DC",genes,border=T,min_group_size_to_plot=50)
+      
+```
+
+```{r}
+     rho_1 = filter_tissue_rho_list[["d8_glp1"]][["QZ0"]]
+     rho_2 = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]]
+
+     rho_3 = filter_tissue_rho_list[["d8_glp1_da_d8_glp1_DC"]][["QZ0_da_d8_glp1"]]
+     #rho_3 = filter_tissue_rho_list[["d8_glp1_da_d8_glp1_DC"]][["CB4037"]]
+
+     genes_to_use = intersect(rownames(rho_1),rownames(rho_3))
+     
+     rho_1 = rho_1[genes_to_use,genes_to_use]
+     rho_2 = rho_2[genes_to_use,genes_to_use]
+     rho_3 = rho_3[genes_to_use,genes_to_use]
+     
+     greater_than_half = abs(rho_1)>.5 | abs(rho_2)>.5 | abs(rho_3)>.5
+     
+     dat = data.table(QZ0 = as.vector(rho_1[upper.tri(rho_1) & greater_than_half]),glp1 = as.vector(rho_2[upper.tri(rho_2) & greater_than_half]), QZ0_norm = as.vector(rho_3[upper.tri(rho_3) & greater_than_half]))
+     cr_1 = cor(dat[,1],dat[,2],method="s",use="complete")
+     cr_2 = cor(dat[,1],dat[,3],method="s",use="complete")
+     cr_3 = cor(dat[,2],dat[,3],method="s",use="complete")
+     ggplot(dat,aes(QZ0,glp1))+geom_point()
+     
+```
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+source("../scripts/helpers/heatmap.R")
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID %in% c("G01","G02") & group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == c("G01","G02") & group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+      
+```
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+source("../scripts/helpers/heatmap.R")
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID %in% c("G01","G02") & group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1_da_nlp28_DC",unique(merged_community_membership[coexp_group_ID %in% c("G01","G02") & group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+      
+```
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+source("../scripts/helpers/heatmap.R")
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1",unique(merged_community_membership[group=="d1_glp1" & !is.na(Tissue),GeneName]),border=T)
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_atp5_DC",unique(merged_community_membership[group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+      
+```
+#plot coexpression groups for glp-1
+```{r}
+
+gene_data = unique(community_membership[group=="d8_glp1" & fit_subgroup = "CB4037",])
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",gene_data$GeneName,border=T,explicit_subgroups = rep("CB4037",2))
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1",gene_data,border=T,min_group_size_to_plot=50,explicit_subgroups = rep("CB4037",2))
+
+
+```
+
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+source("../scripts/helpers/heatmap.R")
+
+gene_data = unique(community_membership[group=="d8_glp1",])
+#rl = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]][gene_data$GeneName,gene_data$GeneName]
+
+filter_tissue_rho_list = filter_tissue_rho_list[c("d8_glp1","d8_glp1_da_d8_glp1_DC","d8_glp1_da_nlp28_DC","d8_glp1_da_nlp28" )]
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",gene_data$GeneName,border=T,explicit_subgroups = rep("QZ0",2))
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1",gene_data,border=T,min_group_size_to_plot=50,explicit_subgroups = rep("QZ0",2))
+
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",gene_data$GeneName,border=T,explicit_subgroups = rep("CB4037",2))
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1",gene_data,border=T,min_group_size_to_plot=50,explicit_subgroups = rep("CB4037",2))
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+```
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+source("../scripts/helpers/heatmap.R")
+
+gene_data = unique(community_membership[group=="d8_glp1"& fit_subgroup== "CB4037",])
+#rl = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]][gene_data$GeneName,gene_data$GeneName]
+rho = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]][gene_data$GeneName,gene_data$GeneName]
+grps = unique(gene_data$coexp_group_ID)
+coexpression_group_members = rbindlist(lapply(grps,function(cur_grp){
+  grp_genes = gene_data[coexp_group_ID == cur_grp,GeneName]
+  rho_val = apply(rho[grp_genes,grp_genes],1,function(x)mean(x))
+  rho_val = rho_val[order(rho_val,decreasing=T)]
+  num=length(rho_val)#10
+  data.table(coexp_group_ID = rep(cur_grp,num),rho=rho_val[1:num],GeneName=names(rho_val)[1:num],grp_size = rep(length(grp_genes),num))
+}))
+setkey(geneid,GeneName)
+coexpression_group_members$GeneSymbol = geneid[coexpression_group_members$GeneName,GeneSymbol]
+coexpression_group_members = coexpression_group_members[order(rho,decreasing=T),]
+
+
+### Gene annotations
+enrich_dat = lapply(grps,function(cur_grp){
+  grp_genes = gene_data[coexp_group_ID == cur_grp,]
+  enrich_hvg <- lapply(names(gene_annotations), function(database) {
+    fisherEnrichment(gene_annotations[[database]], 
+                     data.table(grp_genes), 
+                     "Annotation", 
+                     universe = rownames(rho))
+  })
+  names(enrich_hvg) <- names(gene_annotations)
+  enrich_hvg
+})
+names(enrich_dat) = grps
+
+wcat = rbindlist(lapply(grps,function(grp){
+    tmp = enrich_dat[[grp]][[1]]$qvalue[,"GeneName"]
+    res = data.table(cat = names(tmp),qval = tmp)
+    res$coexp_group_ID = grp;
+    res
+}))
+wcat = wcat[qval<.05]
+wcat = wcat[order(wcat,decreasing=F)]
+
+wormexp = rbindlist(lapply(grps,function(grp){
+    tmp = enrich_dat[[grp]][[2]]$qvalue[,"GeneName"]
+    res = data.table(cat = names(tmp),qval = tmp)
+    res$coexp_group_ID = grp;
+    res
+}))
+wormexp = wormexp[qval<.000001]
+wormexp = wormexp[order(qval,decreasing=F)]
+
+
+
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",gene_data$GeneName,border=T)
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1",gene_data,border=T,min_group_size_to_plot=50)
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+```
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+
+jaccard <- function(a, b) {
+  intersection = length(intersect(a, b))
+  union = length(a) + length(b) - intersection
+  return (intersection/union)
+}
+
+
+source("../scripts/helpers/heatmap.R")
+
+gene_data_ts = unique(community_membership_tissue_specific[group=="d8_glp1"& fit_subgroup== "QZ0",])
+gene_data = unique(community_membership[group=="d8_glp1"& fit_subgroup== "CB4037" & !is.na(Tissue),])
+#rl = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]][gene_data$GeneName,gene_data$GeneName]
+overlap = jaccard(gene_data_ts$GeneName,gene_data$GeneName)
+
+
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",gene_data$GeneName,border=T,rho_to_use = filter_tissue_rho_list_tissue_specific)
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_coexp_group("d8_glp1",gene_data,border=T,min_group_size_to_plot=50,rho_to_use = filter_tissue_rho_list_tissue_specific)
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+new_grp = list("glp1_grp" = list())
+new_grp[["glp1_grp"]][["CB4037"]] = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]][gene_data$GeneName,gene_data$GeneName]
+new_grp[["glp1_grp"]][["QZ0 Tissue norm"]] = filter_tissue_rho_list_tissue_specific[["d8_glp1"]][["QZ0"]][gene_data_ts$GeneName,gene_data_ts$GeneName]
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("glp1_grp",gene_data$GeneName,border=T,rho_to_use = new_grp,explicit_subgroups = names(new_grp[["glp1_grp"]]))
+
+
+
+```
+
+```{r,fig.width=10,fig.height=8}
+#plot correlation matrix with communities highlight overlaid SORTED BY TISSUE
+
+source("../scripts/helpers/heatmap.R")
+
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_sw",unique(merged_community_membership[ group=="d1_sw" & !is.na(Tissue),GeneName]),border=T)
+plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_sw_da_atp5_DC",unique(merged_community_membership[ group=="d1_sw_da_atp5_DC" & !is.na(Tissue),GeneName]),border=T)
+
+
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d8_glp1",unique(merged_community_membership[coexp_group_ID == "G02" & group=="d8_glp1"& !is.na(Tissue),GeneName]),border=T)
+#plotSplitCorrelationDualDiffHeatmap_for_gene_subset_by_tissue("d1_glp1_da_d8_glp1_DC",unique(merged_community_membership[coexp_group_ID == "G02"& group=="d8_glp1" & !is.na(Tissue),GeneName]),border=T)
+
+
+      
+```
+
+```{r}
+
+genes_in_communities = unique(community_membership[group=="d8_glp1"& fit_subgroup== "CB4037",])
+
+  rho_1 = filter_tissue_rho_list[["d8_glp1"]][["QZ0"]]
+     rho_2 = filter_tissue_rho_list[["d8_glp1"]][["CB4037"]]
+  counts = readRDS("../data/gene_variability/communities/count_data_d8_glp1.Rds")
+  d1 = counts[[1]]$QZ0
+  d2 = counts[[1]]$CB4037
+  r = cancor(t(d1[,1:80]),t(d2[,1:80]))
+```
+
+```{r}
+
+source("../scripts/helpers/heatmap.R")
+
+cur_group = "d8_glp1"
+
+genes_to_plot = unique(merged_community_membership[coexp_group_ID == "G01" & !is.na(Tissue),GeneName])
+
+ subgroup_to_plot = subgroups = names(filter_tissue_rho_list[[cur_group]])
+      rho_1 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[1]]]
+      rho_2 = filter_tissue_rho_list[[cur_group]][[subgroup_to_plot[2]]]
+      
+      gtp = intersect(intersect(genes_to_plot,rownames(rho_1)),rownames(rho_2))
+      rho_1 =  rho_1[gtp,gtp]
+      rho_2 =  rho_2[gtp,gtp]
+     
+      
+       #browser()
+    separate_plots = F
+       gp = plotSplitCorrelationDualDiffHeatmap(rho_1,
+                                                rho_2,
+                                          name1 = subgroup_to_plot[[1]],
+                                          name2 = subgroup_to_plot[[2]],
+                                          show_dendrogram=F,
+                                          separate_plots=F)
+       if (!separate_plots){
+          if (is.null(gp) | !("rho1" %in% names(gp) & "rho2" %in% names(gp)) || is.null(gp[["rho1"]]) || is.null(gp[["rho1"]]))
+            browser()
+          draw(gp[["rho1"]],column_title=paste(cur_group, "fit on ",subgroups[1],"\n",subgroups[2]),row_title=subgroups[1])
+
+          #draw(gp[["diff_XXX"]],column_title=paste(group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+          draw(gp[["rho2"]],column_title=paste(cur_group, "fit on ",subgroups[2],"\n",subgroups[2]),row_title=subgroups[1])
+        }else draw(gp);
+```
+
+
+```{r,fig.width=16,fig.height=4}
+gb = correlation_change_across_interventions_merged[group_type=="merged" & group %in% c("d1_glp1","d1_glp1_da_nlp28"),]
+ggplot(gb,aes(community,1/community_est,color=group)) + geom_point() + scale_y_log10() +ylab("Effect of glp-1 on community")
+gb = correlation_change_across_interventions_merged[group_type=="merged" & group %in% c("d1_glp1","d1_glp1_da_atp5"),]
+ggplot(gb,aes(community,1/community_est,color=group)) + geom_point()  + scale_y_log10() +ylab("Effect of glp-1 on community")
+gb = correlation_change_across_interventions_merged[group_type=="merged" & group %in% c("d1_glp1","d1_glp1_da_d8_glp1"),]
+ggplot(gb,aes(community,1/community_est,color=group)) + geom_point()  + scale_y_log10() +ylab("Effect of glp-1 on community")
+
+
+```
+
+```{r,fig.width=7,fig.height=2.5}
+library("cowplot")
+library("ggplotify")
+
+for(grp in unique(community_membership$group)){
+  #grp = "d1_n2_da_atp5";
+ # print(grp)
+   stats = correlation_change_across_interventions[correlation_change_across_interventions$group ==grp,]
+   stats = stats[abs(log(stats$community_est)) > log(2) & stats$community_pvalue < .01 & fit_subgroup != "all",];
+   if (nrow(stats) == 0)
+     next;
+   #communities = unique(stats$community)
+   correls = community_gene_correlations[[grp]]
+   correl_comps = rbindlist(lapply(unique(stats$coexp_group_ID),function(cur_coexp_group_ID){
+        c1 = correls[correls$coexp_group_ID == cur_coexp_group_ID,];
+         res = dcast(c1,GeneName~subgroup, value.var = "per_gene_correlation");
+         res$coexp_group_ID = cur_coexp_group_ID
+         res;
+    }))
+   subgroups = unique(correls$subgroup);
+   da_cur = da[group == grp,]
+   
+   #chose the reference group in the correlation change analysis to match the reference group in the differential analysis
+   comp_str = da_cur$comparison[1] #we can do this because the comparison string lists the reference group second
+   subgroup_1_loc = regexpr(gsub(" ",".",subgroups[1]),comp_str);
+   subgroup_2_loc = regexpr(gsub(" ",".",subgroups[2]),comp_str)
+   #print(subgroups)
+   #print(comp_str)
+   if (subgroup_1_loc == -1 || subgroup_2_loc == -1)
+     warning(paste("Could not find subgroups",subgroups[[1]],subgroups[[2]]," in the da comparison string ",comp_str, ".   Setting ",subgroups[1], " as the reference"))
+   if (subgroup_1_loc > subgroup_2_loc){
+       names(correl_comps)[names(correl_comps) == subgroups[1]] = "control_correlation";
+       names(correl_comps)[names(correl_comps) == subgroups[2]] = "intervention_correlation";
+    }else{ 
+      names(correl_comps)[names(correl_comps) == subgroups[1]] = "intervention_correlation";
+      names(correl_comps)[names(correl_comps) == subgroups[2]] = "control_correlation";
+    }
+  correl_comps$fold_change_correlation = correl_comps$intervention_correlation/correl_comps$control_correlation;
+  setkey(tissues_df,GeneName);
+  correl_comps$tissue = tissues_df[correl_comps$GeneName,Tissue]
+  
+  dat = merge(correl_comps,da_cur,by="GeneName")
+
+  
+  gps = list();
+  coexp_ids = unique(dat$coexp_group_ID)
+ for (cur_coexpr in 1:length(coexp_ids)){
+   dat2 = dat[dat$coexp_group_ID==coexp_ids[[cur_coexpr]],]
+  # dat2$padj_mean[is.na(dat2$padj_mean)] = dat2$pvalue_mean[is.na(dat2$padj_mean)]
+  # dat2$padj_overdispersion[is.na(dat2$padj_overdispersion)] = dat2$pvalue_overdispersion[is.na(dat2$padj_overdispersion)]
+   
+   a = 
+     ggplot(dat2,aes(x=log2FoldChange_mean,
+                     y=log2(fold_change_correlation),
+                   #  fill=tissue,
+                     color=tissue,
+                     shape=as.factor(is.na(padj_mean) | padj_mean<.01)))+geom_point() +
+     geom_vline(xintercept=0,lty=2,col="gray") + 
+     geom_hline(yintercept=0,lty=2,col="gray") +
+     xlab("Population Mean (Fold Change)")+ 
+     ylab("Co-expression (Fold Change)") + 
+     scale_shape_manual(values = c(21,19))+
+     scale_colour_manual(values=tissue_colors, aesthetics = c("fill","color")) +
+     theme(legend.position = "none",plot.title = element_text(size=12),axis.title = element_text(size=12)) +
+     ggtitle(paste(grp,coexp_ids[cur_coexpr],comp_str));
+   
+   b = 
+     ggplot(dat2,aes(x=logFoldChange_overdispersion,
+                        y=log2(fold_change_correlation),
+                   #  fill=tissue,
+                     color=tissue,
+                     shape=as.factor(is.na(padj_mean) | padj_mean<.01)))+geom_point() + 
+     geom_vline(xintercept=0,lty=2,col="gray") + 
+     geom_hline(yintercept=0,lty=2,col="gray") + 
+     xlab("Overdispersion (Fold Change)")+
+     ylab("")+#Fold Change in Correlation") +
+     scale_shape_manual(values = c(21,19))+
+     scale_colour_manual(values=tissue_colors, aesthetics = c("fill","color")) +
+     theme(legend.position = "none",plot.title = element_text(size=12),axis.title = element_text(size=12))+ ggtitle(" ")
+   
+    leg_source =  ggplot(dat2,aes(x=logFoldChange_overdispersion,
+                        y=log2(fold_change_correlation),fill=tissue,color=tissue))+geom_point(pch=21) + 
+    scale_colour_manual(values=tissue_colors, aesthetics = c("fill","color")) 
+     
+    c=as.grob(cowplot::get_legend(leg_source))
+    plot(grid.arrange(a,b,c, ncol = 3))
+  
+ }
+
+ 
+}
+
+```
+
+```{r}
+#calculate a "score" that shows how "up" or "down" the members of each group are together in each individual
+
+com_info = merged_community_info
+
+all_community_IDs = unique(merged_community_membership$coexp_group_ID)
+models = names(com_info)
+#models = "n2_sw"
+
+community_pca_correlations = rbindlist(lapply(models,function(cur_model){
+  
+  communities =  names(com_info[[cur_model]])
+  
+  subgroups = names(filter_tissue_norm_list[[cur_model]]);
+  rbindlist(lapply(subgroups,function(subgroup){
+    counts = filter_tissue_norm_list[[cur_model]][[subgroup]];
+    
+    scores = rbindlist(lapply(communities,function(cur_com){
+      cur_genes = merged_community_info[[cur_model]][[cur_com]]$all_genes
+      cur_counts = t(scale(t(counts[cur_genes,]),center=T,scale=T))
+      pca_res = prcomp(t(cur_counts),scale=T,center=T)
+      scores = t(cur_counts) %*% pca_res$rotation[,1]
+      scores = data.frame(score = t(unlist(scores)))
+    }))
+    score_corr = cor(t(scores),method="s")
+    colnames(score_corr) = communities;
+    rownames(score_corr) = communities;
+    diag(score_corr) = score_corr[lower.tri(score_corr)] = NA
+    score_core_long = melt(score_corr)
+    score_core_long = score_core_long[!is.na(score_core_long$value),]
+    score_core_long$subgroup = subgroup
+    score_core_long$group = cur_model;
+    score_core_long
+  }))
+}))
+```
+
+
+```{r,fig.width=8,fig.height=5}
+#look at the relationship between all pairs of communities
+com_corr = community_pca_correlations;
+cor_mean = aggregate(value~Var1+Var2,com_corr,FUN=mean)
+names(cor_mean)[3] = "mean"
+cor_sd = aggregate(value~Var1+Var2,com_corr,FUN=sd)
+names(cor_sd)[3] = "sd"
+cor_ttest = aggregate(value~Var1+Var2,com_corr,FUN=function(x)t.test(x)$p.value)
+names(cor_ttest)[3] = "p_nonzero"
+cor_N = aggregate(value~Var1+Var2,com_corr,FUN=length)
+names(cor_N)[3] = "N"
+cor_stats = merge(cor_mean,cor_sd,by=c("Var1","Var2"))
+cor_stats = merge(cor_stats,cor_ttest,by=c("Var1","Var2"))
+cor_stats = merge(cor_stats,cor_N,by=c("Var1","Var2"))
+cor_stats = cor_stats[order(cor_stats$mean),]
+
+com_corr$var_pair = apply(com_corr,1,function(x)paste(x[["Var1"]],x[["Var2"]]))
+cor_stats$var_pair = apply(cor_stats,1,function(x)paste(x[["Var1"]],x[["Var2"]]))
+cor_stats$var_pair = factor(cor_stats$var_pair,levels=cor_stats$var_pair)
+com_corr$var_pair = factor(com_corr$var_pair,levels=cor_stats$var_pair)
+com_corr = merge(com_corr,cor_stats[,c("Var1","Var2","N")],by=c("Var1","Var2"))
+
+sig_pairs = as.character(cor_stats$var_pair[cor_stats$p_nonzero < .01])
+
+
+ggplot(com_corr,aes(x=Var1,y=Var2,color=value)) +scale_colour_gradientn(colors = c("blue","gray","red"),
+                                                                                                    values =c(0,.5,1),limits = c(-1,1))+ 
+  geom_jitter(width=.2,height=.2)
+
+ggplot(cor_stats,aes(x=Var1,y=Var2,color=mean,label=paste0(round(mean,2),"+-",round(sd,2)))) +scale_colour_gradientn(colors = c("blue","gray","red"),
+                                                                                                    values =c(0,.5,1),limits = c(-1,1))+ 
+  geom_text(size=5)
+
+
+ggplot(com_corr,aes(x=var_pair,y=value)) + geom_jitter()+geom_errorbar(aes(ymin=mean-sd,y=mean, ymax=mean+sd), width=.2,data=cor_stats,col="red")+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10))
+
+
+ggplot(com_corr[com_corr$var_pair %in% sig_pairs,],aes(x=var_pair,y=value)) + geom_jitter()+geom_errorbar(aes(ymin=mean-sd,y=mean, ymax=mean+sd), width=.2,data=cor_stats[cor_stats$var_pair %in% sig_pairs,],col="red")+geom_point(aes(y=mean), cex=2,pch=21,data=cor_stats[cor_stats$var_pair %in% sig_pairs,],col="red")+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10))
+
+cor_stats = cor_stats[order(cor_stats$sd),]
+com_corr$var_pair = apply(com_corr,1,function(x)paste(x[["Var1"]],x[["Var2"]]))
+cor_stats$var_pair = apply(cor_stats,1,function(x)paste(x[["Var1"]],x[["Var2"]]))
+cor_stats$var_pair = factor(as.character(cor_stats$var_pair),levels=cor_stats$var_pair)
+com_corr$var_pair = factor(as.character(com_corr$var_pair),levels=cor_stats$var_pair)
+
+ggplot(com_corr[!com_corr$var_pair %in% sig_pairs & com_corr$N > 4,],aes(x=var_pair,y=value)) + geom_jitter()+geom_errorbar(aes(ymin=mean-sd,y=mean, ymax=mean+sd), width=.2,data=cor_stats[!cor_stats$var_pair %in% sig_pairs & cor_stats$N > 4,],col="red")+geom_point(aes(y=mean), cex=2,pch=21,data=cor_stats[!cor_stats$var_pair %in% sig_pairs & cor_stats$N > 4,],col="red")+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=8))+geom_hline(yintercept=0,col="gray")
+```
+
+```{r}
+#look at each communitiy in respect to all others
+cor_mean = aggregate(value~Var1,com_corr,FUN=mean)
+names(cor_mean)[2] = "mean"
+cor_sd = aggregate(value~Var1,com_corr,FUN=sd)
+names(cor_sd)[2] = "sd"
+cor_ttest = aggregate(value~Var1,com_corr,FUN=function(x)t.test(x)$p.value)
+names(cor_ttest)[2] = "p_nonzero"
+cor_N = aggregate(value~Var1,com_corr,FUN=length)
+names(cor_N)[2] = "N"
+cor_min = aggregate(value~Var1,com_corr,FUN=min)
+names(cor_min)[2] = "min"
+cor_max = aggregate(value~Var1,com_corr,FUN=max)
+names(cor_max)[2] = "max"
+cor_single_stats = merge(cor_mean,cor_sd,by=c("Var1"))
+cor_single_stats = merge(cor_single_stats,cor_ttest,by=c("Var1"))
+cor_single_stats = merge(cor_single_stats,cor_N,by=c("Var1"))
+cor_single_stats = merge(cor_single_stats,cor_min,by=c("Var1"))
+cor_single_stats = merge(cor_single_stats,cor_max,by=c("Var1"))
+cor_single_stats = cor_single_stats[order(cor_single_stats$sd),]
+
+
+com_corr = merge(community_pca_correlations,cor_single_stats[,c("Var1","N")],by=c("Var1"))
+
+cor_single_stats$Var1 = factor(cor_single_stats$Var1,levels=cor_single_stats$Var1)
+com_corr$Var1 = factor(com_corr$Var1,levels=cor_single_stats$Var1)
+
+
+ggplot(com_corr,aes(x=Var1,y=value)) + geom_jitter()+geom_errorbar(aes(ymin=mean-sd,y=mean, ymax=mean+sd), width=.2,data=cor_single_stats,col="red")+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10))
+ggplot(com_corr[com_corr$N>4,],aes(x=Var1,y=value)) + geom_point()+geom_errorbar(aes(ymin=mean-sd,y=mean, ymax=mean+sd), width=.2,data=cor_single_stats[cor_single_stats$N>4,],col="red")+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10))
+
+probably_independent_communities = cor_single_stats[cor_single_stats$min > -.5 & cor_single_stats$max < .5,]
+```
+
+
+```{r}
+
+com_info = merged_community_info
+#Calculate correlations between communities across individuals using the PCA scores derived for each community
+individual_scores_t = data.frame(t(individual_scores));
+names(individual_scores_t) = rownames(individual_scores)
+corr_m = matrix(NA,nrow=length(communities),ncol=length(communities))
+rownames(corr_m) = paste0("G",1:nrow(corr_m))
+colnames(corr_m) = paste0("G",1:nrow(corr_m))
+corr_m_long = NULL
+for (i in 1:length(communities)){
+  for (j in i:length(communities)){
+    if (i==j)next;
+    ci = as.integer(substring(communities[i],2,4))
+    cj = as.integer(substring(communities[j],2,4))
+    plot(ggplot(individual_scores_t,aes_string(communities[i],communities[j],label="rownames(individual_scores_t)"))+geom_point() + geom_smooth(method="lm",se=F,col="red"))
+    corr_m[ci,cj]=corr_m[cj,ci]=cor(individual_scores_t[,communities[i]],individual_scores_t[,communities[j]],method='s')
+    corr_m_long = rbind(data.frame(X=communities[i],Y=communities[j],val = corr_m[ci,cj]),corr_m_long);
+    corr_m_long = rbind(data.frame(X=communities[j],Y=communities[i],val = corr_m[ci,cj]),corr_m_long);
+  }
+}
+ggplot(corr_m_long,aes(X,Y,fill=val,label=round(val,2)))+scale_fill_gradientn (colours=c("blue","white","red"),limits=c(-1,1))+geom_tile()+geom_text(color="white")
+outlier = c("C3_d3_22","C3_d3_4")
+hist(corr_m_long$val)
+```
+```{r}
+#plot fancy heatmap of correlation among communities built from PCA scores
+ distfun <- function(x) {
+      as.dist(1-abs(x[rownames(x), rownames(x)]))}
+ 
+gene_clusters =as.dendrogram(hclust(distfun(corr_m),method="ward.D2"))
+hmp = ComplexHeatmap::Heatmap(corr_m,
+                          use_raster = TRUE,
+                          border = TRUE,
+                         
+                          cluster_rows=gene_clusters,
+                          cluster_columns=gene_clusters,
+                          show_row_names = T, 
+                          show_column_names = T,
+                          show_column_dend = T,
+                          show_row_dend = F)
+draw(hmp)
+```
+```{r}
+#Calculate correlations using the correlation of each gene in pairs of clusters
+model = "n2_sw"
+subgroups = names(filter_tissue_norm_list[[model]]);
+x = subgroups[2]
+
+correlations = filter_tissue_rho_list[[model]][[x]];
+
+
+cur_community_memberships = community_memberships[group==model,]
+communities = unique(cur_community_memberships$coexp_group_ID)
+communities = communities[order(communities)]
+
+corr_raw_m = matrix(NA,nrow=length(communities),ncol=length(communities))
+rownames(corr_raw_m) = communities
+colnames(corr_raw_m) = communities
+for (i in 1:length(communities)){
+  for (j in i:length(communities)){
+      corr_raw_m[i,j] = corr_raw_m[j,i] = median(abs(correlations[cur_community_memberships[coexp_group_ID == communities[i]]$GeneName,
+                                                            cur_community_memberships[coexp_group_ID == communities[j]]$GeneName
+                                                            ]))
+  }
+}
+
+
+```

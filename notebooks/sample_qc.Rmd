@@ -1,0 +1,106 @@
+```{r}
+library(data.table)
+library(ggpubr)
+```
+
+```{r}
+model_names = c("d8_sw","d1_sw","n2_series_all","d8_glp1","d1_glp1","d1_UV","d8_UV","mars_seq_sep_plates");
+
+#model_names = c("d_glp1_m");
+#model_names = c("d8_20v25C")
+#model_names = c("ts_d_25C");
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+counts =lapply(model_names, function(x){
+                                  r = bc$batch_counts_list[[x]]
+                                  r[,colnames(r) %in% data$annots$Sample]
+                                 })
+names(counts) = model_names
+erccs =lapply(model_names, function(x){
+                                  r = data$ercc
+                                  r[,colnames(r) %in% colnames(counts[[x]])]
+                                 })
+names(erccs) = model_names
+mRNAs =lapply(model_names, function(x){
+                                  r = data$counts
+                                  r[,colnames(r) %in% colnames(counts[[x]])]
+                                 })
+names(mRNAs) = model_names
+
+setkey(data$annots,Sample)
+annots = data$annots;
+annot_list <- lapply(model_names,function(x){
+                  r = data$annots[colnames(counts[[x]]),]
+                  r$model = x;
+                  r
+                })
+names(annot_list) = model_names
+```
+
+```{r,fig.width=24,fig.height=12}
+setkey(annots,Sample)
+counts_table = rbindlist(lapply(model_names,function(model){
+  mr = rowSums(t(mRNAs[[model]]))
+  er = rowSums(t(erccs[[model]]))
+  
+  unique_mr = apply(mRNAs[[model]],2,function(x)length(which(x>0)))
+  unique_mr_high = apply(mRNAs[[model]],2,function(x)length(which(x>30)))
+  r = data.table(sample=names(mr),total_counts_mRNA=mr,total_counts_ercc=er,unique_transcripts=unique_mr,unique_transcripts_above_30_counts=unique_mr_high)
+  r$model = model;
+  r$Strain = annots[r$sample,Strain]
+  r$Day = annots[r$sample,Day]
+  r$Food = annots[r$sample,Food]
+  r$Temperature = annots[r$sample,Temperature]
+  r$extra_processing = annots[r$sample,optional_strain_prefix]
+  r
+}))
+counts_table$model = factor(counts_table$model,levels=model_names)
+counts_table[,group := paste("Strain:",Strain,"Day:",Day,"Food:",Food,"Temperature:",Temperature ,extra_processing)]
+
+a = ggplot(counts_table,aes(log10(total_counts_ercc),log10(total_counts_mRNA),color=group))+geom_point()+facet_wrap(~model,scale="free_x",ncol=8)+xlab("Total ERCC Counts (log10)") + ylab("Total mRNA Counts (log10)") 
+
+b = ggplot(counts_table,aes(log10(total_counts_mRNA),(unique_transcripts),color=group))+geom_point()+facet_wrap(~model,scale="free_x",ncol=8)+xlab("Total mRNA Counts (log10)") + ylab("Number of Unique Genes") +scale_y_continuous(trans="log10")
+
+c = ggplot(counts_table,aes(log10(unique_transcripts),(unique_transcripts_above_30_counts),color=group))+geom_point()+facet_wrap(~model,scale="free_x",ncol=8)+xlab("Number of Unique Genes (Log10)") + ylab("Number of Unique Genes\nabove 30 count threshold") +scale_y_continuous(trans="log10")
+
+ggpubr::ggarrange(a,b,c,common.legend=T,ncol=1,nrow=3)
+ggsave("../figures/R2R/sample_size_diagnostic.png",width=18,height=12)
+
+fwrite(counts_table,"../figures/R2R/sample_size_table.csv.gz")
+
+aggregate(unique_transcripts_above_30_counts~group+model,counts_table,median)
+```
+
+
+```{r,width=8.height=8}
+data_dir = "../../../microscopy/sequence_data/2017_murphy_TS/"
+# standard Trizol/ chloroform/ isopropanol method, DNase digested, and cleaned using Qiagen RNEasy Minelute columns
+kaletsky_annots = fread(paste0(data_dir,"data/annotations/sample_annotations.csv"))
+kaletsky_counts = fread(paste0(data_dir,"data/formatted_counts/counts.txt.gz"),header=T)
+names(kaletsky_counts)[1] = "GeneName"
+kaletsky_mRNA = kaletsky_counts[!grep("^ERCC",GeneName),]
+kaletsky_mRNA_matrix = as.matrix(kaletsky_mRNA[,2:ncol(kaletsky_mRNA)])
+rownames(kaletsky_mRNA_matrix) = kaletsky_mRNA$GeneName
+colnames(kaletsky_mRNA_matrix) = names(kaletsky_mRNA)[2:ncol(kaletsky_mRNA)]
+
+kaletsky_annots$Basename = as.character(kaletsky_annots$Basename)
+setkey(kaletsky_annots,Basename)
+
+mr = rowSums(t(as.matrix(kaletsky_mRNA_matrix)))
+unique_mr = apply(kaletsky_mRNA_matrix,2,function(x)length(which(x>0)))
+unique_mr_high = apply(kaletsky_mRNA_matrix,2,function(x)length(which(x>30)))
+r = data.table(sample=names(mr),total_counts_mRNA=mr,unique_transcripts=unique_mr,unique_transcripts_above_30_counts=unique_mr_high)
+r$tissue = r$group = kaletsky_annots[as.character(r$sample),Genotype ]
+r$data_source =  "Kaletsky et al"
+
+our_dat = counts_table[model=="d1_sw" & Strain=="QZ0",]
+our_dat$data_source = "Eder et al"
+r2 = rbind(r,our_dat,fill=T)
+
+ ggplot(r2,aes(log10(total_counts_mRNA),unique_transcripts,color=data_source))+geom_point()+xlab("Total mRNA Counts (log10)") + ylab("Number of Unique Genes") + geom_smooth(method="lm",se=F,col="black",aes(grouping=data_source))
+ ggsave("../figures/R2R/smart_seq_vs_trizol.png",width=5,height=3)
+ 
+
+```
+

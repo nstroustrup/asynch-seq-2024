@@ -1,0 +1,195 @@
+---
+title: "Beads"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+
+library(ggrepel)
+library(pbapply)
+library(scales)
+
+theme_set(theme_cowplot())
+
+dir.create("../figures/main_figure_2/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_2/", showWarnings = FALSE)
+
+source("../scripts/notebooks_helpers/beads_and_tso_only.R")
+source("../scripts/helpers/scales.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rrn1 <- c(15062083, 15063836)
+rrn2 <- c(15064301, 15064453)
+rrn3 <- c(15064838, 15068346)
+```
+
+## Load data
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+```
+
+```{r}
+beads <- readRDS("../data/formated_counts/counts_and_annots_beads.rds")
+beads[["da"]] <- fread("../data/differential_analysis/tables/beads/beads.csv.gz")
+beads[["norm"]] <- sweep(beads$counts, 2, beads$nf, "/")
+beads$da <- merge(beads$da, geneid[, .(GeneName, GeneType)])
+
+tso <- readRDS("../data/formated_counts/counts_and_annots_tso_only.rds")
+tso[["da"]] <- fread("../data/differential_analysis/tables/tso_only/tso_only.csv.gz")
+tso[["norm"]] <- sweep(tso$counts, 2, tso$nf, "/")
+tso$da <- merge(tso$da, geneid[, .(GeneName, GeneType)])
+```
+
+```{r}
+beads_genomecov <- loadGenomeCov(beads$annots)
+beads_genomecov[, NF := beads$nf[Sample]]
+
+tso_genomecov <- loadGenomeCov(tso$annots)
+tso_genomecov[, NF := tso$nf[Sample]]
+```
+
+## Genome Coverage
+
+```{r}
+gc <- tso_genomecov[, .(Coverage = mean(Count/NF)), by = c("Position", "TSOOnly")]
+
+gp_cov_std <- plotCov(gc[TSOOnly == FALSE &
+                           
+                           Position >= rrn1[1]-500 & 
+                           Position <= rrn3[2]+500]) +
+  ggtitle("Standard (oligo-dT and TSO)") +
+  theme(plot.title = element_text(size = 15, face = "bold"))
+
+gp_cov_tso <- plotCov(gc[TSOOnly == TRUE &
+                           Position >= rrn1[1]-500 & 
+                           Position <= rrn3[2]+500]) +
+  ggtitle("TSO Only") +
+  theme(plot.title = element_text(size = 15, face = "bold"))
+
+gp_cov_std
+ggsave("../figures/sup_figure_2/beads_and_tso_only_genomecov_standard.pdf", width = 7, height = 6)
+
+gp_cov_tso
+ggsave("../figures/sup_figure_2/beads_and_tso_only_genomecov_tso.pdf", width = 7, height = 6)
+```
+## ECDF of raw gene counts showing reduction of rrn-3.1 in the library
+
+```{r}
+set.seed(63)
+std <- beads$counts[, beads$annots[Beads == FALSE]$Sample]
+bd <- beads$counts[, beads$annots[Beads == TRUE]$Sample]
+prop_df <- data.table(GeneName = rownames(std), 
+                      Stantard =  rowMeans(sweep(std, 2, colSums(std), "/")),
+                      Beads = rowMeans(sweep(bd, 2, colSums(bd), "/")))
+rm(std, bd)
+prop_df <- melt(prop_df, id.vars = "GeneName", value.name = "Proportion", variable.name = "Condition")
+prop_df <- prop_df[Proportion != 0]
+prop_df <- merge(geneid, prop_df, by = "GeneName", all.x = FALSE, all.y = TRUE)
+
+prop_df <- prop_df[order(Proportion, decreasing = TRUE)]
+prop_df <- prop_df[, Number := 1:.N, by = .(Condition)]
+prop_df <- prop_df[, CDF := 1 - Number/.N, by = .(Condition)]
+
+prop_df[Number <= 5, Label := paste0(GeneSymbol, " (", round(100*Proportion, 1), "%)")]
+prop_df[Number <= 5, Label := factor(Label, levels = unique(Label))]
+
+gp_prop_beads <- ggplot(prop_df, aes((Proportion), CDF, color = Condition)) +
+  geom_point() +
+  scale_x_log10(labels = function(x) {   parse(text=gsub("e\\+*", " %*% 10^", scales::scientific_format()(x))) }) + 
+  scale_color_manual(name = "Protocol", 
+                     values = c("gray0", "orangered"),
+                     labels = c("Standard", "Beads")) +
+  geom_text_repel(aes(label = Label), show.legend = FALSE,
+                  size = 3.7,
+                  prop_df[Number <= 3 & Condition == "Beads"],
+                  box.padding = 0.45,
+                  arrow = arrow(length = unit(0.04, "npc")),
+                  direction    = "x",
+                  nudge_x      = -1,
+                  nudge_y      = -1,
+                  angle        = 0,
+                  vjust        = 0,
+                  hjust        = 1,
+                  segment.size = 0.5) +
+  ylab("Empirical Cumulative Probability") +
+  xlab("Proportion of Gene in Read Library") +
+  theme(legend.position = "top")
+
+gp_prop_beads
+ggsave("../figures/main_figure_2/beads_and_tso_only_cdf_beads.pdf", width = 7, height = 6)
+```
+
+## Differential analysis comparing TSO-only with the standard protocol. 
+
+```{r}
+ggplot(tso$da[! is.na(GeneType)], 
+       aes(TSOOnly_log2FoldChange, 
+           TSOOnly_padj,
+           color = GeneType == "protein_coding_gene")) +
+  geom_point() +
+  scale_y_continuous(trans=reverselog_trans(10), labels = scientific_10) +
+  xlab("log2 Fold Change") +
+  ylab("Adjusted p-value") +
+  geom_hline(yintercept = 1) +
+  scale_color_manual(name = "", 
+                     values = c("#990000ff", "#0b5394ff"),
+                     labels = c("Non protein coding genes", 
+                                "Protein coding genes")) +
+  theme(legend.position = "top")
+```
+
+## Differential analysis comparing cDNA generated on oligo-dT carrying magnetic beads with the standard protocol. 
+
+```{r}
+set.seed(65)
+gp_volcano_beads <- ggplot(beads$da, 
+                           aes(Beads_log2FoldChange, 
+                               Beads_padj,
+                               color = Beads_padj < 0.001)) +
+  geom_point() +
+  scale_y_continuous(trans=reverselog_trans(10), labels = scientific_10) +
+  xlab("log2 Fold Change\nBeads vs Standard") +
+  ylab("Adjusted p-value") +
+    scale_color_manual(name = "Effect of Beads",
+                     values = c("gray0", "orangered"),
+                     labels = c("p-value > 0.001",
+                                "p-value < 0.001")) +
+  geom_text_repel(aes(label = GeneSymbol), 
+                  beads$da[(Beads_padj < 1e-15 & 2**Beads_log2FoldChange < 0.2) | (Beads_log2FoldChange < -6 & Beads_padj < 1e-4)],
+                  min.segment.length = unit(0, 'lines'),
+                  show.legend = FALSE) +
+  theme(legend.position = "top")
+gp_volcano_beads
+```
+
+## Comparing the effect of removing the oligo-dT in the retro-transcriptionwith the effect of using oligo-dT carrying magnetic beads.
+
+```{r}
+da <- merge(tso$da, beads$da, by = "GeneName")
+da[, BeadsSignificant := Beads_padj < 1e-3]
+
+gp_compare <- ggplot(da[order(BeadsSignificant)],
+                     aes(TSOOnly_log2FoldChange,
+                         Beads_log2FoldChange,)) +
+  geom_point(aes(color = BeadsSignificant)) +
+  scale_color_manual(name = "Effect of Beads",
+                     values = c("gray0", "orangered"),
+                     labels = c("p-value > 0.001",
+                                "p-value < 0.001")) +
+  theme(legend.position = "top") +
+  xlab("log2 Fold Change\nTSO Only vs Standard") +
+  ylab("log2 Fold Change\nBeads vs Standard")
+gp_compare
+```

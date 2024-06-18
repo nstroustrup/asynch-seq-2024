@@ -1,0 +1,274 @@
+```{r}
+library(data.table)
+  library(reshape2)
+library(ggplot2)
+library(cowplot)
+theme_set(theme_cowplot())
+```
+
+```{r}
+data_dir = "../../../microscopy/sequence_data/2017_murphy_TS/"
+annots = fread(paste0(data_dir,"data/annotations/sample_annotations.csv"))
+```
+               
+```{r}
+merged_counts = rbindlist(lapply(annots$Basename,function(x){
+  res = fread(paste0(data_dir,"data/counts/",x,".count.txt.gz"), header = TRUE, drop = 2:6,)
+  colnames(res)[1] <- "GeneName"
+  colnames(res)[2] <- "Count"
+  res$Basename = x;
+  allzeros <- res[, .(mean(Count == 0)), by = .(GeneName)][V1 == 1]$GeneName
+  filtered_df <- res[! GeneName %in% allzeros, .(Basename, GeneName, Count)]
+  filtered_df
+}))
+```
+
+```{r}
+allcounts <- acast(merged_counts, GeneName ~ Basename, value.var = "Count")
+allcounts[is.na(allcounts)] = 0
+d = as.data.frame(allcounts)
+rownames(d) = rownames(allcounts)
+fwrite(d,paste0(data_dir,"data/formatted_counts/counts.txt.gz"),row.names=T)
+```
+```{r}
+counts = fread(paste0(data_dir,"data/formatted_counts/counts.txt.gz"),header=T)
+names(counts)[1] = "GeneName"
+mRNA = counts[!grep("^ERCC",GeneName),]
+```
+
+```{r}
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+
+
+```
+
+#calculate differential expression between each tissue (NOT USED)
+```{r}
+source("../scripts/helpers/differential_analysis.R")
+source("../scripts/helpers/preprocess.R")
+library(stringr)
+
+#load genes that passed kaletsky et all quality control check
+all_genes = fread("../data/tissue_unique_genes/all_genes_kaletsky.csv")
+all_GeneNames = data.frame(GeneName=all_genes$`WormBase Gene ID`,tissue=all_genes$tissue)
+
+counts2 = as.matrix(counts[,2:ncol(counts)])
+annots$tissue = factor(annots$Condition)
+#find highly expressed genes (logRPKM>5)
+sample_sizes = rowSums(t(counts2))
+
+#apply threshold for count quality used by kaletsky et al
+cnts = log(counts2)-log(sample_sizes)
+genes_measured_well = unique(all_GeneNames$GeneName)
+genes_measured_well = genes_measured_well[genes_measured_well%in%rownames(counts2)]
+counts3 = counts2[genes_measured_well[genes_measured_well%in%rownames(counts2)],]
+sample_sizes3 = rowSums(t(counts3))
+
+originally_selected=tissues_df$GeneName[tissues_df$GeneName %in% genes_measured_well]
+
+#identify highly-abundant genes in each tissue as defined by kaletsky et al
+highly_expressed_genes= lapply(unique(annots$tissue),function(ts){
+  smps = as.character(annots[tissue==ts,Basename])
+  cnts = log(counts3[,smps])-log(sample_sizes3[smps])
+  #os=tissues_df$GeneName[tissues_df$GeneName %in% genes_measured_well & tissues_df$Tissue == ts]
+  #print(quantile(rowMeans(counts3[os,smps]),c(.1,.9)))
+  #print(quantile(rowMeans(cnts[os,]),c(.1,.9)))
+rownames(cnts)[apply(cnts,1,function(x)mean(x)>=-10.1)]
+})
+names(highly_expressed_genes) = unique(annots$tissue)
+
+#run deseq
+colnames(counts3) = colnames(counts)[2:ncol(counts)]
+rownames(counts3) = genes_measured_well
+nf =  normalizationFactor(counts3, groups = annots$tissue)
+ts_comps = lapply(unique(annots$tissue),function(ref){
+  annots$tissue = relevel(annots$tissue,ref=as.character(ref))
+  deseq_res = runDESeq(counts3, annots, nf, ~tissue)
+  deseq_res_out = formatDESeq(deseq_res, cooksCutoff=FALSE)
+  deseq_res_out$tissue_ref = as.character(ref)
+  deseq_res_out
+})
+names(ts_comps) = unique(annots$tissue)
+
+ts_comps_merged = rbindlist(lapply(unique(annots$tissue),function(ref){
+  r = ts_comps[[ref]];
+  for (ts in as.character(unique(annots$tissue))){
+    names(r) = str_replace(names(r),paste0("_vs_",ts),"")
+  }
+  r$GeneName = genes_measured_well
+  r
+}),fill=T)
+fwrite(ts_comps_merged,"../data/tissue_unique_genes/all_tissue_differences.csv.gz")
+```
+
+```{r}
+fc_values = ts_comps_merged[,.(tissue_intestine_log2FoldChange ,tissue_muscle_log2FoldChange, tissue_neurons_log2FoldChange,tissue_hypodermis_log2FoldChange,tissue_ref,GeneName)] 
+names(fc_values) = c("intestine","muscle","neurons","hypodermis","tissue_ref","GeneName")
+
+p_values = ts_comps_merged[,.(tissue_intestine_pvalue ,tissue_muscle_pvalue, tissue_neurons_pvalue,tissue_hypodermis_pvalue,tissue_ref,GeneName)] 
+names(p_values) = c("intestine","muscle","neurons","hypodermis","tissue_ref","GeneName")
+
+fc_values_long = melt(fc_values,id.vars=c("tissue_ref","GeneName"),variable.name="tissue_comp",value.name="FoldDifference")
+p_values_long = melt(p_values,id.vars=c("tissue_ref","GeneName"),variable.name="tissue_comp",value.name="p_value")
+all_values = merge(fc_values_long,p_values_long,by=c("tissue_ref","GeneName","tissue_comp"))
+all_values = as.data.table(all_values)
+all_sig_values = all_values[!is.na(p_value) & p_value<.001,]
+all_sig_values$highly_expressed = apply(all_sig_values,1,function(x)x[["GeneName"]] %in% highly_expressed_genes[[x[["tissue_ref"]]]])
+all_sig_highly_expressed = all_sig_values[highly_expressed==T,]
+
+```
+
+#compare to published set.
+```{r}
+thresh = -2
+res = aggregate(FoldDifference~tissue_ref+GeneName,all_sig_highly_expressed,function(x)!any(log(2^x) > thresh))
+res2 = res[res$FoldDifference==T & !grepl("ERCC",res$GeneName),]
+table(tissues_df$Tissue[tissues_df$Tissue!="germ_line"])
+
+for (tis in unique(tissues_df$Tissue)){
+  if (tis=="germ_line") next;
+  prev = tissues_df$GeneName[tissues_df$Tissue == tis]
+  new = res2$GeneName[res2$tissue_ref==tis]
+  print(paste(tis,length(prev),length(new),length(intersect(prev,new))))
+  not_in_new = prev[!prev %in% new]
+  if (length(not_in_new) == 0){
+    print("Great!")
+    next;
+  }
+  print(length(not_in_new))
+  also_missing_from_all_sig_highly_expressed = which(not_in_new %in% all_sig_highly_expressed$GeneName)
+  print(length(also_missing_from_all_sig_highly_expressed))
+  if (length(also_missing_from_all_sig_highly_expressed) == 0){
+    print("all missing from sig highly expressed")
+    next;
+    }
+  
+  plot(hist(all_sig_highly_expressed[all_sig_highly_expressed$GeneName %in% not_in_new,FoldDifference]))
+}
+
+```
+#calculate germline from somatic genes selected at arbitrary thresholds.
+```{r}
+source("../scripts/define_tissue_unique_genes.R",local=T)
+
+get_tissue_specific_genes = function (thresh){
+  res = aggregate(FoldDifference~tissue_ref+GeneName,all_sig_highly_expressed,function(x)!any(log(2^x) > thresh))
+  res2 = (res[res$FoldDifference==T & !grepl("ERCC",res$GeneName),])
+  setkey(geneid,GeneName)
+  res3 = data.table(GeneSymbol=geneid[res2$GeneName,GeneSymbol],GeneName=res2$GeneName,Tissue=res2$tissue_ref)
+  
+  compute_ts_genes(res3)
+}
+
+#v = get_tissue_specific_genes(-2)
+
+```
+
+```{r}
+
+thresh_screen=rbindlist(lapply(seq(-4,-1,by=.25),function(thresh){
+  #res = aggregate(FoldDifference~tissue_ref+GeneName,all_sig_highly_expressed,function(x)!any(log(2^x) > thresh))
+  #res2 = res[res$FoldDifference==T & !grepl("ERCC",res$GeneName),]
+  #d = data.frame(table(res2$tissue_ref[res2$tissue_ref!="germ_line"]))
+ # d$thresh = thresh
+  #d
+  r = get_tissue_specific_genes(thresh)[Tissue!="germ_line",];
+  res = data.table(aggregate(GeneName~Tissue,r,length))
+  res$thresh = thresh;
+  res
+}))
+names(thresh_screen)[1] = "tissue"
+names(thresh_screen)[2] = "N"
+ggplot(thresh_screen,aes(thresh,N,color=tissue))+ geom_vline(xintercept=-2,lty=2) + geom_point() +geom_line() + xlab("Tissue-specific logFC threshold") +ylab("Number of Genes")+theme(legend.position=c(.1,.7))
+ggsave("../figures/R2R/tissue_specific_set_size.png",width=8,height=6)
+
+```
+```{r}
+model_name="d8_sw";
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+#load counts
+counts = bc$batch_counts_list[[model_name]]
+annots = data$annots
+setkey(annots,Sample)
+annots = annots[colnames(counts) ]
+erccs = data$ercc[,colnames(counts)]
+rm(data,bc)
+
+strain_to_use = c("QZ0","QZ120")
+counts2 = counts[,annots[Strain %in% strain_to_use,Sample]]
+annots2 = annots[Strain %in% strain_to_use,]
+
+erccs2 = erccs[,annots2$Sample]
+                         
+thresh_range = seq(-3.5,-1,by=.25);
+
+tissue_sets = lapply(thresh_range,function(thresh){
+  res = get_tissue_specific_genes(thresh);
+  pull(res, "Tissue", "GeneName")
+})
+
+#add in the published data at a random threshold.
+tissue_sets[[length(tissue_sets)+1]] = pull(tissues_df, "Tissue", "GeneName")
+thresh_range = c(thresh_range,-.5)
+
+germline_soma_sets = lapply(thresh_range,function(thresh){
+  res = get_tissue_specific_genes(thresh);
+  res2 = pull(res, "Tissue", "GeneName")
+  res2[res2 != "germ_line"] <- "soma"
+  res2
+})
+
+
+tissue_nfs = lapply(1:length(thresh_range), function(x){
+    tissue_nf <- normalizationFactorTissueSpecific(counts2, groups = annots2$Group, tissues = tissue_sets[[x]])
+    simplify2array(tissue_nf)
+})
+
+
+germline_soma_nfs = lapply(1:length(thresh_range), function(x){
+    tissue_nf <- normalizationFactorTissueSpecific(counts2, groups = annots2$Group, tissues = germline_soma_sets[[x]])
+    simplify2array(tissue_nf)
+})
+names(germline_soma_nfs) = model_names
+
+
+ercc_nfs = normalizationFactor(erccs2, groups = annots2$Group)
+
+
+tissue_sfs <- lapply(1:length(thresh_range), function(x){
+  sweep(tissue_nfs[[x]], 1, ercc_nfs, "/")
+})
+
+germline_soma_sfs <- lapply(1:length(thresh_range), function(x){
+  sweep(germline_soma_nfs[[x]], 1, ercc_nfs, "/")
+})
+```
+
+
+```{r}
+tissue_names = unique(tissue_sets[[1]])
+tissue_cors = rbindlist(lapply(1:length(thresh_range), function(x){
+  res = NULL;
+  for (i in 1:length(tissue_names)){
+     for (j in i:length(tissue_names)){
+      res = rbind(data.frame(thresh=thresh_range[[x]],
+                 tissue_1=tissue_names[[i]],
+                 tissue_2=tissue_names[[j]],
+                 cor = cor(tissue_sfs[[x]][,tissue_names[[i]]],tissue_sfs[[x]][,tissue_names[[j]]])
+                 ),res)
+     }
+  }
+  res
+}))
+tissue_cors$method = ifelse(tissue_cors$thresh == -.5,"Kaletsky et al","Eder et al.")
+tissue_cors$comp = apply(tissue_cors,1,function(x)paste(x[["tissue_1"]],x[["tissue_2"]]))
+t2 = tissue_cors[tissue_1!=tissue_2 & method=="Eder et al."]
+#t2 = tissue_cors[tissue_1!=tissue_2 ]
+t2$involves_germline = ifelse(grepl("germ",t2$comp),"Germline","Soma")
+ggplot(t2,aes(thresh,cor,color=comp,shape=involves_germline))+ geom_vline(xintercept=-2,lty=2)+geom_point()+geom_line() + xlab("Tissue-specific logFC threshold") +ylab("Tissue size factor correlation") 
+ggsave("../figures/R2R/tissue_size_factor_sensitivity.png",width=8,height=6)
+
+```
+

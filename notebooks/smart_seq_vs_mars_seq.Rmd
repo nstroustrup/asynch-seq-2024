@@ -1,0 +1,804 @@
+---
+title: "Gene Variability"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(BASiCS)
+library(dendextend)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+require(scales)
+library(RColorBrewer)
+library(pbapply)
+theme_set(theme_cowplot())
+
+library("wesanderson")
+
+source("../scripts/notebooks_helpers/gene_variability.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/basics.R")
+source("../scripts/helpers/clustering.R")
+source("../scripts/helpers/preprocess.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-4 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+cluster_colors <- c("firebrick", "sienna1", "cornflowerblue", "darkorchid", "black")
+```
+
+## Load data
+
+### Gene names
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+
+```
+
+### Counts
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+model_names = c("mars_seq_sep_plates");
+
+#model_names = c("d_glp1_m");
+#model_names = c("d8_20v25C")
+#model_names = c("ts_d_25C");
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+ercc_counts = data$ercc;
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+counts =lapply(model_names, function(x){
+                                  r = bc$batch_counts_list[[x]]
+                                  r[,colnames(r) %in% data$annots$Sample]
+                                 })
+names(counts) = model_names
+
+annots <- rbindlist(lapply(model_names,function(x){
+                  r = data$annots[Sample %in% colnames(counts[[x]])]
+                  r$model = x;
+                  r
+                }))
+setkey(annots, Sample)
+annots[, Strain := droplevels(Strain)]
+annots[, Genotype := droplevels(Genotype)]
+annots[, Day := droplevels(Day)]
+annots[, Group := droplevels(Group)]
+
+nf <- lapply(model_names,function(x){print(x);normalizationFactor(counts[[x]], groups = annots$Group[annots$model==x])})
+names(nf) = model_names;
+
+norm <- lapply(model_names,function(x){normalizeCounts(counts[[x]], nf[[x]])})
+names(norm) = model_names;
+
+rm(data, bc)
+```
+```{r}
+UMIs_per_individual = rowSums(t(counts[["mars_seq_sep_plates"]]))
+plate_1 = UMIs_per_individual[annots[Group=="QZ0 MARS-seq.t20.d8.fNEC937.br8.sw",Sample]]
+plate_2 = UMIs_per_individual[annots[Group=="QZ0 MARS-seq.t20.d8.fNEC937.br9.sw",Sample]]
+       
+       "QZ0 MARS-seq.t20.d8.fNEC937.br9.sw"
+```
+
+### Load Gene variability data
+
+```{r}
+params_df = NULL;
+trend_df = NULL;
+
+for (model in model_names){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,".csv.gz"))
+  p$model = model
+  params_df = rbind(p,params_df,fill=TRUE);
+  p <- fread(paste0("../data/gene_variability/summary_trend_",model,".csv.gz"))
+  p$model = model
+  trend_df = rbind(p,trend_df,fill=TRUE);
+}
+
+params_df[, Strain := factor(Strain)]
+params_df <- params_df[AllZeroProp == 0]
+params_df$ResDisp = as.numeric(params_df$ResDisp)
+if (0){ #no shared spike-in references between technologies
+params_shared_tech_df = NULL;
+for (model in model_names){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,"_shared_tech.csv.gz"))  
+  if (!("Food" %in% names(p))) p[,Food:=""]
+  if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+  p$model = model
+  params_shared_tech_df = rbind(p,params_shared_tech_df,fill=TRUE);
+}
+params_shared_tech_df[, Day := factor(Day, levels(annots$Day))]
+params_shared_tech_df[, Strain := factor(Strain, levels(annots$Strain))]
+params_shared_tech_df[, Food := factor(Food, unique(annots$Food))]
+params_shared_tech_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+params_shared_tech_df <- params_shared_tech_df[AllZeroProp == 0]
+params_shared_tech_df$ResDisp = as.numeric(params_shared_tech_df$ResDisp)
+}
+```
+
+
+```{r}
+#load differential_expression_data
+dva_multiple_shared_tech = list();
+dva_shared_tech_df <- rbindlist(lapply(model_names, function(filename) {
+  print(filename)
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename,".csv.gz"))
+ # browser()
+  multiple_regression_model = grepl("\\+",models$BiologicalCovariates[models$Name == filename]);
+  if (!multiple_regression_model){
+    prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+    prefix = substring(names(df)[3],0,prefix_N-2)
+   
+    names(df)[3:6] = paste0(substring(names(df)[3:6],prefix_N),"_mean")
+     
+    df$comparison_mean = prefix;
+    df$group = filename;
+    print(paste(filename,nrow(df),ncol(df)))
+    df_mean = df[, .(GeneName,GeneSymbol,log2FoldChange_mean,pvalue_mean,padj_mean,comparison_mean,group)]
+    
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+    prefix2_N = gregexpr("logFold",names(df2)[7])[[1]][[1]];
+    prefix2 = substring(names(df2)[7],0,prefix2_N-2)
+  
+    names(df2)[7:10] = paste0(substring(names(df2)[7:10],prefix2_N),"_overdispersion")
+    df_overdispersion = df2[, .(GeneName,logFoldChange_overdispersion,pvalue_overdispersion,padj_overdispersion)]
+    df_overdispersion$comparrison_da =  prefix2
+    
+    ret = merge(df_mean,df_overdispersion,by="GeneName");
+    return(ret);
+  }else{
+    fold_change_columns = which(grepl("FoldChange",names(df))& !grepl("Intercept",names(df)))
+    prefix_N = gregexpr("log2",names(df)[fold_change_columns])
+    prefix = unlist(lapply(1:length(fold_change_columns),function(col)substring(names(df)[fold_change_columns[col]],0,prefix_N[[col]][[1]]-2)))
+
+    
+    regression_results = lapply(1:length(fold_change_columns),function(col){
+      tmp = df[,fold_change_columns[[col]]:(fold_change_columns[[col]]+3)];
+       names(tmp) = paste0(substring(names(tmp),nchar(prefix[[col]])+2,nchar(prefix[[col]])+30),"_mean")
+       tmp$GeneName = df$GeneName;
+       tmp
+    })
+    names(regression_results) = prefix
+    
+    #add variability data to each estimand's table
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+    fold_change_columns2 = which(grepl("FoldChange",names(df2)) & !grepl("Intercept",names(df2)))
+    prefix2_N = gregexpr("log",names(df2)[fold_change_columns2])
+    prefix2 = unlist(lapply(1:length(fold_change_columns2),function(col)substring(names(df2)[fold_change_columns2[col]],0,prefix2_N[[col]][[1]]-2)))
+    
+     for (col in 1:length(fold_change_columns2)){
+       source_cols = names(df2)[fold_change_columns2[[col]]:(fold_change_columns2[[col]]+3)];
+       dest_cols = paste0(substring(source_cols,nchar(prefix2[[col]])+2,nchar(prefix2[[col]])+30),"_overdispersion")
+       tmp = df2[,source_cols,with=F];
+       names(tmp) = dest_cols;
+       tmp$GeneName = df2$GeneName;
+       regression_results[[ prefix[[col]] ]] = merge( regression_results[[ prefix[[col]] ]],tmp,by="GeneName")
+     }
+    mean_overdispersion_name_matches = unlist(lapply(1:length(fold_change_columns),function(i)paste(prefix[[i]], "(",prefix2[[i]],")")))
+    
+    dva_multiple_shared_tech[[filename]] <<- list(estimands = regression_results, variables = prefix,variable_matches=mean_overdispersion_name_matches)
+    return(NULL)
+  }
+}))
+
+
+```
+
+##  residual overdispersion - USING CONSENSUS SPIKE-IN NORMALIZATION
+
+```{r}
+ library(viridis) 
+i = "mars_seq_sep_plates"
+ #  print(i)
+  params <- params_df[params_df$model == i ,]
+  params$grp = factor(as.character(params$Strain))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+ # params[ResDisp < -10,ResDisp := -10];
+  params=  params[LogMean > log2(10),]
+ # psp = params[LogMean > log(10),]
+  #psp2 = params[LogMean > log(100000) ,];
+  #browser()
+  gp = ggplot() +
+    geom_point_rast(aes(2^(LogMean), ResVar,color=grp), params, alpha = .5, 
+               size = .75, pch = 20,raster.dpi=600) +
+    scale_x_log10(labels = scales::number_format())  +
+    
+   #geom_vline(xintercept = 50, linetype = "dashed") +
+  # geom_vline(xintercept = 100000, linetype = "dashed") +
+   #geom_hline(yintercept = 1.5, linetype = "dashed") +
+   geom_smooth(aes(2^(LogMean), ResVar,color=grp), params, )+
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Variation")+
+  scale_color_viridis(discrete = TRUE)
+  gp
+
+```
+
+##   overdispersion vs mean - USING type-specific SPIKE-IN NORMALIZATION
+
+```{r,fig.width=8,height=8}
+source("../scripts/helpers/gene_variability.R")
+ library(viridis) 
+i = "mars_seq_sep_plates"
+ #  print(i)
+ params <- params_df[model == i & bad_fit == F & LogMean >=log2(1),]
+  params$grp = factor(as.character(params$Strain))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  
+  params$tech = params$Strain#ifelse(params$grp == "QZ0","Smart-Seq2","MARS-Seq")
+  params$transcript_type = ifelse(params$SequenceType == "Biological","mRNA","spike-in")
+
+  if(1){
+    trend_line = rbindlist(lapply(unique(params$Strain),function(str){
+      fit = generate_predictive_model_from_min_fit(as.numeric(trend_df[model == i & Strain==str,][,6:34]))
+      new_x = seq(min(params[Strain==str,]$LogMean), max(params[Strain==str,]$LogMean), length.out = 1001)
+      data.table(LogMean = new_x,LogVar=predict(fit,new_x)$y,Strain=str,SequenceType = "Technical")
+    }))
+  }else{
+    trend_line = rbindlist(lapply(unique(params$Strain),function(str){
+      
+      tl = data.frame(t(trend_df[model == i & Strain==str,][,6:34]))
+      names(tl) = "LogVar";
+      tl$LogMean = log2(as.numeric(substring(rownames(tl),2,10)))
+      tl = tl[!is.na(tl$LogDisp),]
+      tl$Strain = str;
+      tl
+    }))
+  }
+  
+  trend_line$transcript_type = ifelse(trend_line$SequenceType == "Biological","mRNA","spike-in")
+  
+  
+  #trend_line$tech = trend_line$Strain #ifelse(trend_line$Strain == "QZ0","Smart-Seq2","MARS-Seq")
+   
+
+  r =   wes_palette("Zissou1")
+  grps = c("MARS-Seq, Bead Purification spike-in",
+             "MARS-Seq, Bead Purification mRNA",
+             "MARS-Seq, No Purification spike-in",
+             "MARS-Seq, No Purification mRNA",
+             "Smart-Seq2, Bead Purification spike-in",
+             "Smart-Seq2, Bead Purification mRNA")
+  colors = c(r[4],r[4],r[5],r[5],r[1],r[1])
+  names(colors)=grps
+  
+  params$label = ifelse(grepl("Plate 2",params$Strain),"MARS-Seq, No Purification",ifelse(grepl("Plate 1",params$Strain),"MARS-Seq, Bead Purification","Smart-Seq2, Bead Purification"))
+  trend_line$label = ifelse(grepl("Plate 2",trend_line$Strain),"MARS-Seq, No Purification",ifelse(grepl("Plate 1",trend_line$Strain),"MARS-Seq, Bead Purification","Smart-Seq2, Bead Purification"))
+  
+  gp = ggplot(data=NULL,aes(2^LogMean, 2^LogVar)) +
+    geom_point_rast(aes(color=paste(label,transcript_type),bg=paste(label,transcript_type)),params[ SequenceType!="Technical",] , alpha = .3, 
+               size = 1, pch = 20) +
+   
+    scale_x_log10(labels = scales::number_format())  + 
+    scale_y_log10(labels = scales::number_format())  + 
+    geom_path(aes(group=paste(label,transcript_type)),color="black",data=trend_line,lwd=1.3) +
+    geom_path(aes(color=paste(label,transcript_type)),data=trend_line,lwd=1) +
+    scale_color_manual(name="RNA type",values=colors)+
+    scale_fill_manual(name="RNA type",values=colors)+
+    geom_point(aes(bg=paste(label,transcript_type)),params[ SequenceType=="Technical",] , alpha = 1, 
+               size = 2, color="black",pch = 21) +
+   # geom_hline(yintercept = c(-4))+
+   
+   # geom_smooth(aes(2^(LogMean), LogDisp,color=paste(tech,transcript_type)), params[SequenceType=="Technical",],method="loess", se=F,size=.75)+
+   
+    xlab("Mean Gene Expression (Counts)") +
+    ylab("Cohort Variation (Counts^2)")+
+    theme(legend.position=c(.025,.8))#+
+
+  
+   # scale_color_viridis(discrete = TRUE)
+  gp
+  ggsave("../figures/01/S_mars_seq_variation.pdf",width=8,height=8)
+
+```
+
+#look at interpretation of spike-in trend fitting across bootstrap replicates
+```{r,fig.width=18}
+if (0){
+library(stringr)
+tl = read.csv("../data/gene_variability/trend_mars_seq.csv.gz")
+source("../scripts/helpers/gene_variability.R")
+r = summarizeTrend(as.data.table(tl))
+stop()
+ tl_long = rbindlist(lapply(unique(tl$Strain),function(str){
+      tlt = tl[tl$Strain==str,2:30];
+      tlt = melt(tlt,measure.vars = names(tlt))
+    
+      names(tlt)[2] = "LogDisp";
+      xv = substring(tlt[,1],2,10)
+      xv = str_replace(xv,"e.","e+")
+      tlt$LogMean = log2(as.numeric(xv))
+      
+      tlt$Strain = str;
+      tlt
+     
+    }))
+ na_frac = aggregate(LogDisp~LogMean+Strain,data=tl_long,FUN=function(x){length(which(is.na(x)))},na.action=na.pass) 
+ names(na_frac)[3] = "NA.Count"
+ good_frac = aggregate(LogDisp~LogMean+Strain,data=tl_long,FUN=function(x){length(which(!is.na(x)))},na.action=na.pass)
+ names(good_frac)[3] = "Good.Count"
+ na_info = merge(na_frac,good_frac,by=c("LogMean","Strain"))
+ na_info$frac = na_info$NA.Count/(na_info$NA.Count+na_info$Good.Count);
+ na_info = na_info[order(na_info$Strain,na_info$LogMean),]
+ tl_long = tl_long[!is.na(tl_long$LogDisp),]
+ tl_long$Mean = 2^tl_long$LogMean;
+ lvls = unique(tl_long$Mean);
+ lvls = lvls[order(lvls)]
+ tl_long$Mean = factor(tl_long$Mean,levels=lvls)
+ 
+ ggplot(tl_long,aes(LogDisp,fill=Strain)) + geom_histogram() + facet_wrap(~Strain+Mean,scales="free")
+}
+```
+
+## play around with spike-in model fitting
+
+```{r,fig.height=5,fig.width=8}
+if (0){
+source("../scripts/helpers/gene_variability.R")
+library(viridis) 
+library(splines)
+i = "mars_seq"
+  params <- params_df[params_df$model == i & bad_fit==F,]
+  params$grp = factor(as.character(params$Strain))
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  
+  params$tech = ifelse(params$Strain == "QZ0","Smart-Seq2","MARS-Seq")
+  #params[ResDisp < -10,ResDisp := -10];
+ # params=  params[LogMean > log2(10),]
+ # psp = params[LogMean > log(10),]
+  if(0){
+  fit_list = lapply(unique(params$Strain),function(str){
+   # str="QZ0 MARS-seq"
+    print(paste("Fitting",str))
+    flush.console();
+      good_params = params[Strain==str,]
+      max_tech = max(good_params[SequenceType == "Technical",LogMean])
+    	x_bounds = quantile(good_params[good_params$LogMean <= max_tech,LogMean],seq(0,1,.025))
+	    x_i = seq(2,length(x_bounds)-1,2)
+	    x_c = x_bounds[x_i]
+	    x_mins =rbindlist(lapply(x_i,FUN=function(i){
+	      xb = x_bounds[c(i-1,i+1)];
+	     # min_cutoff = quantile(good_params[LogMean>= xb[1] & LogMean < xb[2],LogDisp],.01)
+	      min_cutoff = min(good_params[LogMean>= xb[1] & LogMean < xb[2],LogDisp])
+	      return(good_params[LogMean>= xb[1] & LogMean < xb[2] & LogDisp <= min_cutoff,.(LogMean,LogDisp,SequenceType)])
+	    }))
+	    
+      iter <- 0
+	    max_iter <- 1000
+	    fit <- NULL
+	    while(is.null(fit) & iter <= max_iter) {
+	      cat(".")
+	      iter <- iter + 1
+	      init <- list(Asym  = - rlnorm(1, mean(good_params$LogMean), 0.4),
+			   resp0 = rlnorm(1, log(0.6), 0.4),
+			   lrc   = - rlnorm(1, log(2.4), 0.4))
+	      fit <- tryCatch(
+	        nls(LogDisp ~ Asym + (resp0-Asym) * exp(-exp(lrc)*LogMean), data = as.data.table(x_mins), start = init),
+			      error = function(e) {return(NULL)
+			 })
+	    }
+	     fit;
+ })
+	 fit_params <- as.data.table(t(sapply(fit_list, coef)))
+	 fit_params$Strain = unique(params$Strain)
+  }else{
+  
+	 fit_list2 = rbindlist(lapply(unique(params$Strain),function(str){
+	    # str="QZ0 MARS-seq"
+      print(paste("Fitting",str))
+      flush.console();
+	    as.data.frame(t(fit_bio_and_tech_running_minimum(params[Strain==str,])))
+   }))
+  }
+	fit_list2$Strain = unique(params$Strain)
+}
+```
+
+
+```{r,fig.height=5,fig.width=8}
+if (0){
+trend_line$tech = ifelse(trend_line$Strain == "QZ0","Smart-Seq2","MARS-Seq")
+  trend_line$SequenceType = "Technical"
+ 
+   # trend_line[, LogDisp := Asym + (resp0 - Asym) * exp(-exp(lrc)* LogMean)]
+
+  
+  if (0){
+   #plot raw nin fit
+    trend_line2 = rbindlist(lapply(unique(params$Strain),function(str){
+    dat = data.frame(LogMean = log2(new_x),LogDisp= as.numeric(fit_list2[fit_list2$Strain == str,colnames(fit_list2)[colnames(fit_list2)!="Strain"],with=FALSE]),Strain=str)
+ 
+  }))
+   trend_line2 = trend_line2[!is.na(trend_line2$LogDisp),] 
+  }else{
+  
+    
+    
+    trend_line2 = rbindlist(lapply(unique(params$Strain),function(str){
+       f = generate_predictive_model_from_min_fit(as.numeric(fit_list2[fit_list2$Strain == str,colnames(fit_list2)[colnames(fit_list2)!="Strain"],with=FALSE]))
+      
+       rng = range(params[Strain==str,LogMean])
+       new_x2 = seq(rng[1],rng[2],length.out=100);
+       data.frame(LogMean = new_x2,LogDisp = predict(f,new_x2)$y,Strain=str)
+    }))
+  }
+  
+  trend_line2$tech = ifelse(trend_line2$Strain == "QZ0","Smart-Seq2","MARS-Seq")
+  trend_line2$SequenceType = "Technical"
+	    
+	    
+	    
+  psp= params;
+  psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+ gp = ggplot(data=NULL,aes(2^LogMean, LogDisp)) +
+    geom_line(aes(color=tech),trend_line) +
+    geom_point(aes(color=paste(tech,SequenceType)),params[ SequenceType=="Technical",] , alpha = .5, 
+               size = 4, pch = 20) +
+    geom_point_rast(aes(color=paste(tech,SequenceType)),params[ SequenceType!="Technical",] , alpha = .5, 
+               size = 2, pch = 20,raster.dpi=600) +
+    scale_x_log10(labels = scales::number_format())  +
+   # geom_line(data=trend_line) +
+    geom_line(aes(color=tech),data=trend_line2,lwd=2) +
+   
+  # geom_smooth(aes(2^(LogMean), LogDisp,color=paste(tech,SequenceType)), params,method="loess", se=F,size=.75)+
+   
+    xlab("Mean Gene Expression") +
+    ylab("Overdispersion")#+
+  #scale_color_viridis(discrete = TRUE)
+  plot(gp)
+}
+
+```
+##  residual overdispersion PLATES TOGETHER
+
+```{r}
+if (0){
+ library(viridis) 
+library(stringr)
+i = "mars_seq"
+  params <- params_df[params_df$model == i & bad_fit ==F,]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain,"-",".")
+  params$grp = as.character(params$Strain)  
+  
+  params = as.data.frame(params[LogMean > log2(3),])
+
+  log_mean = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="LogMean")
+  res_disp = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="ResDisp")
+  res_disp_se = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="ResDispSE")
+  res_disp = data.table(merge(res_disp,res_disp_se,by=c("GeneName","SequenceType"),suffixes=c("","SE")))
+
+  overdisp = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="LogDisp")
+  
+   
+  gp = ggplot(log_mean,aes(QZ0, QZ0.MARS.seq)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+geom_smooth(se=F)+xlab("Smart-Seq2") + ylab("MARS-Seq")+
+  scale_color_viridis(discrete = TRUE) + ggtitle("Log Mean Expression")
+  plot(gp)
+  mean_lm = lm(QZ0.MARS.seq~QZ0,log_mean)
+  #browser()
+ 
+    gp = ggplot(overdisp,aes(QZ0, QZ0.MARS.seq)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+geom_smooth(se=F)+xlab("Smart-Seq2") + ylab("MARS-Seq")+
+  scale_color_viridis(discrete = TRUE)+ ggtitle("Overdispersion")
+  plot(gp)
+  
+  gp = ggplot(res_disp,aes(QZ0, QZ0.MARS.seq)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+geom_smooth(se=F)+geom_smooth(method="lm",se=F,col="red")+xlab("Smart-Seq2") + ylab("MARS-Seq")+
+  scale_color_viridis(discrete = TRUE) + ggtitle("Residual Overdispersion")
+  plot(gp)
+  resdisp_lm = lm(QZ0.MARS.seq~QZ0,res_disp)
+}
+
+```
+##  residual overdispersion EACH PLATE SEPARATE
+
+```{r}
+ library(viridis) 
+i = "mars_seq_sep_plates"
+  params <- params_df[params_df$model == i & bad_fit ==F ,]
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain,"\t",".")
+  params$Strain = str_replace(params$Strain,"-",".")
+  params$grp = as.character(params$Strain)  
+  
+  params = as.data.frame(params[LogMean > log2(3),])
+
+  res_disp = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="ResVar")
+  res_disp_se = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="ResVarSE")
+  res_disp = data.table(merge(res_disp,res_disp_se,by=c("GeneName","SequenceType"),suffixes=c("","SE")))
+  res_disp = melt(res_disp,measure.vars=c("QZ0.MARS.seq.Plate.1","QZ0.MARS.seq.Plate.2"))
+  res_disp = res_disp[!is.na(res_disp$value),]
+  
+  overdisp = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="LogVar")
+  overdisp = melt(overdisp,measure.vars=c("QZ0.MARS.seq.Plate.1","QZ0.MARS.seq.Plate.2"))
+  overdisp = overdisp[!is.na(overdisp$value),]
+  
+  log_mean = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="LogMean")
+  log_mean = melt(log_mean,measure.vars=c("QZ0.MARS.seq.Plate.1","QZ0.MARS.seq.Plate.2"))
+  log_mean = log_mean[!is.na(log_mean$value),]
+  
+  #plate 1 is purified
+  
+ log_mean$label = ifelse(grepl("Plate.2",log_mean$variable),"No Purification","Bead Purification")
+ overdisp$label = ifelse(grepl("Plate.2",overdisp$variable),"No Purification","Bead Purification")
+ 
+   r =   wes_palette("Zissou1")
+  grps = c("Bead Purification",
+             "No Purification",
+             "QZ0")
+  colors = c(r[4],r[5],r[1])
+  names(colors)=grps
+ 
+  cor(log_mean[log_mean$label=="Bead Purification",]$QZ0,log_mean[log_mean$label=="Bead Purification",]$value,use="complete.obs")
+  cor(log_mean[log_mean$label!="Bead Purification",]$QZ0,log_mean[log_mean$label!="Bead Purification",]$value,use="complete.obs")
+ gp1 = ggplot(log_mean,aes(2^QZ0, 2^value,color=label,group=label)) +
+    geom_point_rast(alpha = .3,  size = .75, pch = 20,raster.dpi=600)+
+   geom_abline(slope=1,intercept=0,color="black")+
+   geom_smooth(se=F,lwd=2,color="black")+
+   geom_smooth(se=F,lwd=1)+
+   xlab("Smart-Seq2") + 
+   ylab("MARS-Seq") +
+   scale_color_manual(name="Mean Expression",values=colors)+
+  scale_y_continuous(breaks=2^seq(0,max(log_mean$value)+1,2),trans="log10")+
+   scale_x_continuous(breaks=2^seq(0,max(log_mean$value)+1,2),trans="log10")+theme(legend.position=c(0,1),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+   
+  
+  cor(log_mean[overdisp$label=="Bead Purification",]$QZ0,overdisp[log_mean$label=="Bead Purification",]$value,use="complete.obs")
+  cor(log_mean[overdisp$label!="Bead Purification",]$QZ0,overdisp[log_mean$label!="Bead Purification",]$value,use="complete.obs")
+ gp2= ggplot(overdisp,aes(2^QZ0, 2^value,color=label,group=label)) +
+    geom_point_rast(alpha = .3,  size = .75, pch = 20,raster.dpi=600)+
+   geom_abline(slope=1,intercept=0,color="black")+
+   geom_smooth(se=F,lwd=2,color="black")+
+   geom_smooth(se=F,lwd=1)+
+   xlab("Smart-Seq2") + ylab("MARS-Seq") +
+     scale_color_manual(name="Cohort Variance",values=colors)+
+ scale_y_continuous(breaks=2^seq(-6,max(overdisp$value),3),trans="log2")+
+   scale_x_continuous(breaks=2^seq(-6,max(overdisp$value),3),trans="log2")+theme(legend.position=c(0,1),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ 
+ g = gridExtra::grid.arrange(gp1,gp2,nrow=1)
+ ggsave("../figures/R2R/MARS_SMART_mean_variance.png",g,width=16,height=8)
+ if (0){
+  overdisp2 = merge(log_mean,overdisp,by=c("GeneName","variable"),suffixes=c(".Mean",".Var"))
+  
+   ggplot(overdisp2,aes(QZ0.Var, value.Var,color=QZ0.Mean)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(colors=c("green","black","red"))+
+   
+   geom_smooth(se=F,col="gray")+geom_smooth(,method="lm",se=F,col="black")+ facet_wrap(~variable)+ xlab("Smart-Seq2") + ylab("MARS-Seq")+ ggtitle("Overdispersion") +  scale_y_continuous(breaks=seq(-6,max(overdisp2$value.Var),1))+ scale_x_continuous(breaks=seq(-6,max(overdisp2$value.Var),1))
+   
+    overdisp2 = merge(log_mean,overdisp,by=c("GeneName","variable"),suffixes=c(".Mean",".Var"))
+  
+   ggplot(overdisp2[!is.na(overdisp2$QZ0.Mean) & overdisp2$QZ0.Mean > 5,],aes(QZ0.Var, value.Var,color=QZ0.Mean)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(colors=c("green","black","red"))+
+   
+   geom_smooth(se=F,col="gray")+geom_smooth(,method="lm",se=F,col="black")+ facet_wrap(~variable)+ xlab("Smart-Seq2") + ylab("MARS-Seq")+ ggtitle("Overdispersion") +  scale_y_continuous(breaks=seq(-6,max(overdisp2$value.Var),1))+ scale_x_continuous(breaks=seq(-6,max(overdisp2$value.Var),1))
+
+  #OvERLAY MEAN EXPRESSION ON OVERDISPERSION FITS
+  ggplot(res_disp,aes(2^QZ0, 2^value,color=variable)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+    geom_smooth(se=F,col="gray")+
+    geom_smooth(,method="lm",se=F,col="black")+ facet_wrap(~variable)+ xlab("Smart-Seq2") + ylab("MARS-Seq")+  scale_y_continuous(breaks=2^seq(-4,max(res_disp$value),4),trans="log2")+ 
+    scale_x_continuous(breaks=2^seq(-4,max(res_disp$value),4),trans="log2")+
+     scale_color_manual(name="Cohort Variance",values=colors)
+
+  
+   ggplot(res_disp2,aes(QZ0.ResDisp, value.ResDisp,color=QZ0.Mean)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(colors=c("green","black","red"))+
+   
+   geom_smooth(se=F,col="gray")+geom_smooth(,method="lm",se=F,col="black")+ facet_wrap(~variable)+ xlab("Smart-Seq2") + ylab("MARS-Seq")+ ggtitle("Residual Overdispersion") +  scale_y_continuous(breaks=seq(0,max(res_disp2$value.ResDisp),1))+ scale_x_continuous(breaks=seq(0,max(res_disp2$value.ResDisp),1))
+   
+ }
+   
+ 
+  res_disp2 = merge(log_mean,res_disp,by=c("GeneName","variable"),suffixes=c(".Mean",".ResVar"))
+  
+  x_axis_label_range = c(-5,8)
+  x_axis_labels = c(paste0("1/",2^(abs(x_axis_label_range[1]):1)),as.character(2^c(0:x_axis_label_range[2])))
+  x_axis_labels[! 1:length(x_axis_labels) %in% seq(2,length(x_axis_labels)-1,by=2)] = ""
+  x_axis_breaks = 2^(x_axis_label_range[1]:x_axis_label_range[2])
+  
+  
+  var_limits =aggregate(value.ResVar~variable,res_disp2,quantile,probs=c(.001,.999))
+  var_limits = c(min(var_limits[,2][,1]),max(var_limits[,2][,2]))
+  var_limits[2] = log2(1000)
+  res_disp2_capped = data.table(res_disp2)
+  res_disp2_capped[,value.ResVar:=ifelse(value.ResVar> var_limits[2],var_limits[2],ifelse(value.ResVar< var_limits[1],var_limits[1],value.ResVar))]
+  
+  
+ res_disp2_capped$label = ifelse(grepl("Plate.2",res_disp2_capped$variable),"No Purification","Bead Purification")
+ res_disp2_capped$label = ifelse(grepl("Plate.2",res_disp2_capped$variable),"No Purification","Bead Purification")
+ 
+   r =   wes_palette("Zissou1")
+  grps = c("Bead Purification",
+             "No Purification",
+             "QZ0")
+  colors = c(r[4],r[5],r[1])
+  names(colors)=grps
+  
+  
+  
+  dat_to_plot = res_disp2_capped[!is.na(res_disp2$QZ0.Mean) & 2^res_disp2$QZ0.Mean > 5,]
+  dat_to_fit = dat_to_plot[2^QZ0.ResVar>=1,]
+  
+  cor(dat_to_fit[label ==  "Bead Purification"  ]$QZ0.ResVar,dat_to_fit[label ==  "Bead Purification"]$value.ResVar)
+  cor(dat_to_fit[label !=  "Bead Purification"  ]$QZ0.ResVar,dat_to_fit[label !=  "Bead Purification"]$value.ResVar)
+  avg_across_bead_methods = data.table(aggregate(value.ResVar~GeneName,dat_to_fit,mean))
+  setkey(avg_across_bead_methods,GeneName)
+  dat_to_fit$avg_across_bead_methods = avg_across_bead_methods[dat_to_fit$GeneName,value.ResVar]
+  cor(dat_to_fit[label ==  "Bead Purification"  ]$QZ0.ResVar,dat_to_fit[label ==  "Bead Purification"  ]$avg_across_bead_methods)
+  
+  gp1 = ggplot(dat_to_plot,aes(2^QZ0.ResVar, 2^value.ResVar,color=2^value.Mean))+
+    geom_hline(yintercept=c(1,5,10,50,100,1000),lty=2,col="dark gray",lwd=.5)+
+  annotate("rect",xmin = min(2^dat_to_plot$QZ0.ResVar),xmax=1,ymin=min(2^dat_to_plot$value.ResVar),ymax=max(2^dat_to_plot$value.ResVar),fill="light pink")+
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(name="Mean Expression",trans="log2",colors=c("green","black","red"))+
+   geom_smooth(method="lm",lwd=2,se=F,col="white",data=dat_to_fit)+ 
+   geom_smooth(method="lm",lwd=1.5,se=F,col="purple",data=dat_to_fit)+ 
+   geom_smooth(se=F,lwd=2,col="white",data=dat_to_fit)+
+   geom_smooth(se=F,lwd=1.5,col="blue",data=dat_to_fit)+
+     facet_wrap(~label)+ xlab("Residual Variance (Counts^2)\nSmart-Seq2") + ylab("Residual Variance (Counts^2)\nMARS-Seq")+ 
+  #  scale_y_continuous(breaks=x_axis_breaks,labels=x_axis_labels,trans="log10")+ 
+   # scale_x_continuous(breaks=x_axis_breaks,labels=x_axis_labels,trans="log10")+
+     
+     scale_x_continuous(breaks=c(1,5,10,50,100,500,1000,5000),labels = scales::number_format(),trans="log10")+
+     scale_y_continuous(breaks=c(1,5,10,50,100,500,1000,5000),labels = scales::number_format(),trans="log10")+
+   
+    geom_vline(xintercept=1,col="gray",lwd=1,lty="22") + 
+    theme(strip.background  = element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          legend.position="none",
+        strip.text.x = element_blank()
+            )
+   #  scale_color_manual(name="Cohort Variance",values=colors)
+   
+ gp2 = ggplot(dat_to_fit[label ==  "Bead Purification",],aes(2^QZ0.ResVar, 2^avg_across_bead_methods,color=2^value.Mean))+
+    geom_hline(yintercept=c(1,5,10,50,100,1000),lty=2,col="dark gray",lwd=.5)+
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(name="Mean Expression",trans="log2",colors=c("green","black","red"))+
+   geom_smooth(method="lm",lwd=2,se=F,col="white",data=dat_to_fit)+ 
+   geom_smooth(method="lm",lwd=1.5,se=F,col="purple",data=dat_to_fit)+ 
+   geom_smooth(se=F,lwd=2,col="white",data=dat_to_fit)+
+   geom_smooth(se=F,lwd=1.5,col="blue",data=dat_to_fit)+ 
+   ylab("")+
+   xlab("Residual Variance (Counts^2)\nSmart-Seq2") +
+   #ylab("Residual Variance (Counts^2)\nMARS-Seq")+ 
+  #  scale_y_continuous(breaks=x_axis_breaks,labels=x_axis_labels,trans="log10")+ 
+   # scale_x_continuous(breaks=x_axis_breaks,labels=x_axis_labels,trans="log10")+
+     
+     scale_x_continuous(breaks=c(1,5,10,50,100,500,1000,5000),labels = scales::number_format(),trans="log10")+
+     scale_y_continuous(breaks=c(1,5,10,50,100,500,1000,5000),labels = scales::number_format(),trans="log10")+
+   
+    geom_vline(xintercept=1,col="gray",lwd=1,lty="22") + theme(strip.background  = element_blank(),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+   #  scale_color_manual(name="Cohort Variance",values=colors)
+ ggpubr::ggarrange(gp1,gp2,ncol=2)
+   ggsave("../figures/01/S_mars_seq_resvar.pdf",width=14,height=8)
+quantile(res_disp2$QZ0.ResDisp,seq(0,1,by=.1),na.rm=T)
+table(res_disp2$QZ0.ResDisp<5)
+
+```
+##  residual overdispersion EACH PLATE SEPARATE - COMPARING MARS SEQ
+
+```{r}
+ library(viridis) 
+i = "mars_seq_sep_plates"
+  params <- params_df[params_df$model == i & bad_fit ==F,]
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain," ",".")
+  params$Strain = str_replace(params$Strain,"\t",".")
+  params$Strain = str_replace(params$Strain,"-",".")
+  params$grp = as.character(params$Strain)  
+  
+  params = as.data.frame(params[LogMean > log2(3),])
+
+  res_disp = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="ResDisp")
+  res_disp = res_disp[!is.na(res_disp$QZ0.MARS.seq.Plate.1) & !is.na(res_disp$QZ0.MARS.seq.Plate.2),]
+  overdisp = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="LogDisp")
+  overdisp = overdisp[!is.na(overdisp$QZ0.MARS.seq.Plate.1) & !is.na(overdisp$QZ0.MARS.seq.Plate.2),]
+  log_mean = reshape2::dcast(params,GeneName+SequenceType ~ grp,value.var="LogMean")
+  log_mean = log_mean[!is.na(log_mean$QZ0.MARS.seq.Plate.1) & !is.na(log_mean$QZ0.MARS.seq.Plate.2) ,]
+  
+
+  
+ # resdisp_lm = lm(QZ0.MARS.seq~QZ0,res_disp)
+  #R2 = .2
+ 
+  gp = ggplot(log_mean,aes(QZ0.MARS.seq.Plate.1, QZ0.MARS.seq.Plate.2)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+geom_smooth(se=F)+ xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+
+  scale_color_viridis(discrete = TRUE) + ggtitle("Log Mean Expression")+ scale_y_continuous(breaks=seq(1,max(log_mean$QZ0.MARS.seq.Plate.1,log_mean$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(1,max(log_mean$QZ0.MARS.seq.Plate.1,log_mean$QZ0.MARS.seq.Plate.2),1))
+  plot(gp)
+  
+  res = lm( QZ0.MARS.seq.Plate.2~QZ0.MARS.seq.Plate.1,log_mean)
+  hist( log_mean$QZ0.MARS.seq.Plate.2-log_mean$QZ0.MARS.seq.Plate.1,breaks=100)
+  #table(log_mean$QZ0.MARS.seq.Plate.2-log_mean$QZ0.MARS.seq.Plate.1)
+   gp = ggplot(overdisp,aes(QZ0.MARS.seq.Plate.1, QZ0.MARS.seq.Plate.2)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+geom_smooth(se=F)+ xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+
+  scale_color_viridis(discrete = TRUE)+ ggtitle("Overdispersion")+ scale_y_continuous(breaks=seq(-8,max(overdisp$QZ0.MARS.seq.Plate.1,overdisp$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(-8,max(overdisp$QZ0.MARS.seq.Plate.1,overdisp$QZ0.MARS.seq.Plate.2),1))
+  plot(gp) 
+  
+ overdisp2 = merge(log_mean,overdisp,by=c("GeneName"),suffixes=c(".Mean",".Var"))
+     ggplot(overdisp2,aes(QZ0.MARS.seq.Plate.1.Var, QZ0.MARS.seq.Plate.2.Var,color=QZ0.MARS.seq.Plate.2.Mean)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(colors=c("green","black","red"))+  geom_smooth(se=F) +xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+
+  ggtitle("Overdispersion")+ scale_y_continuous(breaks=seq(-8,max(overdisp$QZ0.MARS.seq.Plate.1,overdisp$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(-8,max(overdisp$QZ0.MARS.seq.Plate.1,overdisp$QZ0.MARS.seq.Plate.2),1))
+     
+     ggplot(overdisp2[overdisp2$QZ0.MARS.seq.Plate.2.Mean >5,],aes(QZ0.MARS.seq.Plate.1.Var, QZ0.MARS.seq.Plate.2.Var,color=QZ0.MARS.seq.Plate.2.Mean)) +
+    geom_point_rast(alpha = .5,  size = .75, pch = 20,raster.dpi=600)+
+     scale_colour_gradientn(colors=c("green","black","red"))+  geom_smooth(se=F) +xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+
+  ggtitle("Overdispersion")+ scale_y_continuous(breaks=seq(-8,max(overdisp$QZ0.MARS.seq.Plate.1,overdisp$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(-8,max(overdisp$QZ0.MARS.seq.Plate.1,overdisp$QZ0.MARS.seq.Plate.2),1))
+  
+  gp = ggplot(res_disp,aes(QZ0.MARS.seq.Plate.1, QZ0.MARS.seq.Plate.2)) +
+    geom_point(alpha = .5,  size = .75, pch = 20)+geom_smooth(se=F,col="gray")+geom_smooth(,method="lm",se=F,col="black")+
+    xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+ ggtitle("Residual Overdispersion") +  scale_y_continuous(breaks=seq(0,max(res_disp$QZ0.MARS.seq.Plate.1,res_disp$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(0,max(res_disp$QZ0.MARS.seq.Plate.1,res_disp$QZ0.MARS.seq.Plate.2),1))
+  plot(gp)
+  
+   res_disp2 = merge(log_mean,res_disp,by=c("GeneName"),suffixes=c(".Mean",".ResDisp"))
+   
+ggplot(res_disp2,aes(QZ0.MARS.seq.Plate.1.ResDisp, QZ0.MARS.seq.Plate.2.ResDisp,color=QZ0.MARS.seq.Plate.2.Mean)) +
+    geom_point(alpha = .5,  size = .75, pch = 20)+
+     scale_colour_gradientn(colors=c("green","black","red"))+geom_smooth(se=F,col="gray")+geom_smooth(,method="lm",se=F,col="black")+
+    xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+ ggtitle("Residual Overdispersion") +  scale_y_continuous(breaks=seq(0,max(res_disp$QZ0.MARS.seq.Plate.1,res_disp$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(0,max(res_disp$QZ0.MARS.seq.Plate.1,res_disp$QZ0.MARS.seq.Plate.2),1))
+
+ggplot(res_disp2[overdisp2$QZ0.MARS.seq.Plate.2.Mean >5,],aes(QZ0.MARS.seq.Plate.1.ResDisp, QZ0.MARS.seq.Plate.2.ResDisp,color=QZ0.MARS.seq.Plate.2.Mean)) +
+    geom_point(alpha = .5,  size = .75, pch = 20)+
+     scale_colour_gradientn(colors=c("green","black","red"))+geom_smooth(se=F,col="gray")+geom_smooth(,method="lm",se=F,col="black")+
+    xlab("MARS-Seq Plate 1") + ylab("MARS-Seq Plate 2")+ ggtitle("Residual Overdispersion") +  scale_y_continuous(breaks=seq(0,max(res_disp$QZ0.MARS.seq.Plate.1,res_disp$QZ0.MARS.seq.Plate.2),1))+ scale_x_continuous(breaks=seq(0,max(res_disp$QZ0.MARS.seq.Plate.1,res_disp$QZ0.MARS.seq.Plate.2),1))
+
+```
+```{r}
+ercc_annotations = fread("../data/annotations/cms_095046.txt")
+names(ercc_annotations)[grepl("ERCC ID",names(ercc_annotations))] = "GeneName"
+names(ercc_annotations)[grepl("concentration in Mix 1",names(ercc_annotations))] = "concentration"
+
+counts_mars  = ercc_counts[,annots$Sample[grepl("MARS",annots$Strain)]]
+counts_smart = ercc_counts[,annots$Sample[!grepl("MARS",annots$Strain)]]
+c_m = melt(data.frame(GeneName=rownames(counts_mars),counts_mars),id.vars="GeneName")
+c_m$source = "mars";
+c_sm = melt(data.frame(GeneName=rownames(counts_smart),counts_smart),id.vars="GeneName")
+c_sm$source = "smart";
+
+counts_l = rbind(c_m,c_sm)
+counts_lm = merge(counts_l,ercc_annotations[,.(GeneName,concentration)],by="GeneName")   
+ggplot(counts_lm,aes(log10(concentration+1),log10(value+1),color=source)) + geom_point()  + geom_smooth(method="loess")
+
+```
+

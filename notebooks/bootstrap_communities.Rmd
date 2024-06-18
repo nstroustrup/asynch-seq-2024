@@ -1,0 +1,198 @@
+---
+title: "Bootstrap Communities"
+output: html_document
+date: '2022-03-10'
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(pbapply)
+library(igraph)
+
+source("../scripts/helpers/heatmap_v1.R")
+source("../scripts/helpers/jaccard.R")
+
+dir.create("../figures/03/", showWarnings = FALSE)
+
+theme_set(theme_cowplot())
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load data
+
+### Network
+
+```{r}
+data <- readRDS("../data/gene_network/all_genes_communities_d8_compact_file.rds")
+for (var in names(data)) {
+  assign(paste0("d8_", var), data[[var]])
+}
+rm(data)
+
+community_colors <- colorspace::rainbow_hcl(length(d8_tissue_communities))
+names(community_colors) <- paste0("Community", seq_along(community_colors))
+
+d8_tissue_communities_vector <- unlist(lapply(names(d8_tissue_communities), function(i) {
+  out <- rep_len(i, length(d8_tissue_communities[[i]]))
+  names(out) <- d8_tissue_communities[[i]]
+  out
+}))
+```
+
+```{r}
+community_colors <- colorspace::rainbow_hcl(length(d8_tissue_communities))
+names(community_colors) <- paste0("Community ", seq_along(community_colors))
+community_colors <- c(community_colors, "Not in Community" = "grey")
+```
+
+### Bootstrap
+
+```{r}
+dir <- "../data/gene_network/bootstrap_inclusive/"
+boot_d8_tissue_communities <- pblapply(list.files(dir), function(filename) {
+  df <- fread(paste0(dir, "/", filename))
+  # df[, ID := gsub("[.]csv[.]gz", "", filename)]
+  tapply(df$GeneName, df$Community, function(x) x)
+})
+length(boot_d8_tissue_communities)
+```
+
+```{r}
+if (0)
+allgenes <- unique(c(rownames(d8_filter_tissue_norm_list$n2), 
+                     rownames(d8_filter_tissue_norm_list$daf2),
+                     unlist(boot_d8_tissue_communities)))
+
+ allgenes <- unique(unlist(boot_d8_tissue_communities))
+```
+
+
+## Frequency of being in a community
+
+```{r, fig.width=8, fig.height=5}
+boot_comm_freq <- rowMeans(sapply(boot_d8_tissue_communities, function(x) table(factor(unlist(x), allgenes))))
+boot_comm_freq_df <- data.table(GeneName = names(boot_comm_freq), Frequency = boot_comm_freq)
+boot_comm_freq_df[, Community := d8_tissue_communities_vector[GeneName]]
+boot_comm_freq_df[, CommunityPlot := gsub("y", "y ", as.character(Community))]
+boot_comm_freq_df[is.na(Community), CommunityPlot := "Not in Community"]
+```
+
+```{r, fig.width=8, fig.height=5}
+ggplot(boot_comm_freq_df, aes(color = CommunityPlot, Frequency)) +
+  stat_ecdf() +
+  scale_color_manual(values = community_colors, name = NULL) +
+  xlab("Frequency") +
+  ylab("ECDF")
+ggsave("../figures/03/S_bootstrap_communities_frequency.pdf", width = 8, height = 5)
+if(0){
+ggplot(boot_comm_freq_df, aes(fill = CommunityPlot, Frequency)) +
+  geom_histogram(position = "identity", alpha = .7, bins = 50) +
+  scale_fill_manual(values = community_colors)
+
+ggplot(boot_comm_freq_df, aes(CommunityPlot, Frequency, color = CommunityPlot)) +
+  geom_boxplot(outlier.color = NA) + 
+  geom_jitter(width = .2) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = community_colors)
+}
+```
+
+## Pairwise concordance
+
+```{r}
+concord_mat <- matrix(0, length(allgenes), length(allgenes))
+rownames(concord_mat) <- allgenes
+colnames(concord_mat) <- allgenes
+
+for (boot_index in seq_along(boot_d8_tissue_communities)) {
+  comm_list <- boot_d8_tissue_communities[[boot_index]]
+  for (community in seq_along(comm_list)) {
+    genes <- comm_list[[community]]
+    concord_mat[genes, genes] <- 1 + concord_mat[genes, genes]
+  }
+}
+concord_mat <- concord_mat / length(boot_d8_tissue_communities)
+```
+
+#identify robust members of communities
+```{r}
+high_confidence_d8_tissue_communities = lapply(d8_tissue_communities,function(x){
+  genes = intersect(x,rownames(concord_mat))
+  concord = rowMeans(concord_mat[genes,genes]);
+  names(concord)[concord>.5]
+})
+#remove communities that dropped below the size threshold
+high_confidence_d8_tissue_communities = high_confidence_d8_tissue_communities[unlist(lapply(high_confidence_d8_tissue_communities,function(x)length(x)>20))]
+
+high_confidence_genes = unique(unlist(high_confidence_d8_tissue_communities))
+
+names(high_confidence_d8_tissue_communities) = paste0("Community",1:length(high_confidence_d8_tissue_communities))
+saveRDS(high_confidence_d8_tissue_communities,"../data/gene_network/all_genes_communities_d8_high_confidence.rds")
+```
+
+```{r, fig.width=9, fig.height=8}
+source("../scripts/helpers/heatmap_v1.R")
+gp <- plotSplitCorrelationHeatmap(concord_mat, setNames(d8_tissue_communities,NULL))
+draw(gp)
+
+pdf("../figures/03/S_bootstrap_communities_concord_matrix.pdf", width = 9, height = 8)
+draw(gp)
+dev.off()
+```
+
+```{r, fig.width=9, fig.height=8}
+source("../scripts/helpers/heatmap_v1.R")
+gp <- plotSplitCorrelationHeatmap(concord_mat[high_confidence_genes,high_confidence_genes], setNames(high_confidence_d8_tissue_communities,NULL))
+draw(gp)
+
+pdf("../figures/03/S_bootstrap_high_confidence_communities_concord_matrix.pdf", width = 9, height = 8)
+draw(gp)
+dev.off()
+```
+
+
+## Are communities stable?
+
+```{r}
+stab_mat <- sapply(high_confidence_d8_tissue_communities, function(boot_comm) {
+  jacc <- sapply(boot_comm, function(x) {
+    sapply(d8_tissue_communities, function(y) {
+      jaccardIndex(x, y)
+    })
+  })
+  apply(jacc, 1, max)
+})
+stab_df <- reshape2::melt(stab_mat)
+stab_df <- as.data.table(stab_df)
+colnames(stab_df) <- c("Community", "Bootstrap", "Jaccard")
+stab_df[, CommunityPlot := gsub("y", "y ", as.character(Community))]
+stab_df[is.na(Community), CommunityPlot := "Not in Community"]
+```
+
+```{r}
+ggplot(stab_df, aes(color = CommunityPlot, Jaccard)) +
+  stat_ecdf() +
+  scale_color_manual(values = community_colors[-length(community_colors)], name = NULL)
+ggsave("../figures/03/S_bootstrap_communities_max_jaccard_ecdf.pdf", width = 8, height = 5)
+if (0){
+ggplot(stab_df, aes(fill = CommunityPlot, Jaccard)) +
+  geom_histogram(position = "identity", alpha = .7, bins = 50) +
+  scale_fill_manual(values = community_colors[-length(community_colors)], name = NULL)
+
+ggplot(stab_df, aes(CommunityPlot, Jaccard, color = CommunityPlot)) +
+  geom_boxplot(outlier.color = NA) + 
+  geom_jitter(width = .2) +
+  scale_color_manual(values = community_colors[-length(community_colors)], name = NULL) +
+  theme(legend.position = "none")
+ggsave("../figures/sup_figure_5/bootstrap_communities_max_jaccard_boxplot.pdf", width = 8, height = 5)
+}
+```
+
+
+
+

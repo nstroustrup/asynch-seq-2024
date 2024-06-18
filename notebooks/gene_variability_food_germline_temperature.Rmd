@@ -1,0 +1,1531 @@
+---
+title: "Gene Variability"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(BASiCS)
+library(dendextend)
+library(ggrepel)
+library(reshape2)
+library(ggrastr)
+require(scales)
+library(RColorBrewer)
+theme_set(theme_cowplot())
+
+source("../scripts/notebooks_helpers/gene_variability.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/basics.R")
+source("../scripts/helpers/clustering.R")
+source("../scripts/helpers/preprocess.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-4 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+cluster_colors <- c("firebrick", "sienna1", "cornflowerblue", "darkorchid", "black")
+```
+
+## Load data
+
+### Gene names
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+setkey(geneid, GeneName)
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+
+```
+
+### Counts
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+model_names = c("d8_glp1","d1_glp1","d_glp1","d8_20v25C","d8_UV","d_25C","d1_sw","d8_sw","n2_sw","daf2_sw");
+model_normalized_variants = c("d8_sw_da_nlp15", "n2_sw_mod_comp_da_nlp28","n2_sw_mod_comp_da_rps22")
+
+
+model_names = "n2_sw"
+model_normalized_variants = c();
+
+#model_names = c("d_glp1_m");
+#model_names = c("d8_20v25C")
+#model_names = c("ts_d_25C");
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+counts =lapply(model_names, function(x){
+                                  r = bc$batch_counts_list[[x]]
+                                  r[,colnames(r) %in% data$annots$Sample]
+                                 })
+names(counts) = model_names
+
+annots <- rbindlist(lapply(model_names,function(x){
+                  r = data$annots[Sample %in% colnames(counts[[x]])]
+                  r$model = x;
+                  r
+                }))
+setkey(annots, Sample)
+annots[, Strain := droplevels(Strain)]
+annots[, Genotype := droplevels(Genotype)]
+annots[, Day := droplevels(Day)]
+annots[, Group := droplevels(Group)]
+
+nf <- lapply(model_names,function(x){print(x);normalizationFactor(counts[[x]], groups = annots$Group[annots$model==x])})
+names(nf) = model_names;
+
+norm <- lapply(model_names,function(x){normalizeCounts(counts[[x]], nf[[x]])})
+names(norm) = model_names;
+
+rm(data, bc)
+```
+
+### Load Gene variability data
+
+```{r}
+params_df = NULL;
+
+ if (0){ #Do not load individual overdispersion model fits 
+  for (model in model_names){
+    p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,".csv.gz"))
+    if (!("Food" %in% names(p))) p[,Food:=""]
+    if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+    p$model = model
+    params_df = rbind(p,params_df,fill=TRUE);
+  }
+  params_df[, Day := factor(Day, levels(annots$Day))]
+  params_df[, Strain := factor(Strain, levels(annots$Strain))]
+  params_df[, Food := factor(Food, levels(annots$Food))]
+  params_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+  params_df <- params_df[AllZeroProp == 0]
+  params_df$ResDisp = as.numeric(params_df$ResDisp)
+  dva_df = list();#differential mean and variability analysis
+  #mean analysis columns have suffixes "DeSeq"
+  for (model in model_names){ 
+    dva_df[[model]] <-  fread(paste0("../data/gene_variability/regression_effects_",model,".csv.gz"))
+    dva_df[[model]] <-  dva_df[[model]][MeanMissingValueProp == 0]
+    dma_df_tmp <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/",model,".csv.gz"))
+    colnames(dma_df_tmp)[3:ncol(dma_df_tmp)] <- paste0(colnames(dma_df_tmp)[3:ncol(dma_df_tmp)], "_DESeq")
+    dva_df[[model]] <- merge(dva_df[[model]], dma_df_tmp, by = "GeneName")
+  }
+}
+params_shared_tech_df = NULL;
+for (model in c(model_names,model_normalized_variants)){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,"_shared_tech.csv.gz"))  
+  if (!("Food" %in% names(p))) p[,Food:=""]
+  if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+  p$model = model
+  params_shared_tech_df = rbind(p,params_shared_tech_df,fill=TRUE);
+}
+params_shared_tech_df[, Day := factor(Day, levels(annots$Day))]
+params_shared_tech_df[, Strain := factor(Strain, levels(annots$Strain))]
+params_shared_tech_df[, Food := factor(Food, unique(annots$Food))]
+params_shared_tech_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+params_shared_tech_df <- params_shared_tech_df[AllZeroProp == 0]
+params_shared_tech_df$ResDisp = as.numeric(params_shared_tech_df$ResDisp)
+
+
+```
+
+
+```{r}
+#load differential_expression_data
+dva_multiple_shared_tech = list();
+dva_shared_tech_df <- rbindlist(lapply(model_names, function(filename) {
+  print(filename)
+  df <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", filename,".csv.gz"))
+ # browser()
+  multiple_regression_model = grepl("\\+",models$BiologicalCovariates[models$Name == filename]);
+  if (!multiple_regression_model){
+    prefix_N = gregexpr("log2",names(df)[3])[[1]][[1]];
+    prefix = substring(names(df)[3],0,prefix_N-2)
+  
+    names(df)[3:6] = paste0(substring(names(df)[3:6],prefix_N),"_mean")
+     
+    df$comparison_mean = prefix;
+    df$group = filename;
+    print(paste(filename,nrow(df),ncol(df)))
+    df_mean = df[, .(GeneName,GeneSymbol,log2FoldChange_mean,pvalue_mean,padj_mean,comparison_mean,group)]
+    
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+    prefix2_N = gregexpr("logFold",names(df2)[7])[[1]][[1]];
+    prefix2 = substring(names(df2)[7],0,prefix2_N-2)
+  
+    names(df2)[7:10] = paste0(substring(names(df2)[7:10],prefix2_N),"_overdispersion")
+    df_overdispersion = df2[, .(GeneName,logFoldChange_overdispersion,pvalue_overdispersion,padj_overdispersion)]
+    df_overdispersion$comparrison_da =  prefix2
+    
+    ret = merge(df_mean,df_overdispersion,by="GeneName");
+    return(ret);
+  }else{
+    fold_change_columns = which(grepl("FoldChange",names(df))& !grepl("Intercept",names(df)))
+    prefix_N = gregexpr("log2",names(df)[fold_change_columns])
+    prefix = unlist(lapply(1:length(fold_change_columns),function(col)substring(names(df)[fold_change_columns[col]],0,prefix_N[[col]][[1]]-2)))
+
+    
+    regression_results = lapply(1:length(fold_change_columns),function(col){
+      tmp = df[,fold_change_columns[[col]]:(fold_change_columns[[col]]+3)];
+       names(tmp) = paste0(substring(names(tmp),nchar(prefix[[col]])+2,nchar(prefix[[col]])+30),"_mean")
+       tmp$GeneName = df$GeneName;
+       tmp
+    })
+    names(regression_results) = prefix
+    
+    #add variability data to each estimand's table
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+    fold_change_columns2 = which(grepl("FoldChange",names(df2)) & !grepl("Intercept",names(df2)))
+    prefix2_N = gregexpr("log",names(df2)[fold_change_columns2])
+    prefix2 = unlist(lapply(1:length(fold_change_columns2),function(col)substring(names(df2)[fold_change_columns2[col]],0,prefix2_N[[col]][[1]]-2)))
+    
+     for (col in 1:length(fold_change_columns2)){
+       source_cols = names(df2)[fold_change_columns2[[col]]:(fold_change_columns2[[col]]+3)];
+       dest_cols = paste0(substring(source_cols,nchar(prefix2[[col]])+2,nchar(prefix2[[col]])+30),"_overdispersion")
+       tmp = df2[,source_cols,with=F];
+       names(tmp) = dest_cols;
+       tmp$GeneName = df2$GeneName;
+       regression_results[[ prefix[[col]] ]] = merge( regression_results[[ prefix[[col]] ]],tmp,by="GeneName")
+     }
+    mean_overdispersion_name_matches = unlist(lapply(1:length(fold_change_columns),function(i)paste(prefix[[i]], "(",prefix2[[i]],")")))
+    
+    dva_multiple_shared_tech[[filename]] <<- list(estimands = regression_results, variables = prefix,variable_matches=mean_overdispersion_name_matches)
+    return(NULL)
+  }
+}))
+
+dva_shared_tech_norm_variants_df <- rbindlist(lapply(model_normalized_variants, function(filename) {
+  print(filename)
+ 
+    df2 <- fread(paste0("../data/gene_variability/regression_effects_",filename,"_shared_tech.csv.gz"))
+    prefix2_N = gregexpr("logFold",names(df2)[7])[[1]][[1]];
+    prefix2 = substring(names(df2)[7],0,prefix2_N-2)
+  
+    names(df2)[7:10] = paste0(substring(names(df2)[7:10],prefix2_N),"_overdispersion")
+    df_overdispersion = df2[, .(GeneName,logFoldChange_overdispersion,pvalue_overdispersion,padj_overdispersion)]
+    df_overdispersion$comparrison_da =  prefix2
+    df_overdispersion$model = filename;
+    
+    df_overdispersion
+  
+}))
+
+
+
+
+```
+
+## Define genesets
+
+### Highly variable genes
+
+```{r}
+hvg_gene_list <- lapply(model_names, function(x) params_shared_tech_df[model==x & LogDisp > log(0.15) & 
+                                              ResDisp > 0 
+                                                   & ResDispAdjPValue < 1e-4][order(-ResDisp)]$GeneName)
+names(hvg_gene_list) = model_names
+```
+
+
+### Differentially variable genes
+
+```{r}
+da_gene_list <- lapply(model_names,function(x){
+                          varibility_log2 = which(substring(names(dva_df[[1]]),nchar(names(dva_df[[1]]))-12)=="logFoldChange")[2]
+                          varibility_pvalue = which(substring(names(dva_df[[1]]),nchar(names(dva_df[[1]]))-5)=="pvalue")[2]
+                          list(up=dva_df[[x]]$GeneName[dva_df[[x]][[varibility_log2]] > 0 & dva_df[[x]][[varibility_pvalue]] < 1e-2],
+                               down=dva_df[[x]]$GeneName[dva_df[[x]][[varibility_log2]] < 0 & dva_df[[x]][[varibility_pvalue]] < 1e-2])})
+
+names(da_gene_list) = model_names
+```
+
+```{r}
+age_n2_var = n2_dva_df[,c("GeneName","GeneSymbol","Day1_logFoldChange","Day1_padj"),with=F]
+age_n2_var$Day1_logFoldChange = -age_n2_var$Day1_logFoldChange;
+names(age_n2_var) = c("GeneName","GeneSymbol","log2FoldChange effect of age on variance in wild-type (day 8 / day 1 )","padj effect of age on variance in wild-type")
+
+age_n2_mean = n2_dma_df[,c("GeneName","Day_1_vs_8_log2FoldChange_DESeq","Day_1_vs_8_padj_DESeq"),with=F]
+age_n2_mean$Day_1_vs_8_log2FoldChange_DESeq = -age_n2_mean$Day_1_vs_8_log2FoldChange_DESeq 
+names(age_n2_mean) =c("GeneName","log2FoldChange effect of age on mean in wild-type (day 8 / day 1 )","padj effect of age on mean in wild-type")
+
+d2_d8_var = d8_dva_df[,c("GeneName","StrainQZ120_logFoldChange","StrainQZ120_padj"),with=F]
+names(d2_d8_var) = c("GeneName","log2FoldChange e1368 effect on variance day 8 (e1368 vs wild-type)","padj e1368 effect on variance day 8")
+
+d2_d1_var = d1_dva_df[,c("GeneName","StrainQZ120_logFoldChange","StrainQZ120_padj"),with=F]
+names(d2_d1_var) = c("GeneName","log2FoldChange e1368 effect on variance day 1 (e1368 vs wild-type)","padj e1368 effect on variance day 1")
+
+d2_d8_mean = bd_dma_df[,c("GeneName",
+                          "Strain_QZ120_vs_QZ0_log2FoldChange_DESeq",
+                          "Strain_QZ120_vs_QZ0_padj_DESeq",
+                          "StrainQZ120.Day1_log2FoldChange_DESeq",
+                          "StrainQZ120.Day1_log2FoldChange_DESeq",
+                          "Day_1_vs_8_log2FoldChange_DESeq",
+                          "Day_1_vs_8_padj_DESeq"),with=F];
+
+names(d2_d8_mean) = c("GeneName",
+                      "genotype log2fold effect in genotype x age model",
+                      "genotype padj in genotype x age model",
+                      "cross log2fold effect in genotype x age model (e1368 on day 1 vs. )",
+                      "cross padj in genotype x age model",
+                      "age log2fold effect in genotype x age model",
+                      "age padj in genotype x age model")
+
+pretty_table = merge(age_n2_var,age_n2_mean,by="GeneName")
+pretty_table = merge(pretty_table,d2_d8_var,by="GeneName")
+pretty_table = merge(pretty_table,d2_d1_var,by="GeneName")
+pretty_table = merge(pretty_table,d2_d8_mean,by="GeneName")
+pretty_table$gene_is_expressed_at_all_ages_in_wildtype = 0
+pretty_table$gene_is_expressed_at_all_ages_in_wildtype[pretty_table$GeneName %in% well_expressed_genes_in_young_and_old] = 1
+
+pretty_table$gene_is_expressed_at_all_ages_in_wildtype_and_e1368 = 0
+pretty_table$gene_is_expressed_at_all_ages_in_wildtype_and_e1368[pretty_table$GeneName %in% well_expressed_genes_in_young_and_old_both_strains] = 1
+
+write.csv(pretty_table,gzfile("../data/gene_variability/effects_of_age_and_genotype.csv.gz",compression=9),row.names = F)
+
+all_mean_and_variance = rbind(params_df,pooled_params_df);
+all_mean_and_variance$Genotype = "wild-type";
+all_mean_and_variance$Genotype[all_mean_and_variance$Strain == "QZ120"] = "e1368";
+all_mean_and_variance$SequenceType[all_mean_and_variance$SequenceType == "Technical"] = "ERCC";
+all_mean_and_variance$SequenceType[all_mean_and_variance$SequenceType == "Biological"] = "mRNA";
+all_mean_and_variance$Pooled = as.integer(all_mean_and_variance$Pooled)
+names(all_mean_and_variance)[names(all_mean_and_variance) == "LogMean"] = "mean expression (log)"
+names(all_mean_and_variance)[names(all_mean_and_variance) == "LogMeanSE"] = "mean Expression SE (log)"
+names(all_mean_and_variance)[names(all_mean_and_variance) == "LogDisp"] = "overdispersion (log)"
+names(all_mean_and_variance)[names(all_mean_and_variance) == "LogDispSE"] = "overdispersion SE"
+names(all_mean_and_variance)[names(all_mean_and_variance) == "ResDisp"] = "residual overdispersion (log)"
+names(all_mean_and_variance)[names(all_mean_and_variance) == "ResDispSE"] = "residual overdispersion SE"
+names(all_mean_and_variance)[names(all_mean_and_variance) == "ResDispAdjPValue"] = "residual overdispersion is highly variable p-value"
+all_mean_and_variance[,Strain:=NULL]
+all_mean_and_variance[,ResDispPValue:=NULL]
+all_mean_and_variance[,BaseMean:=NULL]
+all_mean_and_variance[,BaseVar:=NULL]
+all_mean_and_variance[,AllZeroProp:=NULL]
+all_mean_and_variance[,MissingValuesProp:=NULL]
+
+
+write.csv(all_mean_and_variance,gzfile("../data/gene_variability/population_statistics.csv.gz",compression=9),row.names = F)
+```
+
+## Compare ERCC
+
+```{r, fig.width=7, fig.height=5}
+tech_params_df <- params_df[SequenceType == "Technical"]
+tech_params_df[, Genotype := ifelse(Strain == "QZ0", "N2", "daf-2(e1368)")]
+tech_params_df[, Condition := factor(paste0(Genotype, "; Day ", Day), 
+                                     c("N2; Day 1", "N2; Day 8", 
+                                       "daf-2(e1368); Day 1", "daf-2(e1368); Day 8"))]
+
+trend_line <- trend_df[, .(LogMean = seq(log(9), 14, length.out = 1001),
+                           Asym, resp0, lrc), 
+                       by = .(Strain, Day)]
+trend_line[, LogDisp := Asym + (resp0 - Asym) * exp(-exp(lrc)* LogMean)]
+trend_line[, Genotype := ifelse(Strain == "QZ0", "N2", "daf-2(e1368)")]
+trend_line[, Condition := factor(paste0(Genotype, "; Day ", Day), 
+                                 c("N2; Day 1", "N2; Day 8", 
+                                   "daf-2(e1368); Day 1", "daf-2(e1368); Day 8"))]
+
+ggplot(tech_params_df, aes(exp(LogMean), exp(LogDisp), color = Condition)) + 
+  geom_point() +
+  geom_line(data = trend_line) +
+  scale_x_log10(labels = scales::number_format()) +
+  scale_y_log10() +
+  theme(legend.position = "top") +
+  xlab("Mean Gene Expression") +
+  ylab("Overdispersion") +
+  scale_color_discrete(name = NULL)
+ggsave("../figures/sup_figure_7/gene_variability_ercc_trend_all_conditions.pdf", width = 7, height = 5)
+```
+
+
+## Overdispersion and residual overdispersion - USING COVARIATE-SPECIFIC SPIKE-IN NORMALIZATION (NOT GOOD FOR COMPARRISONS)
+
+```{r}
+ 
+gp_disp_overdisp <- lapply(model_names, function(i) {
+ #  print(i)
+  params <- params_df[params_df$model == i,]
+  params$grp = paste(params$Day,params$Strain,params$Food,params$Temperature);
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  params[ResDisp < -10,ResDisp := -10];
+  psp = params[LogMean > log(50),]
+  psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+  #browser()
+  gp = ggplot() +
+    geom_point(aes(2^(LogMean), ResDisp,color=grp), params, alpha = .5, 
+               size = .75, pch = 20) +
+    scale_x_log10(labels = scales::number_format())  +
+    
+   geom_vline(xintercept = 50, linetype = "dashed") +
+   geom_vline(xintercept = 100000, linetype = "dashed") +
+   geom_hline(yintercept = 1.5, linetype = "dashed") +
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Overdispersion")
+  gp
+})
+names(gp_disp_overdisp) <- model_names
+```
+
+```{r}
+for (i in names(gp_disp_overdisp)) {
+  gp <- gp_disp_overdisp[[i]]
+  gp <- gp + ggtitle(i)
+  plot(gp)
+  rm(gp)
+}
+```
+
+## Overdispersion and residual overdispersion - USING CONSENSUS SPIKE-IN NORMALIZATION
+
+```{r}
+ 
+to_plot = c(model_normalized_variants,"d8_sw")
+gp_disp_overdisp <- lapply(to_plot, function(i) {
+ #  print(i)
+  params <- params_shared_tech_df[params_shared_tech_df$model == i,]
+  params$grp = paste(params$Day,params$Strain,params$Food,params$Temperature);
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+#  params[ResDisp < -10,ResDisp := -10];
+  params=  params[LogMean > log2(3),]
+ # psp = params[LogMean > log(3),]
+ # psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+  #browser()
+  gp = ggplot() +
+    geom_point(aes(2^(LogMean), ResDisp,color=grp), params, alpha = .5, 
+               size = .75, pch = 20) +
+    scale_x_log10(labels = scales::number_format())  +
+    
+   #geom_vline(xintercept = 50, linetype = "dashed") +
+  # geom_vline(xintercept = 100000, linetype = "dashed") +
+   #geom_hline(yintercept = 1.5, linetype = "dashed") +
+   geom_smooth(aes(2^(LogMean), ResDisp,color=grp), params, )+
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Overdispersion")
+  gp
+})
+names(gp_disp_overdisp) <- to_plot
+```
+
+```{r}
+for (i in names(gp_disp_overdisp)) {
+  gp <- gp_disp_overdisp[[i]]
+  gp <- gp + ggtitle(i)
+  plot(gp)
+  rm(gp)
+}
+```
+
+#lok at the effect of accounting for nlp15-driven variability
+```{r}
+ 
+to_plot = c("d8_sw_da_nlp15","d8_sw")
+ #  print(i)
+  params <- params_shared_tech_df[params_shared_tech_df$model %in% to_plot & Strain == "QZ0" & bad_fit==F & Pooled==F & SequenceType=="Biological",]
+  params$grp = params$model
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_old_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+#  params[ResDisp < -10,ResDisp := -10];
+  params=  params[LogMean > log2(3),]
+ # psp = params[LogMean > log(3),]
+ # psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+  #browser()
+  gp = ggplot() +
+    geom_point(aes(2^(LogMean), ResDisp,color=grp), params, alpha = .5, 
+               size = .75, pch = 20) +
+    scale_x_log10(labels = scales::number_format())  +
+    
+   #geom_vline(xintercept = 50, linetype = "dashed") +
+  # geom_vline(xintercept = 100000, linetype = "dashed") +
+   #geom_hline(yintercept = 1.5, linetype = "dashed") +
+   geom_smooth(aes(2^(LogMean), ResDisp,color=grp), params, )+
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Overdispersion")
+  gp
+  
+  wide_df = dcast(params,GeneName ~grp,value.var = "LogMean")
+  ggplot(wide_df,aes(2^d8_sw,2^d8_sw_da_nlp15)) +   
+    geom_point(alpha = .5,  size = .75, pch = 20) +
+    xlab("Counts") + ylab("nlp15 residuals") + ggtitle("Mean") +
+    scale_x_log10(labels = scales::number_format())  +
+    scale_y_log10(labels = scales::number_format()) 
+  
+  wide_df = dcast(params,GeneName ~grp,value.var = "ResDisp")
+  
+  res = lm(d8_sw_da_nlp15~d8_sw,wide_df)
+    ggplot(wide_df,aes(2^d8_sw,2^d8_sw_da_nlp15)) +   
+    geom_point(alpha = .5,  size = .75, pch = 20) +
+    xlab("ResDisp of Counts") + ylab("ResDisp of nlp15 residuals") + ggtitle("ResDisp") + geom_abline(color="gray") + geom_smooth(color="red",method="lm") +
+    scale_x_log10(labels = scales::number_format())  +
+    scale_y_log10(labels = scales::number_format()) 
+```
+
+
+## Overdispersion and residual overdispersion - CONSENSUS SPIKE INS + TISSUE-SPECIFIC
+
+```{r}
+ 
+gp_disp_overdisp <- lapply(model_names, function(i) {
+ #  print(i)
+  params <- params_shared_tech_df[params_shared_tech_df$model == i,]
+  params = params[GeneName %in% names(tissues),];
+  params = merge(params,tissues_df,by="GeneName")
+  params$grp = paste(params$Day,params$Strain,params$Temperature,params$Food);
+ # params = params[GeneName %in% well_expressed_genes_in_young_and_oparamsld_both_strains]
+  params[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  params[ResDisp < -10,ResDisp := -10];
+  params = params[LogMean > log2(35),];
+  psp = params[LogMean > log(50),]
+  psp2 = params[LogMean > log(100000) & ResDisp < 0.5,];
+  #browser()
+  gp = ggplot() +
+    geom_point(aes(2^(LogMean), ResDisp,color=grp), params, alpha = .5, 
+               size = .75, pch = 20) +
+    scale_x_log10(labels = scales::number_format())  +
+    
+   geom_vline(xintercept = 50, linetype = "dashed") +
+   geom_vline(xintercept = 100000, linetype = "dashed") +
+   geom_hline(yintercept = 1.5, linetype = "dashed") +
+   # ggrepel::geom_text_repel(aes(exp(LogMean), ResDisp,label = GeneSymbol), 
+   #                        min.segment.length = unit(0, 'lines'),
+   #                        rbind(params[order(-LogMean)][1:10],
+   #                                  psp[order(ResDisp)][1:10],params[order(-ResDisp)][1:10],psp2)) +
+    #theme(legend.position = "none") +
+    xlab("Mean Gene Expression") +
+    ylab("Residual Overdispersion") + facet_wrap(~Tissue)
+  gp
+})
+names(gp_disp_overdisp) <- model_names
+```
+
+```{r}
+for (i in names(gp_disp_overdisp)) {
+  gp <- gp_disp_overdisp[[i]]
+  gp <- gp + ggtitle(i)
+  plot(gp)
+  rm(gp)
+}
+```
+#PLOT MODEL FITS ACROSS ALL BOOTSTRAP INTERVALS TO DIAGNOSE FITTING PROBLEMS
+```{r}
+res = fread("../data/gene_variability/residual_overdispersion_d1_glp1.csv.gz")
+#res_orig = fread("../data/gene_variability/residual_overdispersion_d1_glp1.csv - Copy.gz")
+```
+```{r}
+res_o = res_orig[GeneName == "WBGene00022048",]
+res_o$rep = "old"
+res2 = res[GeneName == "WBGene00022048",]
+res2$rep = "new"
+res2 = rbind(res_o,res2)
+ggplot(res2,aes(x=LogDisp,color=rep))+
+    geom_histogram(aes(y = ..density..,fill = GeneName), binwidth =.1, position = "identity", alpha = .4) +
+  
+     facet_wrap(~Strain)+
+    xlab("Normalized Read Counts") +
+    ylab("Number of Samples")
+
+```
+
+#plot mean overdisp with examples
+```{r, fig.width=10, fig.height=7}
+sel_mean_disp_df <- rbind(
+  mean_disp_df[c("WBGene00000733", "WBGene00006050", "WBGene00006927", "WBGene00000216"), on = "GeneName"] %>% 
+    .[, c("Type", "Group") := .("High", 1:4)],
+  mean_disp_df[c("WBGene00195063", "WBGene00001340", "WBGene00004075", "WBGene00006537"), on = "GeneName"] %>%
+    .[, c("Type", "Group") := .("Low", 1:4)]
+)
+gp_list <- lapply(unique(sel_mean_disp_df$Group), function(group) {
+  
+  gene_df <- sel_mean_disp_df[Group == group]
+  gene_df[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  
+  ggdf <- counts_df[GeneName %in% gene_df$GeneName]
+  ggdf[, GeneSymbol := factor(GeneSymbol, gene_df$GeneSymbol)]
+  
+  ggplot(ggdf, aes(Norm+1)) +
+    geom_histogram(aes(fill = GeneSymbol), bins = 30, position = "identity", alpha = .7) +
+    scale_fill_manual(values = (colors), name = NULL) +
+    scale_color_manual(values = (colors), name = NULL) +
+    scale_x_log10() +
+    theme(legend.position = "top") +
+    xlab("Normalized Read Counts") +
+    ylab("Number of Samples")
+})
+
+plot_grid(plotlist = gp_list, nrow = 2, ncol = length(gp_list)/2)
+ggsave("../figures/main_figure_3/gene_variability_mean_overdisp_fit_day8_n2_with_examples_expression.pdf",
+       width = 10, height = 7)
+```
+
+## Clustering HVG
+
+```{r}
+hvg_norm_list <- lapply(names(hvg_gene_list), function(i) {
+  norm <- norm_list[[i]]
+  genes <- hvg_gene_list[[i]]
+  
+  t(norm[rownames(norm) %in% genes, ])
+})
+names(hvg_norm_list) <- names(hvg_gene_list)
+
+hvg_rho_list <- lapply(hvg_norm_list, cor, method = "s")
+hvg_hc_list <- lapply(hvg_rho_list, function(x) hclust(as.dist(1-x), method = "ward.D2"))
+
+k_list <- c("n2_d8_sw" = 3, "daf2_d8_sw" = 4, "n2_d1_sw" = 4, "daf2_d1_sw" = 3)
+
+hvg_gene_clustered_list <- lapply(names(hvg_hc_list), function(i) {
+  print(i)
+  cl <- cutree2(hvg_hc_list[[i]], k_list[i])
+  cl <- tapply(names(cl), cl, function(x) x)
+  names(cl) <- paste0("Cluster", seq_len(length(cl)))
+  cl
+})
+names(hvg_gene_clustered_list) <- names(hvg_hc_list)
+# hvg_gene_clustered_list <- unlist(hvg_gene_clustered_list, recursive = FALSE)
+```
+
+```{r}
+gp_heatmap <- lapply(names(hvg_norm_list), function(i) {
+  
+  dend <- as.dendrogram(hvg_hc_list[[i]])
+  dend <- color_branches(dend, k = k_list[i], col = cluster_colors[seq_len(k_list[i])])
+  
+  col_fun <- circlize::colorRamp2(c(-1, 0, 1), 
+                                  c("blue", "white", "red"))
+  
+  Heatmap(hvg_rho_list[[i]], 
+          
+          name = " ", 
+          use_raster = TRUE,
+          
+          cluster_rows = dend, 
+          cluster_columns = dend,
+          
+          row_title_gp = grid::gpar(col = cluster_colors[seq_len(k_list[i])]), 
+          column_title_gp = grid::gpar(col = cluster_colors[seq_len(k_list[i])]), 
+          
+          row_split = k_list[i], 
+          column_split = k_list[i],
+          
+          show_row_names = FALSE, 
+          show_column_names = FALSE)
+})
+names(gp_heatmap) <- names(hvg_norm_list)
+```
+
+```{r}
+for (i in names(gp_heatmap)) {
+  print(i)
+  draw(gp_heatmap[[i]])
+}
+
+```
+
+```{r}
+pdf("../figures/main_figure_4/gene_variability_hvg_heatmap_day8_n2.pdf", width = 7, height = 6)
+draw(gp_heatmap$n2_d8_sw)
+dev.off()
+```
+
+```{r}
+pdf("../figures/sup_figure_4/gene_variability_hvg_heatmap_day8_daf2.pdf", width = 7, height = 6)
+draw(gp_heatmap$daf2_d8_sw)
+dev.off()
+```
+
+## Residual overdispersion
+
+```{r}
+sig_colors <- c(Equal = "grey", Up = "#990000ff", Down = "#0b5394ff")
+sig_alpha <- 1e-2
+```
+
+#Look at differentially regulated genes in each comparrison--overdispersion vs overdispersion
+```{r}  
+model_names_tmp = model_names[!(model_names %in% names(dva_multiple_shared_tech))]
+gp_list <- lapply(model_names_tmp, function(group) {
+
+params = params_shared_tech_df[model == group & SequenceType == "Biological",]
+ggdf <- dcast(params, GeneName ~ paste0("Day", Day)+paste0("Strain", Strain)+paste0("Food", Food)+paste0("Temperature", Temperature), value.var = "ResDisp")
+
+#rename resp_disp values to "group1" or "group2"
+strain_levels = as.character(unique(params$Strain));
+day_levels = as.character(unique(params$Day));
+temperature_levels = as.character(unique(params$Temperature));
+food_levels = as.character(unique(params$Food));
+
+comp_levels = NULL;
+if (length(strain_levels) == 2){
+  comp_levels = strain_levels;
+    col_prefix = ""; 
+}
+if (length(day_levels) == 2){
+  comp_levels = day_levels;
+    col_prefix = "Day"
+}
+if (length(temperature_levels) == 2){
+  comp_levels = temperature_levels;
+    col_prefix = "Temperature"
+}
+if (length(food_levels) == 2){
+  comp_levels = food_levels;
+  col_prefix = "Food"
+}
+if (is.null(comp_levels))
+  return(NULL);
+
+#set the control to be the first level and thus be on the x axis
+m = models[models$Name==group,]
+if (comp_levels[[1]] != m$ControlGroup1){
+  if (comp_levels[[2]] != m$ControlGroup1){ return( NULL);stop(paste("for",group,"Control group (",m$ControlGroup1,") not found in (",paste(comp_levels[1],",",comp_levels[2],")")))}
+  comp_levels = rev(comp_levels);
+}
+
+  for (lev in comp_levels)
+    colnames(ggdf)[which(grepl(paste0(col_prefix,as.character(lev)),colnames(ggdf)))[1]] = paste0("group_",which(comp_levels==lev))
+
+
+#browser()
+#rename regression analysis to "effect_logfoldchange" and "effect_pvalue"
+gr = group
+da = dva_shared_tech_df[group == gr,]
+
+ggdf <- merge(ggdf, da[, .(GeneName, logFoldChange_overdispersion, pvalue_overdispersion)], by = "GeneName")
+ggdf <- as.data.table(ggdf)
+ggdf[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+ggdf[, ResultDiff := "Equal"]
+ggdf[logFoldChange_overdispersion > 0 & pvalue_overdispersion < sig_alpha, ResultDiff := "Up"]
+ggdf[logFoldChange_overdispersion < 0 & pvalue_overdispersion < sig_alpha, ResultDiff := "Down"]
+
+ggplot(ggdf, aes(group_1, group_2)) +
+  geom_point(aes(color = ResultDiff), alpha = .5, size = .5, pch = 20) +
+   
+  scale_color_manual(values = sig_colors, name = NULL) +
+  theme(legend.position = "none") +
+ # geom_smooth(method = "lm", se = FALSE, color = "purple") +
+ # geom_smooth(se = FALSE) +
+  geom_abline() +ggrepel::geom_text_repel(aes(color = ResultDiff, label = GeneSymbol), 
+                           min.segment.length = unit(0, 'lines'),
+                           rbind(ggdf[ResultDiff == "Up"][order(-logFoldChange_overdispersion)][1:3],
+                                 ggdf[ResultDiff == "Down"][order(logFoldChange_overdispersion)][1:3])) +
+  xlab(paste0("Residual Overdispersion (",comp_levels[1], ")")) +
+  ylab(paste0("Residual Overdispersion (",comp_levels[2], ")")) + ggtitle(group)
+})
+names(gp_list) = model_names_tmp
+
+for (i in names(gp_list)) {
+  if (!is.null(gp_list[[i]])) plot(gp_list[[i]])
+}
+```
+
+#Look at differentially regulated genes in each comparrison--loglikihood of fit vs logliklihood of fit
+```{r}  
+model_names_tmp = model_names[!(model_names %in% names(dva_multiple_shared_tech))]
+gp_list <- lapply(model_names_tmp, function(group) {
+print(group)
+params = params_shared_tech_df[model == group & SequenceType == "Biological",]
+ggdf <- dcast(params, GeneName ~ paste0("Day", Day)+paste0("Strain", Strain)+paste0("Food", Food)+paste0("Temperature", Temperature), value.var = "LogLik")
+
+
+if(0){
+#rename resp_disp values to "group1" or "group2"
+strain_levels = as.character(unique(params$Strain));
+day_levels = as.character(unique(params$Day));
+temperature_levels = as.character(unique(params$Temperature));
+food_levels = as.character(unique(params$Food));
+
+comp_levels = NULL;
+if (length(strain_levels) == 2){
+  comp_levels = strain_levels;
+    col_prefix = ""; 
+}
+if (length(day_levels) == 2){
+  comp_levels = day_levels;
+    col_prefix = "Day"
+}
+if (length(temperature_levels) == 2){
+  comp_levels = temperature_levels;
+    col_prefix = "Temperature"
+}
+if (length(food_levels) == 2){
+  comp_levels = food_levels;
+  col_prefix = "Food"
+}
+if (is.null(comp_levels))
+  return(NULL);
+
+#set the control to be the first level and thus be on the x axis
+}
+m = models[models$Name==group,]
+cov_info = find_covariate_levels(params,m$ControlGroup1)
+col_prefix = cov_info$covariate_column_name;
+comp_levels = cov_info$levels
+  for (lev in comp_levels)
+    colnames(ggdf)[which(grepl(paste0(col_prefix,as.character(lev)),colnames(ggdf)))[1]] = paste0("group_",which(comp_levels==lev))
+
+if (group == "n2_sw"){#known problem; being fixed
+  if (comp_levels[[2]] != m$ControlGroup1){ return( NULL);stop(paste("for",group,"Control group (",m$ControlGroup1,") not found in (",paste(comp_levels[1],",",comp_levels[2],")")))}
+  comp_levels = rev(comp_levels);
+}
+
+#browser()
+#rename regression analysis to "effect_logfoldchange" and "effect_pvalue"
+gr = group
+da = dva_shared_tech_df[group == gr,]
+
+ggdf <- merge(ggdf, da[, .(GeneName, logFoldChange_overdispersion, pvalue_overdispersion)], by = "GeneName")
+ggdf <- as.data.table(ggdf)
+ggdf[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+ggdf[, ResultDiff := "Equal"]
+#ggdf[logFoldChange_overdispersion > 0 & pvalue_overdispersion < sig_alpha, ResultDiff := "Up"]
+#ggdf[logFoldChange_overdispersion < 0 & pvalue_overdispersion < sig_alpha, ResultDiff := "Down"]
+
+ggplot(ggdf, aes(group_1, group_2)) +
+  geom_point(aes(color = ResultDiff), alpha = .5, size = .5, pch = 20) +
+   
+  scale_color_manual(values = sig_colors, name = NULL) +
+  theme(legend.position = "none") +
+ # geom_smooth(method = "lm", se = FALSE, color = "purple") +
+ # geom_smooth(se = FALSE) +
+  geom_abline() +ggrepel::geom_text_repel(aes(color = ResultDiff, label = GeneSymbol), 
+                           min.segment.length = unit(0, 'lines'),
+                           rbind(ggdf[ResultDiff == "Up"][order(-logFoldChange_overdispersion)][1:3],
+                                 ggdf[ResultDiff == "Down"][order(logFoldChange_overdispersion)][1:3])) +
+  xlab(paste0("Fit LogLiklihood (",comp_levels[1], ")")) +
+  ylab(paste0("Fit LogLiklihood(",comp_levels[2], ")")) + ggtitle(group)
+})
+names(gp_list) = model_names_tmp
+
+for (i in names(gp_list)) {
+  if (!is.null(gp_list[[i]])) plot(gp_list[[i]])
+}
+```
+#compare change in logliklihood to change in mean (just using the average values across bootstrap--so no p values or stats
+```{r}  
+model_names_tmp = model_names;#"n2_sw"
+gp_list <- lapply(model_names_tmp, function(group) {
+
+params = params_shared_tech_df[model == group & SequenceType == "Biological",]
+ggdf <- dcast(params, GeneName ~ paste0("Day", Day)+paste0("Strain", Strain)+paste0("Food", Food)+paste0("Temperature", Temperature), value.var = "LogLik")
+ggdf_m <- dcast(params, GeneName ~ paste0("Day", Day)+paste0("Strain", Strain)+paste0("Food", Food)+paste0("Temperature", Temperature), value.var = "LogMean")
+vari="LogLik"
+vari_m="LogMean"
+
+#rename resp_disp values to "group1" or "group2"
+strain_levels = as.character(unique(params$Strain));
+day_levels = as.character(unique(params$Day));
+temperature_levels = as.character(unique(params$Temperature));
+food_levels = as.character(unique(params$Food));
+
+comp_levels = NULL;
+if (length(strain_levels) == 2){
+  comp_levels = strain_levels;
+    col_prefix = ""; 
+}
+if (length(day_levels) == 2){
+  comp_levels = day_levels;
+    col_prefix = "Day"
+}
+if (length(temperature_levels) == 2){
+  comp_levels = temperature_levels;
+    col_prefix = "Temperature"
+}
+if (length(food_levels) == 2){
+  comp_levels = food_levels;
+  col_prefix = "Food"
+}
+if (is.null(comp_levels))
+  return(NULL);
+
+#set the control to be the first level and thus be on the x axis
+m = models[models$Name==group,]
+if (comp_levels[[1]] != m$ControlGroup1){
+  if (comp_levels[[2]] != m$ControlGroup1){ return( NULL);stop(paste("for",group,"Control group (",m$ControlGroup1,") not found in (",paste(comp_levels[1],",",comp_levels[2],")")))}
+  comp_levels = rev(comp_levels);
+}
+
+  for (lev in comp_levels){
+    colnames(ggdf)[which(grepl(paste0(col_prefix,as.character(lev)),colnames(ggdf)))[1]] = paste0("group_",which(comp_levels==lev))
+    colnames(ggdf_m)[which(grepl(paste0(col_prefix,as.character(lev)),colnames(ggdf_m)))[1]] = paste0("group_",which(comp_levels==lev))
+  }
+
+ggdf_merged = merge(ggdf,ggdf_m,by="GeneName",suffixes=c("","_m"))
+
+#rename regression analysis to "effect_logfoldchange" and "effect_pvalue"
+gr = group
+da = dva_shared_tech_df[group == gr,]
+
+ggplot(ggdf_merged, aes(group_2_m - group_1_m,group_2-group_1)) +
+  geom_point(alpha = .5, size = .5, pch = 20) +
+   
+  scale_color_manual(values = sig_colors, name = NULL) +
+  theme(legend.position = "none") +
+ # geom_smooth(method = "lm", se = FALSE, color = "purple") +
+ # geom_smooth(se = FALSE) +
+  geom_abline()+
+  xlab(paste0("Change in ",vari," (",comp_levels[1], ")")) +
+  ylab(paste0("Change in ",vari_m,"(", comp_levels[2], ")")) + ggtitle(group)
+})
+names(gp_list) = model_names_tmp
+
+for (i in names(gp_list)) {
+  if (!is.null(gp_list[[i]])) plot(gp_list[[i]])
+}
+```
+
+```{r}
+comp = (c("d_glp1","d_25C"))
+comp_labels = (c("glp-1","wild type"))
+#rename regression analysis to "effect_logfoldchange" and "effect_pvalue"
+da_1 = dva_shared_tech_df[[comp[[1]]]]
+da_2 = dva_shared_tech_df[[comp[[2]]]]
+colnames(da_1)[which(grepl("_logFoldChange$",colnames(da_1)))[2]] = "effect1_logFoldChange"
+colnames(da_1)[which(grepl("_pvalue$",colnames(da_1)))[2]] = "effect1_pvalue"
+colnames(da_2)[which(grepl("_logFoldChange$",colnames(da_2)))[2]] = "effect2_logFoldChange"
+colnames(da_2)[which(grepl("_pvalue$",colnames(da_2)))[2]] = "effect2_pvalue"
+
+ggdf <- merge(da_1[, .(GeneName, effect1_logFoldChange, effect1_pvalue)], da_2[, .(GeneName, effect2_logFoldChange, effect2_pvalue)], by = "GeneName")
+ggdf <- as.data.table(ggdf)
+ggdf[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+
+ggdf = ggdf[!is.na(effect1_pvalue),]
+
+
+ggdf[, sig:= ifelse(effect1_pvalue < .001 & effect2_pvalue < .001,"both",ifelse(effect1_pvalue < .001,comp_labels[1],ifelse(effect2_pvalue < .001,comp_labels[2],"none")))]
+
+
+ggplot(ggdf, aes(-effect1_logFoldChange, -effect2_logFoldChange)) +
+  geom_point(aes(color = sig), alpha = .5, size = 1, pch = 20) +
+  geom_hline(yintercept=0)+geom_vline(xintercept=0)+
+  geom_abline()+
+ # geom_smooth(method = "lm", se = FALSE, color = "purple") +
+ # geom_smooth(se = FALSE) +
+ 
+  xlab(paste0("Effect of time on Residual Overdispersion (",comp_labels[1], ")")) +
+  ylab(paste0("Effect of time on Residual Overdispersion (",comp_labels[2], ")")) 
+```
+
+```{r}
+da_1 = dva_shared_tech_df[[comp[[1]]]]
+da_2 = dva_shared_tech_df[[comp[[2]]]]
+plot(is.na(da_1$Day1_logFoldChange),type="l")
+lines(is.na(da_2$Day1_logFoldChange),col="red")
+```
+```{r}
+da_1 = dva_shared_tech_df[["ts_d_25C"]]
+plot(is.na(da_1$Day1_logFoldChange),type="l")
+```
+
+```{r}
+ggdf <- dcast(params_df[Day == 1], GeneName ~ Strain, value.var = "ResDisp")
+ggdf <- merge(ggdf, d1_dva_df[, .(GeneName, StrainQZ120_logFoldChange, StrainQZ120_padj)], by = "GeneName")
+ggdf <- as.data.table(ggdf)
+ggdf[, ResultDiff := "Equal"]
+ggdf[StrainQZ120_logFoldChange > 0 & StrainQZ120_padj < sig_alpha, ResultDiff := "Up"]
+ggdf[StrainQZ120_logFoldChange < 0 & StrainQZ120_padj < sig_alpha, ResultDiff := "Down"]
+
+ggplot(ggdf, aes(QZ0, QZ120)) +
+  geom_point(aes(color = ResultDiff), alpha = .5, size = .5, pch = 20) +
+  scale_color_manual(values = sig_colors, name = NULL) +
+  theme(legend.position = "none") +
+  geom_smooth(method = "lm", se = FALSE, color = "purple") +
+  geom_smooth(se = FALSE) +
+  geom_abline() +
+  xlab("Residual Overdispersion in N2") +
+  ylab("Residual Overdispersion in daf-2(e1368)")
+
+ggsave("../figures/sup_figure_7/gene_variability_compare_resdisp_daf2_vs_n2_for_day1.pdf", width = 7, height = 6)
+```
+
+```{r}
+ggdf <- dcast(params_df[Day == 8], GeneName ~ Strain, value.var = "ResDisp")
+ggdf <- merge(ggdf, d8_dva_df[, .(GeneName, StrainQZ120_logFoldChange, StrainQZ120_padj)], by = "GeneName")
+ggdf <- as.data.table(ggdf)
+ggdf[, ResultDiff := "Equal"]
+ggdf[StrainQZ120_logFoldChange > 0 & StrainQZ120_padj < sig_alpha, ResultDiff := "Up"]
+ggdf[StrainQZ120_logFoldChange < 0 & StrainQZ120_padj < sig_alpha, ResultDiff := "Down"]
+
+ggplot(ggdf, aes(QZ0, QZ120)) +
+  geom_point(aes(color = ResultDiff), alpha = .5, size = .5, pch = 20) +
+  scale_color_manual(values = sig_colors, name = NULL) +
+  theme(legend.position = "none") +
+  geom_smooth(method = "lm", se = FALSE, color = "purple") +
+  geom_smooth(se = FALSE) +
+  geom_abline() +
+  xlab("Residual Overdispersion in N2") +
+  ylab("Residual Overdispersion in daf-2(e1368)")
+
+ggsave("../figures/sup_figure_7/gene_variability_compare_resdisp_daf2_vs_n2_for_day8.pdf", width = 7, height = 6)
+```
+
+## Compare changes in mean and residual overdispersion
+
+```{r}
+model_names_tmp = model_names[!(model_names %in% names(dva_multiple_shared_tech))]
+#model_names_tmp = "n2_sw"
+gp_list = list();
+for (cur_group  in model_names_tmp){
+  print(cur_group)
+  g = dva_shared_tech_df[dva_shared_tech_df$group == cur_group,]
+  g = merge(g,tissues_df,by="GeneName",all.x=T,all.y=F)
+  g$Tissue[is.na(g$Tissue)] = "multi";
+  cur_param = params_shared_tech_df[params_shared_tech_df$model == cur_group,]
+  if (nrow(g) == 0){
+    warning(paste("No data for",cur_group))
+    next;
+    }
+  flush.console()
+ 
+
+  #figure out all the covariates in the DA model
+ control_group = models[models$Name==cur_group,]$ControlGroup1;
+ all_covariates = unique(params_shared_tech_df[model == cur_group,.(Strain,Day,Food,Temperature)])
+ 
+ #known problem, being fixed.
+ all_covariates = all_covariates[apply(all_covariates,1,function(x)!any(is.na(x)))]
+ 
+ covariate_column = which(control_group==all_covariates,arr.ind=T)[2]
+ all_subgroups = unlist(all_covariates[,covariate_column,with=F])
+ #if (cur_group %in% c("d8_sw","n2_sw")) #known issue with these...being fixed.
+ #  all_subgroups = unique(all_subgroups)
+ noncontrol_group = all_subgroups[all_subgroups!=control_group]
+ if(length(noncontrol_group)>1)
+    noncontrol_group =  noncontrol_group[! (noncontrol_group %in% c("3","11"))]
+ if (length(noncontrol_group) > 1)
+     stop("Too many covariates");
+  
+ comp_str = g$comparison[1];
+ cntrl_pos = regexpr(control_group,comp_str)[1]
+ noncntrl_pos = regexpr(noncontrol_group,comp_str)[1]
+ 
+ if (0){#setting the correct controls is now handled correctly in the differential expression calculation code, so we don't need it here
+  #figure out whether the control group is switched in the da, and correct as necessary.
+ print(paste(comp_str,": Control: ",control_group," for ", noncontrol_group))
+ 
+  if (cur_group == "n2_sw"){#known problem; being fixed.
+    print("switching")
+    #g$log2FoldChange_mean = -g$log2FoldChange_mean
+    g$logFoldChange_overdispersion = -g$logFoldChange_overdispersion
+  }else print("Not switching")
+ }
+  new_comp_str = paste(cur_group,": Change in ", noncontrol_group,"relative to ",control_group);
+  
+  #exclude genes with a mean less than 3 in either condition
+
+  frm  = paste("BaseMean ~ GeneName +",c("Strain","Day","Food","Temperature")[covariate_column])
+ # print(frm)
+  gene_min = aggregate(as.formula(frm),cur_param,FUN=min)
+  genes_to_plot = gene_min$GeneName[gene_min$BaseMean>3]
+  
+  g = g[GeneName %in% genes_to_plot,]
+  g[, DiffResult := "Equal"]
+  g[padj_overdispersion < 1e-2 & logFoldChange_overdispersion  > 0, DiffResult := "Up"]
+  g[padj_overdispersion < 1e-2 & logFoldChange_overdispersion  < 0, DiffResult := "Down"]
+  g[, DiffResult := factor(DiffResult, c("Equal", "Up", "Down"))]
+  
+  genes_to_plot = params_shared_tech_df[model==cur_group][BaseMean>25,GeneName]
+  g = g[!is.na(logFoldChange_overdispersion) & 
+          !is.na(log2FoldChange_mean) &
+          GeneName %in% genes_to_plot,]
+  yl = quantile(g$logFoldChange_overdispersion,c(.01,.99))
+  xl = quantile(g$log2FoldChange_mean,c(.01,.99))
+  
+  
+  fit_xl = quantile(g$log2FoldChange_mean,c(.015,.985))
+
+  gp_list[[cur_group]] <- ggplot(g, aes(log2FoldChange_mean  , 
+                      logFoldChange_overdispersion)) +
+    ggrastr::rasterise(geom_point(aes(color = DiffResult), alpha = .5, size = .5, pch = 20),dpi=600) +
+    ggrepel::geom_text_repel(aes(color = DiffResult, label = GeneSymbol.x), 
+                             min.segment.length = unit(0, 'lines'),
+                             rbind(g[DiffResult == "Up"][order(- logFoldChange_overdispersion )][1:8],
+                                   g[DiffResult == "Down"][order(logFoldChange_overdispersion )][1:8],g[grepl("hsp-4",g$GeneSymbol.x)])) + facet_wrap(~Tissue)+
+    xlab("Change in Mean Gene Expression") +
+    ylab("Change in Residual Overdispersion") + ylim(yl) + xlim(xl)+
+    scale_color_manual(values = sig_colors, drop = FALSE) +
+  theme(legend.position = "none") +
+  geom_smooth(data=g[log2FoldChange_mean > fit_xl[1] & log2FoldChange_mean < fit_xl[2]],method = "loess", span=0.4,se = FALSE, color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") + ggtitle(new_comp_str)
+  #ggExtra::ggMarginal(gp, type = "histogram",size=10)
+}
+```
+```{r,fig.width=8,fig.height=8}
+for (i in 1:length(gp_list))
+     plot(gp_list[[i]]);
+          
+```
+## Compare changes in mean and residual overdispersion
+
+```{r}
+model_names_tmp = model_names[!(model_names %in% names(dva_multiple_shared_tech))]
+model_names_tmp = "n2_sw"
+gp_list2 = list();
+for (cur_group  in model_names_tmp){
+  print(cur_group)
+  g = dva_shared_tech_df[dva_shared_tech_df$group == cur_group,]
+  g2 = merge(g,tissues_df,by="GeneName",all.x=T,all.y=F)
+  g$Tissue[is.na(g$Tissue)] = "multi";
+  cur_param = params_shared_tech_df[params_shared_tech_df$model == cur_group,]
+  if (nrow(g) == 0){
+    warning(paste("No data for",cur_group))
+    next;
+    }
+  flush.console()
+ 
+
+  #figure out all the covariates in the DA model
+ control_group = models[models$Name==cur_group,]$ControlGroup1;
+ all_covariates = unique(params_shared_tech_df[model == cur_group,.(Strain,Day,Food,Temperature)])
+ 
+ #known problem, being fixed.
+ all_covariates = all_covariates[apply(all_covariates,1,function(x)!any(is.na(x)))]
+ 
+ covariate_column = which(control_group==all_covariates,arr.ind=T)[2]
+ all_subgroups = unlist(all_covariates[,covariate_column,with=F])
+ #if (cur_group %in% c("d8_sw","n2_sw")) #known issue with these...being fixed.
+ #  all_subgroups = unique(all_subgroups)
+ noncontrol_group = all_subgroups[all_subgroups!=control_group]
+ if(length(noncontrol_group)>1)
+    noncontrol_group =  noncontrol_group[! (noncontrol_group %in% c("3","11"))]
+ if (length(noncontrol_group) > 1)
+     stop("Too many covariates");
+  
+ comp_str = g$comparison[1];
+ cntrl_pos = regexpr(control_group,comp_str)[1]
+ noncntrl_pos = regexpr(noncontrol_group,comp_str)[1]
+ 
+ if (0){#setting the correct controls is now handled correctly in the differential expression calculation code, so we don't need it here
+  #figure out whether the control group is switched in the da, and correct as necessary.
+ print(paste(comp_str,": Control: ",control_group," for ", noncontrol_group))
+ 
+  if (cur_group == "n2_sw"){#known problem; being fixed.
+    print("switching")
+    #g$log2FoldChange_mean = -g$log2FoldChange_mean
+    g$logFoldChange_overdispersion = -g$logFoldChange_overdispersion
+  }else print("Not switching")
+ }
+  new_comp_str = paste(cur_group,": Change in ", noncontrol_group,"relative to ",control_group);
+  
+  #exclude genes with a mean less than 3 in either condition
+
+  frm  = paste("BaseMean ~ GeneName +",c("Strain","Day","Food","Temperature")[covariate_column])
+ # print(frm)
+  gene_min = aggregate(as.formula(frm),cur_param,FUN=min)
+  genes_to_plot = gene_min$GeneName[gene_min$BaseMean>3]
+  
+  g = g[GeneName %in% genes_to_plot,]
+  g[, DiffResult := "Equal"]
+  g[padj_overdispersion < 1e-2 & logFoldChange_overdispersion  > 0, DiffResult := "Up"]
+  g[padj_overdispersion < 1e-2 & logFoldChange_overdispersion  < 0, DiffResult := "Down"]
+  g[, DiffResult := factor(DiffResult, c("Equal", "Up", "Down"))]
+  
+  genes_to_plot = params_shared_tech_df[model==cur_group][BaseMean>25,GeneName]
+  g = g[!is.na(logFoldChange_overdispersion) & 
+          !is.na(log2FoldChange_mean) &
+          GeneName %in% genes_to_plot,]
+  yl = quantile(g$logFoldChange_overdispersion,c(.01,.99))
+  xl = quantile(g$log2FoldChange_mean,c(.01,.99))
+  
+  
+  fit_xl = quantile(g$log2FoldChange_mean,c(.015,.985))
+
+  gp_list2[[cur_group]] <- ggplot(g, aes(log2FoldChange_mean  , 
+                      logFoldChange_overdispersion)) +
+    ggrastr::rasterise(geom_point(aes(color = DiffResult), alpha = .5, size = .5, pch = 20),dpi=600) +
+    xlab("Change in Mean Gene Expression") +
+    ylab("Change in Residual Overdispersion") + ylim(yl) + xlim(xl)+
+    scale_color_manual(values = sig_colors, drop = FALSE) +
+  theme(legend.position = "none") +
+  geom_smooth(data=g[log2FoldChange_mean > fit_xl[1] & log2FoldChange_mean < fit_xl[2]],method = "loess", span=0.4,se = FALSE, color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") + ggtitle(new_comp_str)
+  #ggExtra::ggMarginal(gp, type = "histogram",size=10)
+}
+```
+
+
+```{r,fig.width=8,fig.height=8}
+for (i in 1:length(gp_list))
+     plot(gp_list2[[i]]);
+          
+```
+
+```{r}
+params = params_shared_tech_df[model == "n2_sw" & Day == 8 & bad_fit == F,]
+dat = dva_shared_tech_norm_variants_df[model == "n2_sw_mod_comp_da_nlp28",]
+dm = merge(params,dat,by="GeneName")
+dm = dm[SequenceType == "Biological" & LogMean > log2(50),]
+dm$GeneSymbol = geneid[dm$GeneName,GeneSymbol]
+ggplot(dm,aes(logFoldChange_overdispersion,log10(padj_overdispersion))) + geom_point() + geom_hline(yintercept=-3)
+#View(dm[ResDispAdjPValue<.001,])
+
+params2 = params_shared_tech_df[model == "n2_sw" & Day == 8 & bad_fit == F,]
+dat2 = dva_shared_tech_norm_variants_df[model == "n2_sw_mod_comp_da_rps22",]
+dm2 = merge(params2,dat2,by="GeneName")
+dm2 = dm2[SequenceType == "Biological" & LogMean > log2(50),]
+dm2$GeneSymbol = geneid[dm$GeneName,GeneSymbol]
+ggplot(dm2,aes(logFoldChange_overdispersion,log10(padj_overdispersion))) + geom_point() + geom_hline(yintercept=-3)
+
+
+res = merge(dm,dm2,by="GeneName",suffixes=c(".nlp28",".rps22"))
+lmr = lm(logFoldChange_overdispersion.rps22~logFoldChange_overdispersion.nlp28,res)
+ggplot(res,aes(2^logFoldChange_overdispersion.nlp28,2^logFoldChange_overdispersion.rps22)) + geom_point() + geom_hline(yintercept=-3) + geom_smooth(method="lm") + geom_abline(color="red")
+
+```
+
+
+```{r}
+
+```
+
+
+#todo: Correlate the change in overdispersion and change in mean of each intervention to the change in overdispersion and change in mean *in each time-point of the N2 time series*
+
+#question: Does the effect of each intervention on *mean expression*--changing the "biological age" correlate with its effect on *overdispersion* ?  EG are the two changed in lockstep?
+
+
+
+
+
+
+
+
+
+```{r}
+ 
+
+g = d1_dva_df[GeneName %in% well_expressed_genes_in_young_and_old]
+g[, DiffResult := "Equal"]
+g[StrainQZ120_padj < 1e-2 & StrainQZ120_logFoldChange > 0, DiffResult := "Up"]
+g[StrainQZ120_padj < 1e-2 & StrainQZ120_logFoldChange < 0, DiffResult := "Down"]
+g[, DiffResult := factor(DiffResult, c("Equal", "Up", "Down"))]
+
+gp <- ggplot(g, aes(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq, 
+                      StrainQZ120_logFoldChange / log(2))) +
+  ggrastr::rasterise(geom_point(aes(color = DiffResult), alpha = .5, size = .5, pch = 20),dpi=600) +
+  ggrepel::geom_text_repel(aes(color = DiffResult, label = GeneSymbol), 
+                           min.segment.length = unit(0, 'lines'),
+                           rbind(g[DiffResult == "Up"][order(- StrainQZ120_logFoldChange)][1:8],
+                                 g[DiffResult == "Down"][order(StrainQZ120_logFoldChange)][1:8])) +
+  xlab("Change in Mean Gene Expression") +
+  ylab("Change in Residual Overdispersion") +
+  scale_color_manual(values = sig_colors, drop = FALSE) +
+  theme(legend.position = "none") +
+  geom_smooth(method = "lm", se = FALSE, color = "purple") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")
+ggExtra::ggMarginal(gp, type = "histogram",size=10)
+
+ggsave(paste0("../figures/sup_figure_7/gene_variability_mean_resdisp_d1_effect_of_strain.pdf"), 
+       width = 7, height = 6)
+```
+
+```{r}
+dat = n2_dva_df[GeneName %in% well_expressed_genes_in_young_and_old,]
+dat[, DiffResult := "Equal"]
+dat[Day1_padj < 1e-4 & Day1_logFoldChange < 0, DiffResult := "Up"]
+dat[Day1_padj < 1e-4 & Day1_logFoldChange > 0, DiffResult := "Down"]
+dat[, DiffResult := factor(DiffResult, c("Equal", "Up", "Down"))]
+highlighted_genes = unique(rbind(
+  dat[DiffResult == "Up"][order(Day1_logFoldChange)][1:3],
+  dat[DiffResult == "Down"][order(-Day1_logFoldChange)][1:3],
+  dat[order(Day_1_vs_8_log2FoldChange_DESeq)][1:6],
+  dat[order(-Day_1_vs_8_log2FoldChange_DESeq)][1:6]))
+  #dat[Day_1_vs_8_log2FoldChange_DESeq > 4.3 
+  #          & ( -Day1_logFoldChange/log(2) > 3 | #-Day1_logFoldChange/log(2) < 2)][1:10]))
+                                                                                                               
+gp <- ggplot(dat[dat$GeneSymbol %in% c("egl-3","sbt-1","pgal-1","egl-21")], aes(- Day_1_vs_8_log2FoldChange_DESeq, 
+                      - Day1_logFoldChange / log(2))) +
+  ggrastr::rasterise(geom_point(aes(color = DiffResult), alpha = .5, size = .75, pch = 20),dpi=600) +
+  ggrepel::geom_text_repel(aes(color = DiffResult, label = GeneSymbol), 
+                           min.segment.length = unit(0, 'lines'),
+                          highlighted_genes) +
+  xlab("Change in Mean Gene Expression") +
+  ylab("Change in Residual Overdispersion") +
+  scale_color_manual(values = sig_colors, drop = FALSE) +
+  theme(legend.position = "none") +
+  geom_smooth(method = "lm", se = FALSE, color = "purple") +
+  geom_smooth(method="loess",span=1,se = FALSE) +
+  #geom_abline() + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")
+ggExtra::ggMarginal(gp, type = "histogram",size=10,groupColor=T)
+
+ggsave(paste0("../figures/sup_figure_7/gene_variability_mean_resdisp_n2_effect_of_day.pdf"), 
+       width = 7, height = 6)
+```
+```{r, fig.width=10, fig.height=7}
+sel_mean_disp_df <- rbind(
+  mean_disp_df[c("WBGene00000733", "WBGene00006050", "WBGene00006927", "WBGene00000216"), on = "GeneName"] %>% 
+    .[, c("Type", "Group") := .("High", 1:4)],
+  mean_disp_df[c("WBGene00195063", "WBGene00001340", "WBGene00004075", "WBGene00006537"), on = "GeneName"] %>%
+    .[, c("Type", "Group") := .("Low", 1:4)]
+)
+gp_list <- lapply(unique(sel_mean_disp_df$Group), function(group) {
+  
+  gene_df <- sel_mean_disp_df[Group == group]
+  gene_df[, GeneSymbol := geneid[GeneName, on = "GeneName"]$GeneSymbol]
+  
+  ggdf <- counts_df[GeneName %in% gene_df$GeneName]
+  ggdf[, GeneSymbol := factor(GeneSymbol, gene_df$GeneSymbol)]
+  
+  ggplot(ggdf, aes(Norm+1)) +
+    geom_histogram(aes(fill = GeneSymbol), bins = 30, position = "identity", alpha = .7) +
+    scale_fill_manual(values = (colors), name = NULL) +
+    scale_color_manual(values = (colors), name = NULL) +
+    scale_x_log10() +
+    theme(legend.position = "top") +
+    xlab("Normalized Read Counts") +
+    ylab("Number of Samples")
+})
+
+plot_grid(plotlist = gp_list, nrow = 2, ncol = length(gp_list)/2)
+ggsave("../figures/main_figure_3/gene_variability_mean_overdisp_fit_day8_n2_with_examples_expression.pdf",
+       width = 10, height = 7)
+```
+### Effect of time and genotype
+
+```{r, fig.width=7, fig.height=6}
+ggdf <- merge(d8_dva_df,
+              n2_dva_df, by = "GeneName", suffixes = c("_daf2", "_day8"))
+
+ggplot(ggdf, aes(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq, Day_1_vs_8_log2FoldChange_DESeq)) +
+  geom_point(alpha = .7, size = .8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE, color = "purple") +
+  ggtitle("Change in Mean Gene Expression (log2 Scale)") +
+  xlab("Effect of Genotype (daf-2(e1368) vs N2)") +
+  ylab("Effect of Time (Day 8 vs Day 1)")
+ggsave("../figures/sup_figure_7/gene_variability_change_in_mean_time_and_genotype.pdf", width = 7, height = 6)
+
+ggplot(ggdf, aes(StrainQZ120_logFoldChange / log(2), Day1_logFoldChange / log(2))) +
+  geom_point(alpha = .7, size = .8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "lm", se = FALSE, color = "purple") +
+  ggtitle("Change in Residual Overdispersion") +
+  xlab("Effect of Genotype (daf-2(e1368) vs N2)") +
+  ylab("Effect of Time (Day 8 vs Day 1)")
+ggsave("../figures/sup_figure_7/gene_variability_change_in_resdisp_time_and_genotype.pdf", width = 7, height = 6)
+```
+
+## Enrichment analysis
+
+### HVG Clusters
+
+```{r}
+enrich_hvg <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   unlist(hvg_gene_clustered_list, recursive = FALSE), 
+                   "Annotation", 
+                   universe = rownames(norm_list$n2_d8_sw))
+})
+names(enrich_hvg) <- names(gene_annotations)
+```
+
+```{r}
+gp_enrich_hvg <- lapply(names(gene_annotations), function(database) {
+  gp_list <- plotEnrichment(enrich_hvg[[database]], alpha = 0.05, nmax = 15)
+  new_gp_list <- lapply(names(gp_list), function(set) gp_list[[set]] + ggtitle(paste(database, set)))
+  names(new_gp_list) <- names(gp_list)
+  new_gp_list
+})
+names(gp_enrich_hvg) <- names(gene_annotations)
+```
+
+### Wormcat
+
+```{r, fig.width=10, fig.height=10}
+gp_enrich_list <- lapply(sample_combinations_df$SampleGroup, function(name) {
+  sel <- grep(paste0(name), names(gp_enrich_hvg$Wormcat), value = TRUE)
+  gp_list <- gp_enrich_hvg$Wormcat[sel]
+  gp_list <- lapply(seq_along(gp_list), function(i) {
+    gp_list[[i]] +
+      ggtitle(paste("Cluster", i)) +
+      theme(plot.title = element_text(color = cluster_colors[i]))
+  })
+  gp_list
+})
+names(gp_enrich_list) <- sample_combinations_df$SampleGroup
+
+```
+
+```{r, fig.width=10, fig.height=13}
+for (i in names(gp_enrich_list)) {
+  gp <- plot_grid(plotlist = gp_enrich_list[[i]], nrow = length(gp_enrich_list[[i]]), ncol = 1)
+  plot(ggpubr::annotate_figure(gp, i))
+  height <- ifelse(length(gp_enrich_list[[i]]) <= 3, 12, 14)
+  print(height)
+  ggsave(paste0("../figures/sup_figure_4/gene_variability_hvg_enrichment_wormcat_", i, ".pdf"), gp, width = 10, height = height)
+}
+```
+
+### Wormexp
+
+```{r, fig.width=10, fig.height=10}
+gp_enrich_list <- lapply(sample_combinations_df$SampleGroup, function(name) {
+  sel <- grep(paste0(name), names(gp_enrich_hvg$Wormexp), value = TRUE)
+  gp_list <- gp_enrich_hvg$Wormexp[sel]
+  gp_list <- lapply(seq_along(gp_list), function(i) {
+    gp_list[[i]] +
+      ggtitle(paste("Cluster", i)) +
+      theme(plot.title = element_text(color = cluster_colors[i]))
+  })
+  gp_list
+})
+names(gp_enrich_list) <- sample_combinations_df$SampleGroup
+
+```
+
+```{r, fig.width=10, fig.height=15}
+for (i in names(gp_enrich_list)) {
+  gp <- plot_grid(plotlist = gp_enrich_list[[i]], nrow = length(gp_enrich_list[[i]]), ncol = 1)
+  plot(ggpubr::annotate_figure(gp, i))
+  height <- ifelse(length(gp_enrich_list[[i]]) <= 3, 14, 16)
+  ggsave(paste0("../figures/sup_figure_4/gene_variability_hvg_enrichment_wormexp_", i, ".pdf"), gp, width = 10, 
+         height = height)
+}
+```
+
+### DVA
+
+```{r}
+enrich_dvg <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   da_gene_list, 
+                   "Annotation", 
+                   universe = rownames(norm_list$n2_d8_sw))
+})
+names(enrich_dvg) <- names(gene_annotations)
+```
+
+```{r}
+gp_enrich_dvg <- lapply(names(gene_annotations), function(database) {
+  gp_list <- plotEnrichment(enrich_dvg[[database]], alpha = 0.2, nmax = 15)
+  new_gp_list <- lapply(names(gp_list), function(set) gp_list[[set]] + ggtitle(paste(database, set)))
+  names(new_gp_list) <- names(gp_list)
+  new_gp_list
+})
+names(gp_enrich_dvg) <- names(gene_annotations)
+```
+
+### Wormcat
+
+```{r, fig.width=9, fig.height=5}
+for (i in names(gp_enrich_dvg$Wormcat)) {
+  gp <- gp_enrich_dvg$Wormcat[[i]]
+  plot(gp)
+  ggsave(paste0("../figures/sup_figure_7/gene_variability_dva_enrichment_wormcat_", i, ".pdf"), gp, width = 9, height = 5)
+}
+```
+
+### Wormexp
+
+```{r, fig.width=9, fig.height=5}
+for (i in names(gp_enrich_dvg$Wormexp)) {
+  gp <- gp_enrich_dvg$Wormexp[[i]]
+  plot(gp)
+  ggsave(paste0("../figures/sup_figure_7/gene_variability_dva_enrichment_wormexp_", i, ".pdf"), gp, width = 9, height = 5)
+}
+```
+
+
+```{r}
+data <- readRDS("../data/gene_network/gene_network_d8.rds")
+for (var in names(data)) {
+  assign(paste0("d8_", var), data[[var]])
+}
+rm(data)
+community_colors <- colorspace::rainbow_hcl(length(d8_tissue_communities))
+names(community_colors) <- paste0("Community", seq_along(community_colors))
+```
+
+
+```{r}
+#compare mean and variance for communities
+
+com_members = Reduce(rbind,lapply(names(d8_tissue_communities),function(com){
+  data.frame(GeneName=d8_tissue_communities[[com]],Community=rep(com,length(d8_tissue_communities[[com]])))
+}));
+com_members$com = as.integer(substring(com_members$Community,10))
+rownames(com_members) = com_members$GeneName
+g = d8_dva_df[GeneName %in% com_members$GeneName ]
+g$Community = com_members[g$GeneName,"Community"]
+g = g[GeneName %in% well_expressed_genes_in_young_and_old]
+
+g_agg_mean = aggregate(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq~Community,g,FUN=mean)
+g_agg_var = aggregate(StrainQZ120_logFoldChange~Community,g,FUN=mean)
+g_agg = merge(g_agg_mean ,g_agg_var, by="Community")
+g_agg$com = as.integer(substring(g_agg$Community,10))
+
+g_agg2_mean = aggregate(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq~Community,g,FUN=function(x)(sd(x)))
+g_agg2_var = aggregate(StrainQZ120_logFoldChange~Community,g,FUN=function(x)(sd(x)))
+g_agg2 = merge(g_agg2_mean ,g_agg2_var, by="Community")
+g_agg_m = merge(g_agg,g_agg2,by="Community",suffixes=c(".mean",".stderr"))
+#g[, DiffResult := "Equal"]
+#g[StrainQZ120_padj < 1e-2 & StrainQZ120_logFoldChange > 0, DiffResult := "Up"]
+#g[StrainQZ120_padj < 1e-2 & StrainQZ120_logFoldChange < 0, DiffResult := "Down"]
+#g[, DiffResult := factor(DiffResult, c("Equal", "Up", "Down"))]
+gp <- ggplot()  +
+  ggrastr::rasterise(geom_point(aes(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq, 
+                      StrainQZ120_logFoldChange / log(2),color = Community), g, size = 1, pch = 20),dpi=600) +
+geom_point(aes(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq, 
+                      StrainQZ120_logFoldChange / log(2),color = Community), g_agg, size = 8, pch = 20) +
+geom_errorbar(aes(x=Strain_QZ120_vs_QZ0_log2FoldChange_DESeq.mean,
+                  y=StrainQZ120_logFoldChange.mean / log(2),
+                  ymin=(StrainQZ120_logFoldChange.mean-StrainQZ120_logFoldChange.stderr)/ log(2),
+                  ymax=(StrainQZ120_logFoldChange.mean+StrainQZ120_logFoldChange.stderr)/ log(2),
+                  color = Community),g_agg_m, width=.07)+
+  geom_errorbar(aes(x=Strain_QZ120_vs_QZ0_log2FoldChange_DESeq.mean,
+                  y=StrainQZ120_logFoldChange.mean / log(2),
+                  xmin=(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq.mean-Strain_QZ120_vs_QZ0_log2FoldChange_DESeq.stderr)/ log(2),
+                  xmax=(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq.mean+Strain_QZ120_vs_QZ0_log2FoldChange_DESeq.stderr)/ log(2),
+                  color = Community),g_agg_m, width=.07) +
+geom_text(aes(Strain_QZ120_vs_QZ0_log2FoldChange_DESeq, 
+                      StrainQZ120_logFoldChange / log(2),label = com), g_agg, size = 4, color="black") +
+  xlab("Change in Mean Gene Expression") +
+  ylab("Change in Residual Overdispersion") +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+   scale_color_manual(name = NULL, values = community_colors)
+ggExtra::ggMarginal(gp, type = "histogram",size=15)
+
+ggsave(paste0("../figures/sup_figure_7/gene_variability_mean_of_community_members.pdf"), 
+       width = 6, height = 6)
+```

@@ -1,0 +1,830 @@
+---
+title: "Tissue-specific RNAi"
+output: html_document
+date: '2022-03-10'
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(pbapply)
+library(ggrepel)
+library(survminer)
+library(survival)
+library(DESeq2)
+library(igraph)
+theme_set(theme_cowplot())
+
+source("../scripts/notebooks_helpers/tissue_specific_rnai.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/helpers/heatmap.R")
+source("../scripts/helpers/differential_analysis.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+
+germsoma_colors <- c(soma = "mediumslateblue", 
+                     germ_line = "black")
+
+tissue_colors <- c("germ_line" = "black", 
+                   "hypodermis" = "#5ac134", 
+                   "intestine" = "#79bbe9", 
+                   "muscle" = "#f68528",
+                   "neurons" = "#E92128")
+```
+
+## Load data
+
+### Tissues
+
+```{r}
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+germsoma <- tissues
+germsoma[germsoma != "germ_line"] <- "soma"
+```
+
+### Differential analysis
+
+```{r}
+ts_models <- fread("../data/differential_analysis/models/tissue_specific_rnai.csv")
+ts_da <- rbindlist(lapply(list.files("../data/differential_analysis/tables/tissue_specific_rnai/"), function(filename) {
+  df <- fread(paste0("../data/differential_analysis/tables/tissue_specific_rnai/", filename))
+  df[, Name := stringr::str_remove(filename, "[.]csv[.]gz")]
+  colnames(df) <- stringr::str_replace_all(colnames(df), "^RNAi_.*_vs_EV_", "")
+  df
+}))
+ts_da <- merge(ts_da, ts_models[, .(Name, Day, RNAi, Tissue)], by = "Name")
+
+
+ama1_da <- fread("../data/differential_analysis/tables/tissue_specific_rnai/d8_Germline_ama1.csv.gz")
+rpb2_d8_da <- fread("../data/differential_analysis/tables/tissue_specific_rnai/d8_Germline_rpb2.csv.gz")
+rpb2_d1_da <- fread("../data/differential_analysis/tables/tissue_specific_rnai/d2_Germline_rpb2.csv.gz")
+glp1_glp4_da <- fread("../data/differential_analysis/tables/glp1_glp4/glp1_glp4.csv.gz")
+
+glp1_da = glp1_d1_da =  fread("../data/differential_analysis/tables/single_and_pooled_worms/d1_glp1.csv.gz")
+glp1_d8_da =  fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_glp1.csv.gz")
+glp1_d8_da =  fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_glp1.csv.gz")
+
+```
+
+### Counts
+
+```{r}
+sw <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+ts <- readRDS("../data/formated_counts/counts_and_annots_tissue_specific_rnai.rds")
+samples_list <- list(
+  d8_n2 = sw$annots[Day == 8 & NumberOfWorms == 1 & Genotype == "N2" & Food == "NEC937" & Exclude == F & Temperature == 20 ]$Sample,
+  d8_daf2 = sw$annots[Day == 8 & NumberOfWorms == 1 & Genotype == "daf-2(e1368)"  & Food == "NEC937" & Exclude == F & Temperature == 20 ]$Sample,
+  
+  d1_n2 = sw$annots[Day == 1 & NumberOfWorms == 1 & Genotype == "N2" & Food == "NEC937" & Exclude == F & Temperature == 20 ]$Sample,
+  d1_daf2 = sw$annots[Day == 1 & NumberOfWorms == 1 & Genotype == "daf-2(e1368)" & Food == "NEC937" & Exclude == F & Temperature == 20 ]$Sample,
+  
+   d1_glp1 = sw$annots[Day == 1 & NumberOfWorms == 1 & Strain == "CB4037" & Food == "NEC937" & Exclude == F & Temperature == 25 ]$Sample,
+   d8_glp1 = sw$annots[Day == 8 & NumberOfWorms == 1 & Strain == "CB4037" & Food == "NEC937" & Exclude == F & Temperature == 25 ]$Sample
+  
+)
+
+# counts_list <- sapply(samples_list, function(samples) sw$counts[, samples])
+counts_list <- list(
+  d8_n2 = bc$batch_counts_list$d8_sw[, colnames(bc$batch_counts_list$d8_sw) %in% samples_list$d8_n2],
+  d8_daf2 = bc$batch_counts_list$d8_sw[, colnames(bc$batch_counts_list$d8_sw) %in% samples_list$d8_daf2],
+  d1_n2 = bc$batch_counts_list$d1_sw[, colnames(bc$batch_counts_list$d1_sw) %in% samples_list$d1_n2],
+  d1_daf2 = bc$batch_counts_list$d1_sw[, colnames(bc$batch_counts_list$d1_sw) %in% samples_list$d1_daf2],
+  d1_glp1 = bc$batch_counts_list$d1_glp1[, colnames(bc$batch_counts_list$d1_glp1) %in% samples_list$d1_glp1],
+  d8_glp1 = bc$batch_counts_list$d8_glp1[, colnames(bc$batch_counts_list$d8_glp1) %in% samples_list$d8_glp1]
+)
+
+ercc_list <- sapply(names(samples_list), function(grp) sw$ercc[, colnames(counts_list[[grp]])])
+
+annots <- sw$annots[unlist(samples_list)]
+setkey(annots, Sample)
+
+nf_list <- lapply(counts_list, function(x) normalizationFactor(x, groups = annots[colnames(x), on = "Sample"]$Group))
+tf_list <- lapply(ercc_list, function(x) normalizationFactor(x, groups = annots[colnames(x), on = "Sample"]$Group))
+
+tissue_nf_list <- lapply(counts_list, function(x) 
+  normalizationFactorTissueSpecific(x, 
+                                    tissues = tissues, 
+                                    groups = annots[colnames(x), on = "Sample"]$Group))
+tissue_sf_list <- lapply(names(samples_list), function(i) {
+  lapply(tissue_nf_list[[i]], function(x) x / tf_list[[i]])
+})
+names(tissue_sf_list) <- names(samples_list)
+
+
+germsoma_nf_list <- lapply(counts_list, function(x) 
+  normalizationFactorTissueSpecific(x, 
+                                    tissues = germsoma, 
+                                    groups = annots[colnames(x), on = "Sample"]$Group))
+germsoma_sf_list <- lapply(names(samples_list), function(i) {
+  lapply(germsoma_nf_list[[i]], function(x) x / tf_list[[i]])
+})
+names(germsoma_sf_list) <- names(samples_list)
+
+
+norm_list <- lapply(names(samples_list), function(i) {
+  normalizeCounts(counts_list[[i]], nf_list[[i]])
+})
+names(norm_list) <- names(samples_list)
+
+tissue_norm_list <- lapply(names(samples_list), function(i) {
+  normalizeCountsTissueSpecific(counts_list[[i]],
+                                nf_list = tissue_nf_list[[i]], 
+                                tissues = tissues)
+})
+names(tissue_norm_list) <- names(samples_list)
+
+germsoma_norm_list <- lapply(names(samples_list), function(i) {
+  normalizeCountsTissueSpecific(counts_list[[i]],
+                                nf_list = germsoma_nf_list[[i]], 
+                                tissues = germsoma)
+})
+names(germsoma_norm_list) <- names(samples_list)
+
+```
+
+```{r}
+tissues_levels = unique(tissues)
+ts_tissues <- unique(ts$annots$Tissue)
+ts_rnais <- unique(ts$annots$RNAi)
+ts_days <- unique(ts$annots$Day)
+```
+
+```{r}
+rm(sw, bc, ts)
+gc()
+```
+
+## Number of differential expressed genes
+
+```{r}
+if (0){
+ggdf <- ts_da[Day == 8 & RNAi != "daf-2", 
+              .(NumberOfGenes = sum(padj < 0.001),
+                Percentage = 100 * mean(padj < 0.001)), 
+              by = .(Day, RNAi, Tissue = factor(Tissue, rev(sort(unique(Tissue)))))]
+
+
+ggplot(ggdf, aes(Percentage, Tissue)) +
+  geom_point() +
+  geom_text_repel(aes(label = NumberOfGenes)) +
+  facet_wrap(RNAi ~ .) +
+  theme( strip.background = element_rect(fill = "cornsilk")) +
+  scale_x_log10(limits = c(0.001, 100), 
+                breaks = c(0.01, 0.1, 1, 10, 100), 
+                labels = c(0.01, 0.1, 1, 10, 100)) +
+  xlab("Percentage of Differentially Expressed Genes (adjusted p-value < 0.001)") +
+  ylab("Tissue Sensitive to RNAi")
+ggsave("../figures/sup_figure_4/tissue_specific_rnai_number_of_diff_genes.pdf", width = 8, height = 4)
+}
+```
+
+
+
+## WHOLE ANIMAL PCA
+
+```{r}
+pca_results <- lapply(names(samples_list), function(i) {
+  print(i)
+  x <- norm_list[[i]]
+  x <- x[apply(x,1,function(x)!any(x < 30)), ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  scores_df[, GermlineSF := germsoma_sf_list[[i]]$germ_line]
+  scores_df[, GermlineSF := exp(log(GermlineSF) - mean(log(GermlineSF)))]
+  
+  scores_df[, SomaSF := germsoma_sf_list[[i]]$soma]
+  scores_df[, SomaSF := exp(log(SomaSF) - mean(log(SomaSF)))]
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+  gp_sf <- ggplot(scores_df, aes(PC1, GermlineSF, color = SomaSF)) +
+    geom_point(size = 2) +
+    scale_y_log10() + 
+    scale_color_viridis_c(name = "Somatic Size Factor", trans = "log10") + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab("Germimal Size Factor") + 
+    theme(legend.position = "top")
+  
+  gp_pca <- ggplot(scores_df, aes(PC1, PC2,label=Basename)) +
+    geom_point(size = 2) +
+    scale_color_viridis_c(trans = "log10") + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "top")  + ggtitle(i) + geom_text_repel()
+  list(gp_sf = gp_sf, gp_pca = gp_pca, scores_df = scores_df, loadings_df = loadings_df, vp = vp, normalized_count_data = x)
+})
+names(pca_results) <- names(samples_list)
+
+for (x in names(pca_results)) plot(pca_results[[x]]$gp_pca)
+```
+
+```{r}
+
+single_worm_pca = list(
+    pca_results = pca_results
+)
+saveRDS(single_worm_pca,"../data/gene_variability/single_worm_pca.rds")
+
+```
+
+#Main text Fig. 2g
+## FIT wildtype nad glp-1 day -1 together PCA
+
+```{r}
+
+  x1 <-(norm_list[["n2_d1"]])
+  x2 <-(norm_list[["glp1_d1"]])
+  x = merge(x1,x2,by=0)
+  rownames(x) = x[,1]
+  x = x[,-1]
+  
+  good_genes = apply(x,1,function(x)!any(x < 30))
+  x = as.matrix(x[good_genes,])
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+ 
+  gp_pca <- ggplot(scores_df, aes(PC1, PC2,color=Strain )) +
+    geom_point(size = 2) +
+   # scale_color_viridis_c(trans = "log10") + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "top")  + ggtitle(i) 
+ 
+  plot(gp_pca)
+```
+
+```{r}
+tissue_pca_results <- lapply(names(samples_list), function(i) {
+  
+  x <- tissue_norm_list[[i]]
+  x <- x[apply(x,1,function(x)!any(x < 30)) & rownames(x) %in% somatic_genes, ]
+  pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE)
+  
+  scores_df <- data.table(Sample = rownames(pca$x), pca$x)
+  scores_df <- merge(scores_df, annots[colnames(x)], by = "Sample")
+  
+  scores_df[, GermlineSF := germsoma_sf_list[[i]]$germ_line]
+  scores_df[, GermlineSF := exp(log(GermlineSF) - mean(log(GermlineSF)))]
+  
+  scores_df[, SomaSF := germsoma_sf_list[[i]]$soma]
+  scores_df[, SomaSF := exp(log(SomaSF) - mean(log(SomaSF)))]
+  
+  loadings_df <- data.table(GeneName = rownames(pca$rotation), pca$rotation)
+  
+  vp <- round(100 * pca$sdev**2/sum(pca$sdev**2), 1)
+  
+  gp_sf <- ggplot(scores_df, aes(PC1, GermlineSF, color = SomaSF)) +
+    geom_point(size = 2) +
+    scale_y_log10() + 
+    scale_color_viridis_c(name = "Somatic Size Factor", trans = "log10") + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab("Germimal Size Factor") + 
+    theme(legend.position = "top")
+  
+  gp_pca <- ggplot(scores_df, aes(PC1, PC2)) +
+    geom_point(size = 2) +
+    scale_color_viridis_c(trans = "log10") + 
+    xlab(paste0("Principal Component 1 (", vp[1], "%)")) +
+    ylab(paste0("Principal Component 2 (", vp[2], "%)")) +
+    theme(legend.position = "top")
+  list(gp_sf = gp_sf, gp_pca = gp_pca, scores_df = scores_df, loadings_df = loadings_df, vp = vp)
+})
+names(tissue_pca_results) <- names(samples_list)
+
+```
+
+## PC1 of various populations compared to different RNAi and interventions
+
+```{r}
+library(ggrastr)
+plot_3_PCS=F
+#rpb2_temp_df = fread("rpb2-somatic_knockdown_effect.csv")
+pca_groups_to_plot = names(pca_results)
+pca_groups_to_plot = c("d1_n2","d8_n2","d1_glp1","d8_glp1","d1_daf2","d8_daf2","d8_25C")
+pca_groups_to_plot = c("d1_n2","d8_n2","d1_glp1","d8_glp1")
+only_soma = F
+tissue_colors_with_not_unique = tissue_colors
+names(tissue_colors_with_not_unique) = stringr::str_to_title(gsub("_", "", names(tissue_colors_with_not_unique)))
+tissue_colors_with_not_unique = c(tissue_colors_with_not_unique,c(`Not unique`="#BEBEBE80"))
+
+gp_cor_germline <- lapply(pca_groups_to_plot, function(model_name) {
+  if (!only_soma){
+  pca = pca_results[[model_name]]
+  }else pca = somatic_pca_results[[model_name]]
+  
+  ggdf <- as.data.table(pca$loadings_df[, 1:4])
+  ggdf <- merge(ggdf, ama1_da, by = "GeneName")
+  ggdf <- merge(ggdf, rpb2_d1_da, by = c("GeneName", "GeneSymbol"), all.x = TRUE)
+  ggdf <- merge(ggdf, rpb2_d8_da, by = c("GeneName", "GeneSymbol"),suffixes=c("",".day8"), all.x = TRUE)
+  ggdf <- merge(ggdf, glp1_glp4_da, by = c("GeneName", "GeneSymbol"), all.x = TRUE)
+  ggdf <- merge(ggdf, glp1_d1_da, by = c("GeneName", "GeneSymbol"), all.x = TRUE)
+  ggdf <- merge(ggdf, glp1_d8_da, by = c("GeneName", "GeneSymbol"),suffixes=c("",".day8"), all.x = TRUE)
+
+  
+  
+  #stop(names(ggdf))
+  ggdf <- merge(ggdf, tissues_df, by = c("GeneName", "GeneSymbol"), all.x = TRUE)
+  
+ # ggdf <- merge(ggdf, rpb2_temp_df, by.x = c("GeneName", "GeneSymbol"), by.y = c("Genename", "GeneSymbol"), all.x = TRUE)
+  if (only_soma)
+  ggdf = ggdf[GeneName %in% somatic_genes,]
+  ggdf[, Tissue := stringr::str_to_title(gsub("_", "", Tissue))]
+  ggdf <- ggdf[order(Tissue, na.last = TRUE)]
+  ggdf[is.na(Tissue), Tissue := "Not unique"]
+  
+
+  
+  # alpha("gray", alpha = 0.5)
+  
+  # remove targets of RNAi as these are not measured properly due to small RNAs 
+  ggdf <- as.data.table(ggdf[! GeneSymbol %in% c("ama-1", "rpb-2", "glp-1", "glp-4", "rpb-2","col-122","nlp-28","atp-5")])
+  
+  # direction of loadings is arbritary. make it positive to not confuse reader not PCA savy
+  if (cor(ggdf$PC1, ggdf$RNAi_ama1_vs_EV_log2FoldChange,use="complete.obs") < 0) ggdf[, PC1 := - PC1]
+  if (cor(ggdf$PC2, ggdf$RNAi_ama1_vs_EV_log2FoldChange,use="complete.obs") < 0) ggdf[, PC2 := - PC2]
+  if (cor(ggdf$PC3, ggdf$RNAi_ama1_vs_EV_log2FoldChange,use="complete.obs") < 0) ggdf[, PC3 := - PC3]
+
+  if (cor(ggdf$PC1, ggdf$Genotype_glp1_vs_EV_log2FoldChange,use="complete.obs") < 0) ggdf[, PC1 := - PC1]
+  if (cor(ggdf$PC1, ggdf$Genotype_glp4_vs_EV_log2FoldChange,use="complete.obs") < 0) ggdf[, PC1 := - PC1]
+  if (cor(ggdf$PC2, ggdf$Genotype_glp4_vs_EV_log2FoldChange,use="complete.obs") < 0) ggdf[, PC2 := - PC2]
+  }
+  
+  pc_var = data.frame(pc_var = pca$vp,PC=paste0("PC",1:length(pca$vp)))
+  if (plot_3_PCS){
+    ggdf = as.data.table(melt(ggdf,measure.vars=c("PC1","PC2","PC3")))
+  names(ggdf)[names(ggdf)=="variable"] = "PC"
+    pc_var = pc_var[1:3,]
+    
+  }else{
+    ggdf = as.data.table(melt(ggdf,measure.vars=c("PC1")))
+  names(ggdf)[names(ggdf)=="variable"] = "PC"
+    pc_var = pc_var[1,]
+  }
+  # plots
+  
+  
+  make_pca_graph= function(model_name,column_name,y_axis_description){
+    ggplot(ggdf, aes_string("value", column_name)) +
+      ggpp::geom_text_npc(aes(npcx = "left", npcy = "top", label = paste0("Corr:", round(100*Correlation, 1), "%")),
+                          ggdf[, .(Correlation = cor(value, get(column_name),use="complete.obs")),by = PC],nudge_y=-1) + 
+      ggpp::geom_text_npc(aes(npcx = "right", npcy = "bottom", label = paste0(model_name," ",PC,":",pc_var,"%")),
+                          data=pc_var,nudge_y=-2) + 
+      geom_point_rast(aes(color = Tissue, size = Tissue != "Not unique"),
+                 ggdf[Tissue == "Not unique"],raster.dpi=600) +
+      geom_point_rast(aes(color = Tissue, size = Tissue != "Not unique"), 
+                 ggdf[Tissue != "Not unique"],raster.dpi=600) +
+      scale_size_manual(guide = "none", values = c(0.75, 1.25)) +
+      scale_color_manual(name = y_axis_description, values = tissue_colors_with_not_unique) +
+      theme(legend.position = "top", strip.text.x = element_blank()
+    #,axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+    ) +
+      geom_smooth(method = "lm", formula = y ~ x, se = FALSE) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      xlab("Principal Component Weights ") +
+      ylab(list("Effect of",y_axis_description,"(Change in Gene Expression)")) +facet_wrap(~PC)
+}
+  
+  list(
+    ama1 = make_pca_graph(model_name,"RNAi_ama1_vs_EV_log2FoldChange",expression(germline~italic("ama-1")~knockdown)),
+    germline_rpb2_d1 = make_pca_graph(model_name,"RNAi_rpb2_vs_EV_log2FoldChange",expression(germline~italic("rpb-2")~knockdown~day~1)),
+    germline_rpb2_d8 = make_pca_graph(model_name,"RNAi_rpb2_vs_EV_log2FoldChange.day8",expression(germline~italic("rpb-2")~knockdown~day~8)),
+    glp4 = make_pca_graph(model_name,"Genotype_glp4_vs_EV_log2FoldChange",expression(germline~italic("glp-4(bn2)")~mutants)),
+    glp1_d1 = make_pca_graph(model_name,"Strain_CB4037_vs_QZ0_log2FoldChange",expression(germline~italic("glp-1(e2141)")~mutants~day~1)),
+    glp1_d8 = make_pca_graph(model_name,"Strain_CB4037_vs_QZ0_log2FoldChange.day8",expression(germline~italic("glp-1(e2141)")~mutants~day~8))
+  )
+})
+names(gp_cor_germline) = pca_groups_to_plot
+```
+
+```{r,fig.width=12,fig.height=12}
+library(gridExtra)
+
+gp1_d1 = gp_cor_germline[["d1_n2"]][["germline_rpb2_d1"]]
+gp1_d8 = gp_cor_germline[["d1_n2"]][["germline_rpb2_d8"]]
+gp2_d1 = gp_cor_germline[["d8_n2"]][["germline_rpb2_d1"]]
+gp2_d8 = gp_cor_germline[["d8_n2"]][["germline_rpb2_d8"]]
+gp3_d1 = gp_cor_germline[["d1_glp1"]][["germline_rpb2_d1"]]
+gp3_d8 = gp_cor_germline[["d1_glp1"]][["germline_rpb2_d8"]]
+gp4_d1 = gp_cor_germline[["d8_glp1"]][["germline_rpb2_d1"]]
+gp4_d8 = gp_cor_germline[["d8_glp1"]][["germline_rpb2_d8"]]
+gpm = ggpubr::ggarrange(plotlist=list(gp1_d1,gp2_d1,gp3_d1,gp4_d1), ncol = 2,nrow=4,common.legend = T,legend="top")
+plot(gpm)
+gpm = ggpubr::ggarrange(plotlist=list(gp1_d8,gp2_d8,gp3_d8,gp4_d8), ncol = 2,nrow=4,common.legend = T,legend="top")
+plot(gpm)
+stop()
+#ggsave("../figures/02/rpb2_vs_n2_pca.pdf",gpm,width=8,height=5)
+pca_results[["d1_n2"]]
+
+gp= list(gp_cor_germline[["d1_n2"]][["germline_rpb2"]],
+     gp_cor_germline[["d1_n2"]][["glp1_d1"]],
+     gp_cor_germline[["d8_n2"]][["glp1_d8"]],
+     gp_cor_germline[["d8_n2"]][["ama1"]],
+     gp_cor_germline[["d8_n2"]][["glp4"]],
+     gp_cor_germline[["d1_glp1"]][["germline_rpb2"]])
+gp2 = ggpubr::ggarrange(plotlist=gp, ncol = 3,nrow=2,common.legend = T,legend="top")
+plot(gp2)
+ggsave("../figures/02/S_germline_vs_n2_pca.pdf",gp2,width=8,height=8)
+
+
+vp = rbindlist(lapply(c("d1_n2","d8_n2","d1_glp1","d8_glp1"),function(pca){
+  res = data.frame(vp=pca_results[[pca]]$vp[1:5])
+  res$PC = 1:5;
+  res$population = pca;
+  res
+}))
+vp$day = substring(vp$population,2,2)
+vp$genotype = substring(vp$population,4,7)
+lt = c(n2="solid",glp1="dotted")
+colors_line = c("1"="black","8"="red")
+ybreaks = seq(0,.5,by=.05);
+ylab = as.character(ybreaks)
+ylab[seq(2,length(ylab),by=2)] = ""
+gp2 = ggplot(vp,aes(PC,vp/100,color=day,linetype=genotype))+geom_point(size=2)+geom_line(lwd=1)+scale_linetype_manual(values=lt)+scale_color_manual(values=colors_line)+xlab("Principle Component ID")+ylab("Relative Fraction of cohort variance explained")+scale_x_continuous(breaks=1:5)+scale_y_continuous(breaks=ybreaks,labels=ylab)
+ggsave("../figures/02/S_pca_variance_explained.pdf",gp2,width=8,height=8)
+
+#ggarrange(plotlist=list(g1,g2), ncol = 1,common.legend = T,legend="right")
+#ggsave("../figures/02/germline_vs_glp1_pca.pdf",width=8,height=8)
+
+```
+
+
+```{r,fig.width=8,fig.height=12}
+library(gridExtra)
+
+gp1 = gp_cor_germline[["d8_25C"]][["germline_rpb2"]]
+gp2 = gp_cor_germline[["d8_n2"]][["germline_rpb2"]]
+gpm = ggpubr::ggarrange(plotlist=list(gp1,gp2), ncol = 2,nrow=2,common.legend = T,legend="top")
+plot(gpm)
+
+```
+
+```{r}
+to_fit = pca_results[c("d1_n2","d8_n2","d1_glp1","d8_glp1")]
+da_to_fit = rpb2_da
+res = rbindlist(lapply(names(to_fit),function(pca){
+  p = to_fit[[pca]]
+  ld = data.frame(p$loadings_df)
+  n = ncol(ld)
+  if (n>75)
+    n=75;
+  ldd = merge(da_to_fit,ld,by="GeneName",suffixes=c(".da",".pca"))
+  d = unlist(lapply(1:n,function(x){
+    cor(ldd$RNAi_rpb2_vs_EV_log2FoldChange,ldd[,paste0("PC",x),with=F],method="s")
+  }))
+  d = data.frame(cr = d,PC = 1:n)
+  d = d[order(abs(d$cr),decreasing=T),]
+  d$rank = 1:n
+  d$pca = pca
+  d$strain = substring(pca,4,10)
+  d$day = substring(pca,2,2)
+  d
+}))
+ggplot(res[res$rank<=20,],aes(rank,abs(cr),color=strain))+
+  geom_point() + 
+  geom_line()+ 
+  facet_wrap(~paste("Day",day))+
+  scale_color_manual(values=c("n2"="black","glp1"="red"))+ 
+  ylab("Correlation between\nrpb-2 effect and PC Loadings")+
+  xlab("Principal Component ID")
+ggsave("../figures/02/frac_explained.pdf",width=4,height=3)
+
+```
+
+## Size factors
+
+```{r}
+gp_sf_pairs <- lapply(names(samples_list), function(i) {
+  
+  samples <- samples_list[[i]]
+  data <- simplify2array(tissue_sf_list[[i]])
+  data <- apply(data, 2, function(x) exp(log(x) - median(log(x))))
+  
+  limits <- exp(max(abs(range(log(data)))))
+  limits <- c(1/limits, limits)
+  
+  rownames(data) <- samples
+  colnames(data) <- gsub("_", "", colnames(data))
+  colnames(data) <- stringr::str_to_title(colnames(data))
+  tissuenames <- colnames(data)
+  data <- as.data.table(data)
+  data[, Sample := samples]
+  
+  mlt <- melt(data, id.vars = "Sample", value.name = "SizeFactor", variable.name = "Tissue")
+  
+  pairs <- rbindlist(lapply(seq_len(length(tissuenames)), function(j) {
+    rbindlist(lapply((j+1):length(tissuenames), function(i) {
+      data.table(Sample = data$Sample, Tissue1 = tissuenames[i], Tissue2 = tissuenames[j])
+    }))
+  }))
+  pairs[, Tissue1 := factor(Tissue1, levels = tissuenames)]
+  pairs[, Tissue2 := factor(Tissue2, levels = tissuenames)]
+  # pairs <- CJ(Sample = data$Sample, Tissue1 = tissuenames, Tissue2 = tissuenames)
+  pairs <- pairs[Tissue1 != Tissue2]
+  pairs <- merge(pairs, mlt[, .(Sample, Tissue1 = Tissue, SizeFactor1 = SizeFactor)], 
+                 by = c("Sample", "Tissue1"), allow.cartesian = TRUE)
+  pairs <- merge(pairs, mlt[, .(Sample, Tissue2 = Tissue, SizeFactor2 = SizeFactor)], 
+                 by = c("Sample", "Tissue2"), allow.cartesian = TRUE)
+  
+  corr <- pairs[, .(Correlation = cor(SizeFactor1, SizeFactor2, method = "s")),
+                by = .(Tissue1, Tissue2)]
+  corr[, Correlation := paste0(round(100 * Correlation, 1), "%")]
+  
+  label <- data.table(Tissue1 = tissuenames, Tissue2 = tissuenames, Tissue = tissuenames)
+  
+  identity_line <- pairs[, .(X = c(1/4, 4), 
+                             Y = c(1/4, 4)),
+                         by = .(Tissue1, Tissue2)]
+  
+  ggplot(pairs, aes(SizeFactor1, SizeFactor2))  +
+    geom_line(aes(X, Y), identity_line) +
+    geom_text(aes(0.3, 4, label = Correlation), data = corr, size = 4) + 
+    facet_grid(Tissue1 ~ Tissue2, drop = FALSE) +
+    geom_text(aes(x = 1, y = 1, label = Tissue), data = label, size = 5) + 
+    geom_smooth(method = "lm", color = "purple", se = FALSE, formula = y ~ x) +
+    geom_point(size=.7, alpha = .5) +
+    # geom_text(aes(x = 1, y = 1, label = Correlation), data = corr, size = 5) + 
+    scale_x_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+    scale_y_log10(limits = limits, breaks = c(0.25, 1, 4), labels = c("1/4", "1", "4")) +
+    xlab("Tissue Specific Size Factors") +
+    ylab("Tissue Specific Size Factors") +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.text = element_text(size = 8)) +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_blank())
+})
+names(gp_sf_pairs) <- names(samples_list)
+```
+
+```{r, fig.width=9, fig.height=8}
+gp_sf_pairs
+```
+
+```{r}
+ggsave(filename = paste0("../figures/main_figure_4/tissue_specific_rnai_size_factors_", "n2_d8", ".pdf"), 
+       plot = gp_sf_pairs$n2_d8,
+       width = 9, height = 8)
+
+ggsave(filename = paste0("../figures/sup_figure_7/tissue_specific_rnai_size_factors_", "daf2_d8", ".pdf"),
+       plot = gp_sf_pairs$daf2_d8,
+       width = 9, height = 8)
+
+ggsave(filename = paste0("../figures/sup_figure_4/tissue_specific_rnai_size_factors_", "n2_d1", ".pdf"),
+       plot = gp_sf_pairs$n2_d1,
+       width = 9, height = 8)
+
+
+ggsave(filename = paste0("../figures/sup_figure_7/tissue_specific_rnai_size_factors_", "daf2_d1", ".pdf"),
+       plot = gp_sf_pairs$daf2_d1,
+       width = 9, height = 8)
+```
+
+## Graph
+
+```{r}
+sf_graphs <- lapply(names(samples_list), function(i) {
+  
+  data <- simplify2array(tissue_sf_list[[i]])
+  data <- apply(data, 2, function(x) exp(log(x) - median(log(x))))
+  
+  rownames(data) <- samples_list[[i]]
+  colnames(data) <- gsub("_", "", colnames(data))
+  colnames(data) <- stringr::str_to_title(colnames(data))
+  tissuenames <- colnames(data)
+  
+  data <- cor(data, method = "s")
+  
+  g <- graph_from_adjacency_matrix(data, mode = "undirected", weighted = TRUE, diag = FALSE)
+  E(g)$scaled_weight <- 1/((E(g)$weight- min(E(g)$weight)+.1)/(max(E(g)$weight)-min(E(g)$weight)))
+  
+  
+  g
+})
+names(sf_graphs) <- names(samples_list)
+```
+
+```{r, fig.width=9, fig.height=9}
+for (g in sf_graphs) {
+  par_default <- par()
+  par(mar = c(0, 0, 0, 0))
+  plot(g,
+       layout = graphlayouts::layout_with_stress(g,weights = E(g)$scaled_weight),
+       vertex.label.color = "white",
+       vertex.color = tissue_colors,
+       edge.label.color = "black",
+       vertex.label.cex=.9, 
+       edge.label=round(100*E(g)$weight,1),
+       vertex.shape="circle",
+       vertex.size = 55,
+       edge.width=10*1/E(g)$scaled_weight)
+  par(par_default)
+}
+```
+
+```{r}
+par_default <- par()
+par(mar = c(0, 0, 0, 0))
+
+pdf("../figures/main_figure_4/tissue_specific_rnai_size_factors_graph_n2_d8.pdf", width = 9, height = 9)
+plot(sf_graphs$n2_d8,
+     layout = graphlayouts::layout_with_stress(g,weights = E(g)$scaled_weight),
+     vertex.label.color = "white",
+     vertex.color = tissue_colors,
+     edge.label.color = "black",
+     edge.label=round(E(g)$weight,2),
+     vertex.label.cex=.9, 
+     vertex.shape="circle",
+     vertex.size = 55,
+     edge.width=10*1/E(sf_graphs$n2_d8)$scaled_weight)
+dev.off()
+
+par(par_default)
+```
+
+## Overdispersion
+
+```{r}
+disp_tissue <- lapply(names(samples_list), function(i) {
+  
+  x <- counts_list[[i]]
+  
+  sub_annots <- annots[colnames(x), on = "Sample"]
+  sub_annots[, BiologicalReplicate := droplevels(BiologicalReplicate)]
+  
+  if (length(unique(sub_annots$BiologicalReplicate)) == 1) {
+    form <- ~ 1
+  } else {
+    form <- ~ BiologicalReplicate
+  }
+  
+  joint_dds <- suppressMessages(runDESeq(counts = x[rownames(x) %in% names(tissues), ],
+                                         annots = sub_annots, 
+                                         formula = form, 
+                                         nf = nf_list[[i]],
+                                         nb_test = FALSE))
+  joint_disp_df <- data.table(GeneName = rownames(joint_dds), StandardDisp = DESeq2::dispersions(joint_dds))
+  
+  tissue_disp <- lapply(unique(tissues), function(tissue) {
+    genes <- unique(names(tissues)[tissues == tissue])
+    dds <- suppressMessages(runDESeq(counts = x[rownames(x) %in% genes, ],
+                                     annots = sub_annots, 
+                                     nf = tissue_nf_list[[i]][[tissue]], 
+                                     formula = form, 
+                                     nb_test = FALSE))
+    setNames(DESeq2::dispersions(dds), rownames(dds))
+  })
+  tissue_disp <- unlist(tissue_disp)
+  tissue_disp_df <- data.table(GeneName = names(tissue_disp), TissueDisp = tissue_disp)
+  merge(tissue_disp_df, joint_disp_df, by = "GeneName")
+})
+names(disp_tissue) <- names(samples_list)
+```
+
+```{r}
+gp_disp_tissue <- lapply(disp_tissue, function(ggdf) {
+  ggdf <- merge(ggdf, tissues_df, by = "GeneName")
+  ggdf[, Tissue := stringr::str_to_title(gsub("_", " ", Tissue))]
+  
+  ggplot(ggdf, aes(TissueDisp, StandardDisp)) +
+    geom_point(aes(color = Tissue), alpha = .7) +
+    scale_color_manual(name = NULL, values = as.character(tissue_colors)) + 
+    geom_smooth() +
+    scale_x_log10() +
+    scale_y_log10() +
+    geom_abline() +
+    xlab("Overdispersion\nTissue Specific Normalization") +
+    ylab("Overdispersion\nStandard Normalization Factor") +
+    theme(legend.position = "top")
+})
+gp_disp_tissue
+```
+
+```{r}
+ggsave(paste0("../figures/sup_figure_4/tissue_specific_rnai_dispersion_", "n2_d8", ".pdf"), 
+       gp_disp_tissue$n2_d8, width = 7, height = 6)
+```
+
+## Correlation matrices
+
+```{r}
+tissues_list <- tapply(names(tissues), tissues, function(x) x)
+names(tissues_list) <- stringr::str_replace(names(tissues_list), "_", " ")
+names(tissues_list) <- Hmisc::capitalize(names(tissues_list))
+
+sel_genes_list <- lapply(counts_list, function(x) 
+  intersect(names(which(rowMeans(x) >= 30)), names(tissues)))
+
+rho_list <- lapply(names(samples_list), function(i) 
+  cor(t(norm_list[[i]][sel_genes_list[[i]], ]), method = "s"))
+names(rho_list) <- names(samples_list)
+
+tissue_rho_list <- lapply(names(samples_list), function(i) 
+  cor(t(tissue_norm_list[[i]][sel_genes_list[[i]], ]), method = "s"))
+names(tissue_rho_list) <- names(samples_list)
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(rho_list$n2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_standard_normalization_heatmap_n2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(rho_list$daf2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_standard_normalization_heatmap_daf2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(tissue_rho_list$n2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_normalization_heatmap_n2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(tissue_rho_list$daf2_d8, split_list = tissues_list, colors = tissue_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_normalization_heatmap_daf2_d8.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+## Simulation
+
+```{r}
+mu_hat <- log(rowMeans(germsoma_norm_list$n2_d8))
+mu_hat <- mu_hat[mu_hat > log(30)]
+ngenes <- 100
+
+Sigma_epsilon <- diag(ngenes)
+Sigma_epsilon[lower.tri(Sigma_epsilon)] <- rnorm(sum(lower.tri(Sigma_epsilon)), 0, 0.001)
+Sigma_epsilon[upper.tri(Sigma_epsilon)] <- t(Sigma_epsilon[lower.tri(Sigma_epsilon)])
+
+sim <- doSim(ngenes = ngenes, 
+             nsamples = 1000,
+             mu_mean = mean(mu_hat),
+             mu_sd = sd(mu_hat),
+             Sigma_epsilon = Sigma_epsilon, 
+             Sigma_omega = cor(simplify2array(germsoma_sf_list$n2_d8)[colnames(germsoma_norm_list$n2_d8), ]))
+
+sim$tissues_list <- list(`Germ line` = paste0("Gene", which(sim$p == 1)), 
+                         Soma = paste0("Gene", which(sim$p == 0)))
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(cor(t(sim$norm1), method = "s"), split_list = sim$tissues_list, 
+                                  colors = germsoma_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_standard_normalization_heatmap_simulation.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+
+```{r}
+gp <- plotSplitCorrelationHeatmap(cor(t(sim$norm2), method = "s"), split_list = sim$tissues_list, 
+                                  colors = germsoma_colors, beta = 1)
+
+draw(gp)
+
+pdf("../figures/sup_figure_4/tissue_specific_rnai_tissue_tissue_normalization_heatmap_simulation.pdf", width = 8, height = 7)
+draw(gp)
+dev.off()
+```
+

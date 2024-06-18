@@ -1,0 +1,328 @@
+---
+title: "Pooled worms"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(BASiCS)
+
+theme_set(theme_cowplot())
+
+dir.create("../figures/main_figure_2/", showWarnings = FALSE)
+dir.create("../figures/sup_figure_2/", showWarnings = FALSE)
+
+source("../scripts/notebooks_helpers/pooled.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/helpers/enrichment_analysis.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+alpha <- 1e-3 # significance level
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+```
+
+## Load data
+
+### Counts and annotations
+
+```{r}
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+br1_annots <- data$annots[BiologicalReplicate == 1 & Day == 8]
+setkey(br1_annots, Sample)
+
+br1_counts <- data$counts[, br1_annots$Sample]
+br1_ercc <- data$ercc[, br1_annots$Sample]
+
+# br1_annots <- fread("../data/annotations/sample_annotations_single_and_pooled_worms.csv")
+# br1_annots <- br1_annots[BiologicalReplicate == 1 & Day == 8]
+# setkey(br1_annots, Sample)
+# 
+# 
+# br1_allcounts_df <- fread("../data/annotated_counts/counts_single_and_pooled_worms.csv.gz")
+# br1_allcounts <- reshape2::acast(br1_allcounts_df, GeneName ~ Sample, value.var = "Count")
+# 
+# br1_counts <- br1_allcounts[grepl("WB", rownames(br1_allcounts)), br1_annots$Sample]
+# br1_counts <- br1_counts[, colSums(br1_counts) >= 5e5]
+# br1_annots <- br1_annots[Sample %in% colnames(br1_counts)]
+# 
+# br1_counts <- filterGenes(br1_counts, min_count = 5, min_prop = .5, groups = br1_annots$Pooled)
+# 
+# br1_ercc <- br1_allcounts[grepl("ERCC", rownames(br1_allcounts)), br1_annots$Sample]
+# br1_ercc <- filterGenes(br1_ercc, min_count = 5, min_prop = .5, groups = br1_annots$Pooled)
+
+br1_nf <- normalizationFactor(br1_counts)
+br1_nf_ercc <- normalizationFactor(br1_ercc)
+
+br1_norm <- normalizeCounts(br1_counts, br1_nf)
+br1_norm_ercc <- normalizeCounts(br1_ercc, br1_nf_ercc)
+```
+
+### Differential analysis
+
+```{r}
+# dds_list <- readRDS("../data/differential_analysis/deseq/single_and_pooled_worms.rds")
+da_d8_sw <- fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_sw.csv.gz")
+da_d8_pw <- fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_pw.csv.gz")
+
+degs <- list(
+  # d1 = da_d1[Strain_QZ120_vs_QZ0_padj < alpha]$GeneName,
+  
+  # d1_up = da_d1[Strain_QZ120_vs_QZ0_padj < alpha & 
+  #                 Strain_QZ120_vs_QZ0_log2FoldChange > 0]$GeneName,
+  d8_sw_up = da_d8_sw[Strain_QZ120_vs_QZ0_padj < alpha & 
+                        Strain_QZ120_vs_QZ0_log2FoldChange > 0]$GeneName,
+  d8_pw_up = da_d8_pw[Strain_QZ120_vs_QZ0_padj < alpha & 
+                        Strain_QZ120_vs_QZ0_log2FoldChange > 0]$GeneName,
+  
+  # d1_down = da_d1[Strain_QZ120_vs_QZ0_padj < alpha & 
+  #                   Strain_QZ120_vs_QZ0_log2FoldChange < 0]$GeneName,
+  d8_sw_down = da_d8_sw[Strain_QZ120_vs_QZ0_padj < alpha & 
+                          Strain_QZ120_vs_QZ0_log2FoldChange < 0]$GeneName,
+  d8_pw_down = da_d8_pw[Strain_QZ120_vs_QZ0_padj < alpha & 
+                          Strain_QZ120_vs_QZ0_log2FoldChange < 0]$GeneName
+)
+```
+
+```{r}
+sapply(degs, length)
+```
+
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp")]
+```
+
+## Scatter plot compare mean of single and pooled.
+
+### Day 8 / N2
+
+```{r, fig.width=7, fig.height=6}
+plotCompareSinglePooled(br1_counts, br1_annots[Day == 8 & Genotype == "N2"])
+ggsave("../figures/main_figure_2/pooled_worms_compare_means_day8_n2.pdf", width = 7, height = 6)
+```
+
+### Day 8 / daf-2
+
+```{r}
+plotCompareSinglePooled(br1_counts, br1_annots[Day == 8 & Genotype == "daf-2(e1368)"])
+```
+## Sample Correlation as function of pool size
+
+
+### Day 8 / N2
+
+```{r}
+cor_bio <- computeGeneCorrelation(br1_norm, br1_annots[Day == 8 & Genotype == "N2"])
+cor_tech <- computeGeneCorrelation(br1_norm_ercc, br1_annots[Day == 8 & Genotype == "N2"])
+plotGeneCorrelation(cor_bio, cor_tech)
+ggsave("../figures/main_figure_2/pooled_worms_ercc_day8_n2.pdf", width = 7, height = 6)
+```
+
+### Day 8 / daf-2
+
+```{r}
+cor_bio <- computeGeneCorrelation(br1_norm, br1_annots[Day == 8 & Genotype == "daf-2(e1368)"])
+cor_tech <- computeGeneCorrelation(br1_norm_ercc, br1_annots[Day == 8 & Genotype == "daf-2(e1368)"])
+plotGeneCorrelation(cor_bio, cor_tech)
+```
+
+## Volcano plot
+
+```{r}
+volcanoPlot(da_d8_pw, (genotype_colors), ngenes = 6) +
+  xlim(-3.4, 3.4)
+ggsave("../figures/main_figure_2/pooled_worms_volcano_day8.pdf", width = 7, height = 6)
+```
+
+## Enrichment analysis
+
+```{r}
+enrich <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], degs, "Annotation", universe = rownames(data$counts))
+})
+names(enrich) <- names(gene_annotations)
+```
+
+```{r}
+gp_enrich <- lapply(names(gene_annotations), function(database) {
+  gp_list <- plotEnrichment(enrich[[database]], alpha = 0.1, nmax = 30)
+  new_gp_list <- lapply(names(gp_list), function(set) gp_list[[set]] + ggtitle(paste(database, set)))
+  names(new_gp_list) <- names(gp_list)
+  new_gp_list
+})
+names(gp_enrich) <- names(gene_annotations)
+```
+
+
+```{r, fig.width=12, fig.height=10}
+for (database in names(gene_annotations)) {
+  for (gp in gp_enrich[[database]]) plot(gp)
+}
+```
+
+```{r}
+for (i in names(gp_enrich$Wormexp)) {
+  ggsave(paste0("../figures/sup_figure_2/pooled_worms_enrichment_", i, ".pdf"), 
+         gp_enrich$Wormexp[[i]] + ggtitle(NULL), 
+         width = 12, height = 10)
+}
+```
+
+## Heatmap
+
+### Day 8
+
+```{r}
+heatmap_d8 <- plotHeatmap(br1_norm, c(degs$d8_pw_up, degs$d8_pw_down),
+                          br1_annots[Day == 8 & NumberOfWorms != 1], 
+                          rev(genotype_colors), genotype_colors)
+ComplexHeatmap::draw(heatmap_d8)
+
+pdf("../figures/main_figure_2/pooled_worms_heatmap_day8.pdf", width = 7, height = 6)
+ComplexHeatmap::draw(heatmap_d8)
+dev.off()
+```
+
+## Residual overdispersion
+
+```{r}
+source("../scripts/helpers/basics.R")
+dir <- "../data/basics/chain/"
+files <- list.files(dir, pattern = "^d")
+chains <- lapply(files, function(file) {
+  readRDS(paste0(dir, file))
+})
+names(chains) <- gsub("[.]rds", "", files)
+rm(files, dir)
+
+chains <- lapply(chains, function(x) BASiCS_CorrectOffset2(x, chains$d8_n2_sw)$Chain)
+
+hvg_list <- lapply(chains, BASiCS_DetectHVG, PercentileThreshold = .95)
+
+hvg_df <- lapply(seq_along(hvg_list), function(i) {
+  delta <- colMedians(chains[[i]]@parameters$delta)
+  out <- as.data.table(hvg_list[[i]]@Table)
+  out <- out[order(GeneIndex)]
+  out[, Delta := delta[GeneIndex]]
+  out
+})
+names(hvg_df) <- names(hvg_list)
+```
+
+### N2
+
+```{r}
+ggplot(hvg_df$d8_n2_pw, aes(Mu, Delta, color = Epsilon)) +
+  geom_point(aes(color = Epsilon)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_viridis_c() +
+  geom_smooth()
+
+ggplot(hvg_df$d8_n2_pw, aes(Mu, Delta)) +
+  geom_point(aes(color = HVG)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_smooth()
+```
+```{r}
+cat(sort(data$geneid[hvg_df$d8_n2_pw[HVG == TRUE]$GeneName, on = "GeneName"]$GeneSymbol))
+```
+
+### daf-2
+
+```{r}
+ggplot(hvg_df$d8_daf2_pw, aes(Mu, Delta, color = Epsilon)) +
+  geom_point(aes(color = Epsilon)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_viridis_c() +
+  geom_smooth()
+
+ggplot(hvg_df$d8_daf2_pw, aes(Mu, Delta)) +
+  geom_point(aes(color = HVG)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_smooth()
+```
+
+```{r}
+cat(sort(data$geneid[hvg_df$d8_daf2_pw[HVG == TRUE]$GeneName, on = "GeneName"]$GeneSymbol))
+```
+
+### Compare single and pooled
+
+```{r}
+ggdf <- lapply(names(hvg_df), function(i) {
+  out <- copy(hvg_df[[i]])
+  out[, GeneIndex := NULL]
+  colnames(out)[2:ncol(out)] <- paste0(colnames(out)[2:ncol(out)], "_", i)
+  out
+})
+ggdf <- Reduce(function(x, y) merge(x, y, by = c("GeneName")), ggdf)
+```
+
+```{r}
+ggplot(ggdf, aes(Delta_d8_n2_pw, Delta_d8_n2_sw)) +
+  geom_point(size = .7, alpha = .5) +
+  ggtitle("Overdispersion in N2") +
+  xlab("Pooled nematodes") +
+  ylab("Single nematodes") +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_abline() +
+  geom_smooth()
+
+ggplot(ggdf, aes(Delta_d8_daf2_pw, Delta_d8_daf2_sw)) +
+  geom_point(size = .7, alpha = .5) +
+  ggtitle("Overdispersion in daf-2") +
+  xlab("Pooled nematodes") +
+  ylab("Single nematodes") +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_abline() +
+  geom_smooth()
+
+ggplot(ggdf, aes(Epsilon_d8_n2_pw, Epsilon_d8_n2_sw)) +
+  geom_point(size = .7, alpha = .5) +
+  ggtitle("Residual Overdispersion in N2") +
+  xlab("Pooled nematodes") +
+  ylab("Single nematodes") +
+  geom_abline() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth()
+
+ggplot(ggdf, aes(Epsilon_d8_daf2_pw, Epsilon_d8_daf2_sw)) +
+  geom_point(size = .7, alpha = .5) +
+  ggtitle("Residual Overdispersion in daf-2") +
+  xlab("Pooled nematodes") +
+  ylab("Single nematodes") +
+  geom_abline() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth()
+
+ggplot(ggdf[Epsilon_d8_n2_pw < 1], aes(Epsilon_d8_n2_pw, Epsilon_d8_n2_sw)) +
+  geom_point(size = .7, alpha = .5) +
+  ggtitle("Residual Overdispersion in N2") +
+  xlab("Pooled nematodes") +
+  ylab("Single nematodes") +
+  geom_abline() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth()
+```
+

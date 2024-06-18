@@ -1,0 +1,399 @@
+
+```{r}
+library(dplyr)
+library(data.table)
+library(optparse)
+library(pbapply)
+library(dendextend)
+library(qs)
+#library(ggplot2)
+#library(cowplot)
+#library(ComplexHeatmap)
+#library(BASiCS)
+#library(dendextend)
+#library(ggrepel)
+#library(reshape2)
+#library(ggrastr)
+#require(scales)
+#library(RColorBrewer)
+#library(gridExtra)
+#library(circlize)
+#Run community detection
+library(igraph)
+#theme_set(theme_cowplot())
+
+source("../scripts/helpers/gene_variability.R")
+source("../scripts/helpers/preprocess.R")
+## Load data
+
+### Gene names
+
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+
+```
+
+```{r}
+model_names = c("n2_sw")
+
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+
+
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+
+
+cat("Loading counts...\n")
+    sw <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+    annotations = sw$annots;
+    samples_list = lapply(model_names,function(group){
+      cur_annots = sw$annots[eval(parse(text=models$Subset[models$Name == group])),]
+      subgroup_vals = as.character(as.data.frame(cur_annots)[,models$BiologicalCovariates[models$Name == group]])
+     # browser()
+      subgroups = unique(subgroup_vals)
+      res = lapply(subgroups,function(subgroup){
+          cur_annots$Sample[subgroup_vals == subgroup]
+      }) 
+      names(res) = subgroups
+      res
+    })
+    names(samples_list) = model_names;
+  rm(sw)
+    bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds") 
+    counts_list <- lapply(model_names,function(x){
+        res = lapply(names(samples_list[[x]]),function(y){
+   
+           bc$batch_counts_list[[x]][, colnames(bc$batch_counts_list[[x]])%in% samples_list[[x]][[y]]]
+      })
+      names(res) = names(samples_list[[x]])
+      res;
+    })
+    names(counts_list) = model_names
+    rm(bc)
+  
+  cat("Performing normalization...\n")
+  nf <- lapply(model_names,function(group){
+     ret = lapply(counts_list[[group]],function(x){
+       normalizationFactor(x, groups = annotations[Sample %in% colnames(x)]$Group)
+     })
+     names(ret) = names(counts_list[[group]])
+     ret;
+  })
+     
+  names(nf) = model_names;
+  
+  norm_list <- lapply(model_names,function(group){
+      res = lapply(names(counts_list[[group]]),function(subgroup){
+      
+        normalizeCounts(counts_list[[group]][[subgroup]], nf[[group]][[subgroup]])
+      })
+      names(res) = names(counts_list[[group]])
+      res
+  })
+  names(norm_list) = model_names;
+  
+  #normalize each tissue indepenently
+  tissue_norm_list <- lapply(model_names, function(group) {
+        ret = lapply(counts_list[[group]],function(x){
+          k <- normalizationFactorTissueSpecific(x, tissues,annotations[Sample %in% colnames(x)]$Group)
+          ret = normalizeCountsTissueSpecific(x, k, tissues)
+          ret;
+        })
+        names(ret) = names(counts_list[[group]])
+        ret;
+  })
+  names(tissue_norm_list) = model_names;
+          
+  
+```
+#load list of validated targets
+```{r}
+da_models_df <- fread("../data/differential_analysis/models/net_validation.csv")
+setkey(geneid,GeneSymbol)
+RNAi_name_fix = matrix(c("C15C74", "C15C7.4"   ,
+	  "K02F25",   "K02F2.5" ,
+	  "R1022",   "R102.2" ,
+	  "Y44A6D2",  "Y44A6D.2", 
+	  "Y9C2VA1", "Y9C2UA.1" ,
+	  "casy1", "casy-1"   ,
+	  "egl21","egl-21"    ,
+	  "flp12",   "flp-12" ,
+	  "flp14",    "flp-14" , 
+	  "flp1","flp-1",
+	  "flp5","flp-5",
+	  "flp9","flp-9",
+	  "ida1","ida-1",
+	  "ins24","ins-24",
+	  "ins26","ins-26",
+	  "ins30","ins-30",
+	  "ins6","ins-6",
+	  "mec12","mec-12",
+	  "nlp15","nlp-15",
+	  "nlp21","nlp-21",
+	  "nlp50","nlp-50",
+	  "pdf1","pdf-1",
+	  "pgal1","pgal-1",
+	  "pghm1","pghm-1",
+	  "sbt1","sbt-1",
+	  "snet1","snet-1",
+	  "snt4","snt-4",
+	  "ttr29","ttr-29",
+	  "ceh91","ceh-91",
+	  "egl3","egl-3",
+	  "Y9C2UA1","Y9C2UA.1",
+	  "zig2","zig-2"),ncol=2,byrow=T)
+
+	  for ( i in 1:nrow(RNAi_name_fix)){da_models_df[RNAi==RNAi_name_fix[i],]$RNAi = RNAi_name_fix[i,2]}
+
+da_models_df$GeneName = geneid[da_models_df$RNAi,GeneName]
+da_models_df = da_models_df[Genotype=="N2" & TissueSpecificNormalization==F,]
+
+```
+
+
+
+```{r}
+
+makeGraph <- function(rho, theta, beta = 2) {
+  adj <- abs(rho)^beta
+  adj[upper.tri(adj, diag = TRUE)] <- 0
+  adj[adj < theta] <- 0
+  gr <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE, weighted = TRUE)
+}
+```
+
+```{r}
+all_graphs = list();
+
+for (use_tissue_specific in c(T,F)){
+  if (use_tissue_specific){
+    cv_to_use = tissue_norm_list
+    cv_name = "tissue_specific"
+  }else{
+    cv_to_use = norm_list
+    cv_name = "all_genes"
+  }
+
+#filter counts to genes expressed at a minimum level in both covariate groups
+  
+  min_mu = 50
+  cat(paste0("Filtering genes lower than ",min_mu," counts...\n"))
+  
+  # select genes with high mean
+  intersect_genes <-lapply(cv_to_use, function(x) Reduce(intersect,lapply(x,rownames)))
+  names(intersect_genes) = names(cv_to_use)
+  
+  mu_list <- lapply(names(cv_to_use), function(group) lapply(names(cv_to_use[[group]]),function(subgroup){ 
+    apply(cv_to_use[[group]][[subgroup]][intersect_genes[[group]], ], 1, mean)}))
+  names(mu_list) = names(cv_to_use)
+  
+  select_genes <- lapply(mu_list,function(x){names(which(rowMeans(simplify2array(x)) > min_mu))})
+  names(select_genes)= names(cv_to_use)
+  cat("Gene Counts:\n")
+  print(lapply(select_genes,length))
+ 
+  filter_tissue_norm_list <- lapply(names(cv_to_use), function(group){
+      ret = lapply(names(cv_to_use[[group]]),function(subgroup)cv_to_use[[group]][[subgroup]][select_genes[[group]], ])
+      names(ret) = names(cv_to_use[[group]])
+      ret;
+      })
+  names(filter_tissue_norm_list)= names(cv_to_use)
+
+  #calculate correlation matricies
+  cat("Calculating correlation matricies...\n")
+  filter_tissue_rho_list <- lapply(filter_tissue_norm_list, function(x) lapply(x,function(y)cor(t(y), method = "s")))
+  names(filter_tissue_rho_list)= names(filter_tissue_norm_list)
+  
+  filter_tissue_combined_rho_list <- lapply(filter_tissue_norm_list, function(x){ 
+                                            y = do.call("cbind",x);
+                                            cor(t(y), method = "s")})
+  names(filter_tissue_combined_rho_list)= names(filter_tissue_norm_list)
+  
+  
+  
+  to_fit = names(filter_tissue_rho_list);
+ graphs = lapply(to_fit,function(group){
+    cat(paste("Processing",group,"\n")) 
+    subgroup_names = names(filter_tissue_rho_list[[group]])
+   
+    if (length(subgroup_names)>2)
+      stop(paste("Model",group, "has too many subgroups:",paste(subgroup_names,collapse=" ")))
+    g = lapply(subgroup_names,function(subgroup){
+      cat(paste("Processing subgroup ",subgroup,"\n")) 
+      cur_counts = filter_tissue_norm_list[[group]][[subgroup]]
+  
+      covar = filter_tissue_rho_list[[group]][[subgroup]]
+      makeGraph(covar, theta = 0.1, beta = 2)
+    })
+    names(g) = subgroup_names;
+    g
+  })
+  names(graphs) = to_fit;
+  all_graphs[[cv_name]] = graphs;
+}
+```
+
+```{r}
+
+uniqgenes_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+uniqgenes_df[, GermSoma := ifelse(Tissue == "germ_line", "germline", "soma")]
+
+germsoma <- pull(uniqgenes_df, "GermSoma", "GeneName")
+```
+
+```{r}
+estimateCentrality <- function(graph, genesets, uniqgenes_df) {
+  centrality_df <- rbindlist(lapply(names(genesets), function(j) {
+    
+    genes <- genesets[[j]]
+    sg <- graph #induced_subgraph(graph, genes)
+    
+    deg <- degree(sg)
+    # bet <- betweenness(sg, weights = E(sg)$weight)
+    # eig <- eigen_centrality(sg, weights = E(sg)$weight)$vector
+    pr <- page_rank(sg, weights = E(sg)$weight)$vector
+    
+    out <- data.table(Community = j, 
+                      GeneName = genes, 
+                      Degree = deg[genes], 
+                      # Between = bet[genes], 
+                      # Eigen = eig[genes], 
+                      PageRank = pr[genes])
+    out[, RankDegree := rank(Degree)/.N, by = "Community"]
+    out[, RankPageRank := rank(PageRank)/.N, by = "Community"]
+    
+    out <- merge(uniqgenes_df[, .(GeneName, GeneSymbol, Tissue)], out, by = "GeneName", all.x = FALSE, all.y = TRUE)
+    out <- out[order(Community, Tissue, -RankDegree)]
+    out
+  }))
+}
+```
+
+
+```{r}
+bt = rbindlist(lapply(names(all_graphs),function(ts){
+  to_proc = all_graphs[[ts]][["n2_sw"]]
+  bt = rbindlist(lapply(names(to_proc),function(subgroup){
+    gs = list(a=names(V(to_proc[[subgroup]])));
+    bt = estimateCentrality(to_proc[[subgroup]],gs,uniqgenes_df)
+    bt = bt[order(RankPageRank,decreasing=T),]
+    bt$subgroup = subgroup;
+    bt$type = ts;
+    bt;
+  }))
+  bt;
+}))
+bt$experimental_test = ifelse(bt$GeneName %in% da_models_df$GeneName,"chosen for validation",".")
+setkey(geneid,GeneName)
+bt$GeneSymbol = geneid[bt$GeneName,GeneSymbol]
+```
+
+```{r}
+bt$jitter_x = as.integer(bt$subgroup) + rnorm(nrow(bt),0,.2)
+ggplot(bt,aes(jitter_x,PageRank,color=experimental_test)) + 
+  geom_point(data=bt[!experimental_test==T]) + 
+  geom_point(data=bt[experimental_test==T]) +
+  facet_wrap(~type,scales="free_y") +scale_y_continuous(trans="log10")
+
+ggplot(bt,aes(PageRank,color=experimental_test))+stat_ecdf()+facet_wrap(~type,scales="free_y")+scale_x_continuous(trans="log10")
+```
+#load variability data
+```{r}
+model_names = c("n2_sw");
+params_df = NULL;
+trend_df = NULL
+if (0){
+  for (model in model_names){
+    p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,".csv.gz"))
+    if (!("Food" %in% names(p))) p[,Food:=""]
+    if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+    p$model = model
+    params_df = rbind(p,params_df,fill=TRUE);
+     p <- fread(paste0("../data/gene_variability/summary_trend_",model,".csv.gz"))
+  p$model = model
+  trend_df = rbind(p,trend_df,fill=TRUE);
+  }
+  params_df[, Day := factor(Day, levels(annots$Day))]
+  params_df[, Strain := factor(Strain, levels(annots$Strain))]
+  params_df[, Food := factor(Food, levels(annots$Food))]
+  params_df[, Temperature := factor(Temperature, levels(annots$Temperature))]
+  params_df <- params_df[AllZeroProp == 0]
+  params_df$ResDisp = as.numeric(params_df$ResDisp)
+  dva_df = list();#differential mean and variability analysis
+  #mean analysis columns have suffixes "DeSeq"
+ if(0) for (model in model_names){ 
+    dva_df[[model]] <-  fread(paste0("../data/gene_variability/regression_effects_",model,".csv.gz"))
+    dva_df[[model]] <-  dva_df[[model]][MeanMissingValueProp == 0]
+    dma_df_tmp <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/",model,".csv.gz"))
+    colnames(dma_df_tmp)[3:ncol(dma_df_tmp)] <- paste0(colnames(dma_df_tmp)[3:ncol(dma_df_tmp)], "_DESeq")
+    dva_df[[model]] <- merge(dva_df[[model]], dma_df_tmp, by = "GeneName")
+  }
+{
+params_shared_tech_df = NULL;
+trend_shared_tech_df= NULL
+for (model in model_names){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,"_shared_tech.csv.gz"))  
+  if (!("Food" %in% names(p))) p[,Food:=""]
+  if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+  p$model = model
+  params_shared_tech_df = rbind(p,params_shared_tech_df,fill=TRUE);
+  p <- fread(paste0("../data/gene_variability/summary_trend_",model,"_shared_tech.csv.gz"))
+  p$model = model
+  trend_shared_tech_df = rbind(p,trend_shared_tech_df,fill=TRUE);
+}
+
+```
+
+```{r}
+bt$subgroup = as.numeric(bt$subgroup)
+bt_with_var_info=merge(bt,params_shared_tech_df[bad_fit==F&SequenceType=="Biological"&Pooled==F,],by.x=c("GeneName","subgroup"),by.y = c("GeneName","Day"))
+bt_with_var_info = bt_with_var_info[order(bt_with_var_info$experimental_test),]
+to_plot =bt_with_var_info[subgroup==8,]
+ggplot(data=to_plot,aes(ResVar,RankPageRank,color=experimental_test)) + 
+  geom_point_rast(data=to_plot[experimental_test=="."],alpha=.2,raster.dpi=600) + 
+  geom_point(data=to_plot[experimental_test!="."]) +
+  scale_color_manual(values=c(`.`="black",`chosen for validation`="#00CD6C"))+
+  facet_grid(~type,scales="free_y") +scale_y_continuous(trans="log10") + xlab("Variance across cohort")+ylab("Page Rank")+theme(legend.position="none")+geom_vline(xintercept=1,lty=2,col="dark gray")
+ggsave("../figures/03/gene_selection.pdf",width=8,height=8)
+
+```
+```{r}
+scaling_models = qread("../data/scaling_model_summary.qs")
+gn_to_lookup = unique(bt_with_var_info[experimental_test!=".",GeneName])
+setkey(geneid,GeneName)
+gn_lookup=data.table(GeneName=gn_to_lookup,GeneSymbol=geneid[gn_to_lookup,GeneSymbol])
+gn_lookup$GeneSymbol_mangled = str_replace(gn_lookup$GeneSymbol,"-","")
+gn_lookup$da = "";
+for(i in 1:nrow(gn_lookup)){
+   subs = unique(scaling_models$da[grepl(gn_lookup$GeneSymbol_mangled[i],scaling_models$da)])
+   val = subs[grepl("N2_",subs) & grepl("Day8",subs)]
+   if (length(val)==0){
+     warning(paste("Could not match",gn_lookup$GeneSymbol_mangled[i]))
+     next;
+   }
+   if (length(val)>1){
+      warning(paste("Multiple matches for",gn_lookup$GeneSymbol_mangled[i],":",paste(val,collapse=",")))
+     val = val[1];
+   }
+   gn_lookup$da[i] = val;
+}
+setkey(gn_lookup,GeneName)
+bt_hits = bt_with_var_info[experimental_test!=".",]
+bt_hits$da = gn_lookup[bt_hits$GeneName,da]
+setkey(scaling_models,da)
+bt_hits_with_scaling_data_d8=merge(bt_hits[subgroup==8,],scaling_models[single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & type == "relative_per_gene_variance" ,],by.x=c("da"),by.y=c("da"))
+bt_hits_with_scaling_data_d1=merge(bt_hits[subgroup==1,],scaling_models[single_worm_model=="d1_sw" & single_worm_submodel=="QZ0" & type == "relative_per_gene_variance" ,],by.x=c("da"),by.y=c("da"))
+bt_hits_with_scaling_data = rbind(bt_hits_with_scaling_data_d8,bt_hits_with_scaling_data_d1)
+
+ggplot(bt_hits_with_scaling_data,aes(RankPageRank,1-mean_est))+geom_point()+facet_grid(subgroup~ type.x)+ geom_smooth(method="lm",se=F)
+ggplot(bt_hits_with_scaling_data,aes(ResVar,1-mean_est))+geom_point()+facet_grid(subgroup~ type.x) + geom_smooth(method="lm",se=F)
+
+g1 = ggplot(bt_hits_with_scaling_data[subgroup=="8"&type.x=="all_genes",],aes(RankPageRank,1-mean_est))+geom_point()+ geom_smooth(method="lm",se=F)+ylab("Fraction Cohort Variance Explained")+xlab("Rank Page Rank")
+g2 = ggplot(bt_hits_with_scaling_data[subgroup=="8"&type.x=="all_genes",],aes(ResVar,1-mean_est))+geom_point()+ geom_smooth(method="lm",se=F)+ylab("Fraction Cohort Variance Explained")+xlab("Variance across cohort")
+ggpubr::ggarrange(g1,g2,nrow=1,ncol=2)
+ggsave("../figures/03/S_predictors_of_variance_explained.pdf",width=8,height=8)
+
+```
+

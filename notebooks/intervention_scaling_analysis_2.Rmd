@@ -1,0 +1,3513 @@
+```{r}
+library(qs)
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(pbapply)
+library(qs)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(dendextend)
+library(cowplot)
+library(ggrastr)
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/preprocess.R")
+
+theme_set(theme_cowplot())
+
+```
+ 
+### Gene annotations
+
+```{r}
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+
+
+tissue_colors <- c("germ_line" = "black", 
+                   "hypodermis" = "#5ac134", 
+                   "intestine" = "#79bbe9", 
+                   "muscle" = "#f68528",
+                   "neurons" = "#E92128")
+```
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType  = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+```
+
+```{r}
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+#tissues <- pull(tissues_df, "Tissue", "GeneName")
+#germsoma <- tissues
+#germsoma[germsoma != "germ_line"] <- "soma"
+```
+
+#merge all scaling model fit statistics to a single file
+```{r}
+re_concatentate_all_data = F
+if (re_concatentate_all_data){
+  path = "../data/scaling_models/all_30min/"
+  fls = list.files(path=path,
+     pattern=paste0("*=stats.qs"))
+  #fls = fls[grepl("rpl7",fls)]
+  
+  scaling_models = rbindlist(pblapply(fls,function(x){
+      #cat(paste0(x,'\n'));
+      r = qread(paste0(path,x))
+      r$current_da = x
+      r$type = rownames(r)
+      if (!"da" %in% names(r))
+        return(NULL)
+      r
+  }),fill=T)
+  scaling_models = scaling_models[is.na(min_min_gene_count),]
+  qsave(scaling_models,"../data/scaling_model_min30_summary.qs")
+  
+}
+```
+
+#load scaling models from disk
+```{r}
+scaling_models= qread("../data/scaling_model_min30_summary.qs")
+scaling_model_hit_genes = qread("../data/scaling_model_scaling_hit_genes_summary.qs")
+path = "../data/scaling_models/all_30min/" #path for reading detailed scaling model results from disk
+```
+
+
+```{r}
+sm = scaling_models[type %in% c("relative_per_gene_IQD90","relative_per_gene_variance") & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+```
+
+#select the definitive set of "hits" from scaling analysis
+```{r}
+single_worm_model = "d8_sw"
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & `ci.97.5.`<.985 & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+wt_hits_2 = scaling_models[type == "relative_per_gene_variance" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & mean_est <= .9 & `ci.97.5.`<.99 & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+cohort_scaling_model_hits = wt_hits_2[wt_hits_2$da %in% wt_hits$da,]
+```
+
+#counts of RNAi
+```{r}
+dr =  scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+length(unique(dr[substring(da,0,2)=="N2",]$da))
+(unique(dr[substring(da,0,2)!="N2",]$da))
+
+```
+
+
+```{r}
+if(0){
+#m = merge(scaling_models,scaling_models_old_fit,by=c("current_da","single_worm_model","single_worm_submodel","type","da"),suffixes=c(".new",".old"))
+t = "relative_total_IQD90"
+#t = "relative_per_gene_variance"
+#t = "relative_total_variance"
+mm = m[type == t & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day3",da) & !grepl("e1368",da),]
+rng = quantile(unlist(mm[,.(mean_est.old,mean_est.new)]),c(.05,.95))
+ggplot(mm,aes(mean_est.old,mean_est.new)) + geom_point() + xlim(rng)+ylim(rng)+geom_abline(slope=1,intercept=0,col="gray") + geom_hline(yintercept=1,lty=2,col="dark gray")+ geom_vline(xintercept=1,lty=2,col="dark gray")
+
+m = scaling_models[type %in% c("total_effect_variance","total_observation_variance","total_resid_variance")]
+mm = dcast(m[single_worm_submodel=="d8_sw" & single_worm_submodel=="QZ0",], current_da+single_worm_model+single_worm_submodel+da~type,value.var="mean_est")
+plot(mm,aes(total_observation_variance,total_resid_variance))+geom_point()
+}
+```
+
+
+```{r}
+#the comparisons of the n2 series are consistent (eg. old vs young timepoints) so we make a lookup table to sort it out.
+n2_series_name_lookup = c(`02v01`= "n2_d2_vs_1",
+                    `04v02`= "n2_series_d2",
+                    `06v04`= "n2_series_d4",
+                    `08v06`= "n2_d6_vs_8",
+                    `10v08`= "n2_d10_vs_8",
+                    `12v10`= "n2_series_d10",
+                    `01v04`= "n2_d4_vs_1",
+                    `02v06`= "n2_series_d2_d6",
+                    `04v08`= "n2_d6_vs_8",
+                    `06v10`= "n2_series_d6_d10",
+                    `08v12`= "n2_d12_vs_8")
+
+n2_series_aging_direction = c(`02v01`= "foward",
+                    `04v02`= "forward",
+                    `06v04`= "reverse",
+                    `08v06`= "reverse",
+                    `10v08`= "forward",
+                    `12v10`= "forward",
+                    `01v04`= "forward",
+                    `02v06`= "reverse",
+                    `04v08`= "reverse",
+                    `06v10`= "reverse",
+                    `08v12`= "forward")
+n2_series_da_aging_direction = n2_series_aging_direction;
+names(n2_series_da_aging_direction) = n2_series_name_lookup[names(n2_series_aging_direction)]
+
+```
+
+#load pretty labels for plotting
+```{r}
+das = data.frame(name=unique(scaling_models$da))
+pos = unlist(lapply(gregexpr("_",das$name),function(x)x[[1]]))
+das$genotype= substring(das$name,0,pos-1)
+pos2 = unlist(lapply(gregexpr("Set",das$name),function(x)x[[1]]))
+not_rnai=pos2==-1
+pos2[not_rnai]=nchar(das$name[not_rnai])+4
+das$label = substring(das$name,pos+1,pos2-2)
+write.csv(das,file="../data/annotations/da_model_name_lookup_template.csv",row.names=F)
+da_model_name_lookup=fread("../data/annotations/da_model_name_lookup.csv")
+setkey(da_model_name_lookup,name);
+scaling_models$label_short = da_model_name_lookup[scaling_models$da,label_short]
+scaling_models$label_long = da_model_name_lookup[scaling_models$da,label_long]
+scaling_models$italicize = as.logical(da_model_name_lookup[scaling_models$da,italicize])
+
+
+
+das = data.frame(name=unique(scaling_model_hit_genes$da))
+pos = unlist(lapply(gregexpr("_",das$name),function(x)x[[1]]))
+das$genotype= substring(das$name,0,pos-1)
+pos2 = unlist(lapply(gregexpr("Set",das$name),function(x)x[[1]]))
+not_rnai=pos2==-1
+pos2[not_rnai]=nchar(das$name[not_rnai])+4
+das$label = substring(das$name,pos+1,pos2-2)
+write.csv(das,file="../data/annotations/da_model_name_lookup_template.csv",row.names=F)
+da_model_name_lookup=fread("../data/annotations/da_model_name_lookup.csv")
+setkey(da_model_name_lookup,name);
+scaling_model_hit_genes$label_short = da_model_name_lookup[scaling_model_hit_genes$da,label_short]
+scaling_model_hit_genes$label_long = da_model_name_lookup[scaling_model_hit_genes$da,label_long]
+scaling_model_hit_genes$italicize = as.logical(da_model_name_lookup[scaling_model_hit_genes$da,italicize])
+```
+
+
+#plot correlation examples between the effect of scaling models across residual variance of all the genes
+```{r,fig.width=8,fig.height=8}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% c(cohort_scaling_model_hits$da, "n2_d6_vs_8") & !grepl("Day3",da) & !grepl("e1368",da),]
+
+ts = scaling_models[type == "relative_per_gene_variance" & single_worm_model == "n2_series_all" & da %in% unique(wt_hits$da),]
+ts$day = as.numeric(ts$single_worm_submodel)
+ts[mean_est > 1,mean_est:=1]
+ts[`ci.97.5.` > 1,`ci.97.5.`:=1]
+ts[1-`ci.2.5.` > .6,`ci.2.5.`:=NA]
+
+to_highlight = c()#c("nlp-28","pcn-1","atp-5","rpl−7")
+to_plot = ts[!label_long %in% to_highlight,]
+ggplot(to_plot,aes(day,1-mean_est,color=label_long)) + geom_line() + geom_point() +
+  geom_ribbon(aes(ymin=1-`ci.2.5.`, ymax= 1-`ci.97.5.`),colour = NA ,size=1,alpha=.1) +  
+  geom_hline(yintercept=0)+ facet_wrap(~label_long,scale="free_y")+theme(legend.position="none", strip.background = element_blank(),strip.text = element_text(face = "italic"))+scale_x_continuous(breaks=c(2,4,6,8,10,12))+xlab("Age (days)") + ylab("Fraction of cohort variance explained")
+
+ggsave("../figures/03/S_wt_hits_timeseries.pdf",width=10,height=8)
+
+if (0){to_plot = ts[label_long %in% to_highlight,]
+ggplot(to_plot,aes(day,1-mean_est,color=label_long)) + geom_line() + geom_point() + 
+  geom_ribbon(aes(ymin=1-`ci.2.5.`, ymax= 1-`ci.97.5.`),colour = NA ,size=1,alpha=.1) +  geom_hline(yintercept=0)+ facet_wrap(~label_long,scale="free_x",nrow=1)+theme(legend.position="none", strip.background = element_blank(),strip.text = element_text(face = "italic"))+scale_x_continuous(breaks=c(2,4,6,8,10,12))+xlab("Age (days)") + ylab("Fraction of\ncohort variance\nexplained")
+ggsave("../figures/03/wt_hits_timeseries_highlight.pdf",width=6,height=2)
+}
+
+ path = "../data/scaling_models/all_30min/"
+nms = unique(ts[,.(current_da,da)])
+nms[,current_da:=substring(current_da,1,nchar(current_da)-9)]
+setkey(nms,current_da)
+resids = lapply(nms$current_da,function(x){
+  print(x)
+  qread(paste0(path,x,"=all.qs"))
+})
+names(resids) = nms$current_da
+resid_dat = rbindlist(lapply(names(resids),function(x){
+  r = data.frame(resids[[x]]$dat$residuals)
+  r$GeneName = rownames(r)
+  r$IQD90_ratio = r$residuals_IQD90/r$orig_IQD90
+  r$Name = x;
+  r$da = nms[x,da]
+  r
+}))
+
+
+
+
+resid_dat_8 = resid_dat[grepl("series_all_8",resid_dat$Name),]
+rr = dcast(resid_dat_8,GeneName~Name,value.var="IQD90_ratio")
+decreased_genes = aggregate(IQD90_ratio~GeneName,resid_dat_8,function(x)length(which(x<.9)))
+table(decreased_genes$IQD90_ratio)
+setkey(geneid,GeneName)
+setkey(tissues_df,GeneName)
+decreased_genes = decreased_genes[decreased_genes$IQD90_ratio>2,]
+decreased_genes$GeneSymbol = geneid[decreased_genes$GeneName,GeneSymbol]
+decreased_genes$Tissue = tissues_df[decreased_genes$GeneName,Tissue]
+rr$decreased_in_all = rr$GeneName %in% decreased_genes$GeneName
+rr$label =  geneid[rr$GeneName,GeneSymbol]
+rr$label[!rr$decreased_in_all] = ""
+rr = data.table(rr)
+ plot_comparrison = function(data,col1,col2,labx,laby){
+   corr=cor(data[,get(col1)],data[,get(col2)],use ="complete.obs",method="s")
+   if (is.nan(corr)) browser()
+   rng_x=range(data[,get(col1)],na.rm = T) 
+   rng_y=range(data[,get(col2)],na.rm = T)
+  r = ggplot(data,aes_string(col1,col2,label="label")) + 
+    geom_point_rast(size=.7,alpha=.3,raster.dpi=600) + 
+    geom_abline(intercept=0,slope=1,lty=2)+
+  xlab(labx)+geom_hline(yintercept=1)+geom_vline(xintercept=1)+scale_x_continuous(trans="log2")+scale_y_continuous(trans="log2")+
+  ylab(laby)+geom_text_repel(color="dark blue") + theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + annotate("text",x=rng_x[1]*1.05,y=rng_y[2]*.95,label=paste("cor:",round(corr,2)),color="black")
+  ggExtra::ggMarginal(r, type = "density",size=40,fill="gray")
+ }
+ 
+ 
+gps = list( plot_comparrison(rr,"n2_d6_vs_8_n2_series_all_8","d8_glp1_n2_series_all_8","Aging Pseudotime Day 6 vs 8","glp-1(e2141)"),
+# plot_comparrison(rr,"n2_d6_vs_8_n2_series_8","N2_atp5_Set5_Day8_n2_series_8","Aging Pseudotime Day 6 vs 8","atp-5"),
+ plot_comparrison(rr,"n2_d6_vs_8_n2_series_all_8","N2_pcn1_Set5_Day8_n2_series_all_8","Aging Pseudotime Day 6 vs 8","pcn-1"),
+# plot_comparrison(rr,"n2_d6_vs_8_n2_series_8","N2_nlp28_Set3_Day8_n2_series_8","Aging Pseudotime Day 6 vs 8","nlp-28"),
+ plot_comparrison(rr,"d8_glp1_n2_series_all_8","N2_pcn1_Set5_Day8_n2_series_all_8","glp-1(e2141)","pcn-1"),
+ #plot_comparrison(rr,"d8_glp1_n2_series_8","N2_nlp28_Set3_Day8_n2_series_8","glp-1(e2141)","nlp-28"),
+ plot_comparrison(rr,"N2_pcn1_Set5_Day8_n2_series_all_8","N2_nlp28_Set3_Day8_n2_series_all_8","pcn-1","nlp-28")#,
+# plot_comparrison(rr,"n2_d6_vs_8_n2_series_8","N2_rpl7_Set5_Day8_n2_series_8","Aging Pseudotime Day 6 vs 8","rpl-7"),
+# plot_comparrison(rr,"d8_glp1_n2_series_8","N2_nlp28_Set3_Day8_n2_series_8","glp-1(e2141)","nlp-28"),
+ #plot_comparrison(rr,"N2_nlp28_Set3_Day8_n2_series_8","N2_pcn1_Set5_Day8_n2_series_8","nlp-28","pcn-1"),
+# plot_comparrison(rr,"N2_pcn1_Set5_Day8_n2_series_8","N2_rpl7_Set5_Day8_n2_series_8","pcn-1","rpl-7"),
+# plot_comparrison(rr,"N2_pcn1_Set5_Day8_n2_series_8","N2_col122_Set3_Day8_n2_series_8","pcn-1","col-122"),
+# plot_comparrison(rr,"N2_pcn1_Set5_Day8_n2_series_8","N2_C08H9.15_Set3_Day8_n2_series_8","pcn-1","C08H9.15")
+)
+pdf("../figures/03/S_per_gene_reduction_in_variance.pdf",width=8,height=8)
+ggpubr::ggarrange(plotlist=gps,nrow=2,ncol=2)
+dev.off()
+ 
+
+```
+
+#analyze residuals of time series hits
+```{r}
+
+### Gene annotations
+
+
+enrich_hvg <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   data.table(decreased_genes), 
+                   "Annotation", 
+                   universe = resid_dat_8$GeneName)
+})
+names(enrich_hvg) <- names(gene_annotations)
+
+
+
+tmp = enrich_hvg[[1]]$qvalue[,"GeneName"]
+wcat = data.table(cat = names(tmp),qval = tmp)
+wcat = wcat[qval<.05]
+wcat = wcat[order(wcat,decreasing=F)]
+
+
+tmp = enrich_hvg[[2]]$qvalue[,"GeneName"]
+wormexp = data.table(cat = names(tmp),qval = tmp)
+wormexp = wormexp[qval<.000001]
+wormexp = wormexp[order(qval,decreasing=F)]
+
+
+```
+
+```{r}
+if(0){
+wt_hits = scaling_models[type == "relative_total_IQD90" & grepl("d8_sw",current_da),]
+wt_hits = scaling_models[((single_worm_model=="d8_sw" & single_worm_submodel == "QZ0") |
+                           (single_worm_model == "n2_series" &  single_worm_submodel == "8")) & !grepl("daf2e1368",current_da) & mean_est < .96,]
+
+
+wt_hits = scaling_models[current_single_worm_model=="d8_sw" & single_worm_submodel == "QZ0" & !grepl("daf2e1368",current_da) & type == "relative_total_IQD",]
+
+wt_hits = scaling_models[current_single_worm_model=="n2_series" & single_worm_submodel == "8" & !grepl("daf2e1368",current_da) & type == "relative_total_variance",]
+wt_hits = wt_hits[order(mean_est),]
+
+wt_hits2 =as.data.frame( wt_hits);
+for (i in 1:nrow(wt_hits2))
+  wt_hits2[i,1:5] = t(as.numeric(wt_hits2[i,1:5])[order(wt_hits2[i,1:5])])
+names(wt_hits2)[1:5] = c("025","05","mean","95","97")
+}
+```
+#load relative variance data
+```{r}
+
+params_shared_tech_df <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_n2_sw_shared_tech.csv.gz"))  
+params_shared_tech_df$model = "n2_sw"
+params_shared_tech_df <- params_shared_tech_df[AllZeroProp == 0 & bad_fit==F]
+
+```
+
+
+```{r,fig.width=10,fig.height=10}
+library(ggExtra)
+resvar_params = params_shared_tech_df[model=="n2_sw" & Day == 8,]
+setkey(resvar_params,GeneName)
+wt_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day3",da),]
+
+wt_hits_var = scaling_models[type == "relative_per_gene_variance" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% wt_hits$da,]
+wt_hits_var = wt_hits_var[order(mean_est,decreasing=F),]
+to_plot = c("n2_d6_vs_8","d1_glp1","N2_pcn1_Set5_Day8","N2_nlp28_Set3_Day8")
+setkey(wt_hits_var,da)
+wt_hits_var = wt_hits_var[to_plot,]
+gps = lapply(1:nrow(wt_hits_var),function(i){
+#m = qread(paste0("../data/scaling_models/",wt_hits_var$da[i],"_d8_sw_QZ0=all.qs"))
+  fn = paste0("Z:/nstroustrup/projects/asynch-seq-2022/data/scaling_models/all/",wt_hits_var$da[i],"_d8_sw_QZ0=all.qs")
+#  print(fn)
+m = qread(fn)
+r = m$dat$residuals
+r$GeneName = rownames(r)
+r$var_ratio = (r$residuals_var/r$orig_var)
+setkey(geneid,GeneName)
+r$GeneSymbol= geneid[r$GeneName,GeneSymbol]
+ggplot(r,aes(x=var_ratio))+geom_density() + geom_vline(xintercept=1)
+r$frac_explained = (r$residuals_var/r$orig_var)
+r$resvar_external_calc = resvar_params[r$GeneName,ResVar]
+#r$frac_explained[r$frac_explained<0] = 0
+#ggplot(r,aes(x=frac_explained))+geom_histogram() 
+r = r[order(r$frac_explained,decreasing=T),]
+
+spfit = smooth.spline(r$resvar_external_calc,y=r$frac_explained,spar=.4,nknots=10)
+spfit_df = data.frame(resvar_external_calc=spfit$x,frac_explained=spfit$y)
+spfit_df$GeneSymbol = "Spline_fit"
+
+r$GeneSymbol[r$orig_var < quantile(r$orig_var,.95) | abs(r$frac_explained) < .1 ] = ""
+breaks = seq(-2,2,by=.25)
+labels = as.character(breaks)
+labels[ !breaks %in% seq(-2,2,.5)]= ""
+gp = ggplot(r,aes(x=2^resvar_external_calc,label=GeneSymbol,y=frac_explained))+
+  geom_point_rast(size=.75,alpha=.5,raster.dpi=600)+
+  geom_text_repel(color="dark blue",size=2,fontface=3) + 
+  xlab("Cohort Variance") + 
+  ylab(paste("Model effect on variance\n")) + 
+         geom_hline(yintercept=1,lty=1,col="dark gray") +   
+         geom_line(data=spfit_df,color="dark red") + 
+         scale_x_continuous(trans="log10",breaks=c(1,5,10,50,100,500,1000,5000),lim=c(.5,500))+
+         annotate(geom="text",x=1,y=max(r$frac_explained),label=wt_hits_var$da[i]) + 
+         scale_y_continuous(breaks=breaks,labels=labels)
+
+rr = r[!grepl("vit",r$GeneSymbol),]
+res = data.frame(da = rep(wt_hits_var$da[i],2),
+                 total=sum(r$residuals_var)/sum(r$orig_var),
+  mean=mean(r$residuals_var/r$orig_var),
+  total_without_vit=sum(rr$residuals_var)/sum(rr$orig_var),
+  mean_without_vit=mean(rr$residuals_var/rr$orig_var))
+print(res)
+gp#ggMarginal(gp, type="densigram")
+})
+ggpubr::ggarrange(plotlist=gps,nrow=2,ncol=2)
+ggsave("Z:/nstroustrup/projects/asynch-seq-2022/figures/03/S_fraction_variance_per_gene_vs_variance.pdf",width=8,height=8)
+```
+
+```{r,fig.width=20,fig.height=10}
+#compare WT RNAI results on WT to DAF-2 RNAI results on daf2
+
+daf2_hits = scaling_model_hit_genes[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & `ci.97.5.`<.98 & grepl("e1368",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"daf2e1368_","")
+
+wt_hits = scaling_model_hit_genes[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day3",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+shared = union(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = rbind(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,] )
+ggplot(res,aes(x = factor(da_sub),mean_est,color=single_worm_submodel)) + geom_point() + geom_errorbar(aes(x = factor(da_sub),ymin=`ci.2.5.`,ymax=`ci.97.5.`,width=0.2)) + theme(axis.text.x = element_text(angle = 90)) + geom_hline(yintercept=1,col="gray",lty=2) + ggtitle("WT RNAi on WT single worms, daf-2 RNAi on daf-2 single worms")
+
+#compare WT RNAI results on WT to WT RNAI results on daf2
+daf2_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & !grepl("e1368",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"N2_","")
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("e1368",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = rbind(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,] )
+ggplot(res,aes(x = factor(da_sub),mean_est,color=single_worm_submodel)) + geom_point() + geom_errorbar(aes(x = factor(da_sub),ymin=`ci.2.5.`,ymax=`ci.97.5.`,width=0.2)) + theme(axis.text.x = element_text(angle = 90)) + geom_hline(yintercept=1,col="gray",lty=2) + ggtitle("WT RNAi on WT single worms, WT RNAi on daf-2 single worms")
+
+#compare daf-2 RNAI results on WT to DAF-2 RNAI results on daf2
+daf2_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & grepl("e1368",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"daf2e1368_","")
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & grepl("e1368",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"daf2e1368_","")
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = rbind(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,] )
+ggplot(res,aes(x = factor(da_sub),mean_est,color=single_worm_submodel)) + geom_point() + geom_errorbar(aes(x = factor(da_sub),ymin=`ci.2.5.`,ymax=`ci.97.5.`,width=0.2)) + theme(axis.text.x = element_text(angle = 90)) + geom_hline(yintercept=1,col="gray",lty=2) + ggtitle("daf-2 RNAi on WT single worms, daf-2 RNAi on daf-2 single worms")
+
+```
+```{r,fig.width=8,fig.height=4}
+
+var_to_use = "relative_per_gene_IQD90"
+var_to_use = "relative_per_gene_variance"
+#compare WT RNAI results on WT to WT RNAI results on daf2
+daf2_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & !grepl("e1368",da) & grepl("Day8",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"N2_","")
+daf2_hits[,mean_est := 1-mean_est]
+daf2_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+daf2_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+wt_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("e1368",da) & grepl("Day8",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+wt_hits[,mean_est := 1-mean_est]
+wt_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+wt_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = merge(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,],by="label_short",suffixes=c(".daf2",".wt"  ))
+res = res[1-`ci.97.5..wt`<.98 | 1-`ci.97.5..daf2`<.98,]
+
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+
+gp_wt=ggplot(res,aes(mean_est.wt,mean_est.daf2,label=label_to_use,color=label_short)) + 
+ # geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+ # geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + 
+  geom_hline(yintercept=0,lty=1,col="dark gray")+ 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+  geom_abline(intercept=0,slope=1,col="gray",lty=2)+geom_text_repel()+theme(legend.position="none") + xlab("Wild-type")+ylab("daf-2(e1368)")+annotate("text",x=min(res$ci.2.5..wt)*1.01,y=max(res$ci.97.5..daf2)*.99,label="Knockdown\nin Wildtype")
+
+#compare daf-2 RNAI results on WT to DAF-2 RNAI results on daf2
+daf2_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & grepl("e1368",da) & grepl("Day8",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"daf2e1368_","")
+daf2_hits[,mean_est := 1-mean_est]
+daf2_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+daf2_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+wt_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & grepl("e1368",da) & grepl("Day8",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"daf2e1368_","")
+wt_hits[,mean_est := 1-mean_est]
+wt_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+wt_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = merge(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,],by="label_short",suffixes=c(".daf2",".wt"  ))
+res = res[1-`ci.97.5..wt`<.98 | 1-`ci.97.5..daf2`<.98,]
+
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+
+gp_daf2=ggplot(res,aes(x =mean_est.wt,y=mean_est.daf2,label=label_to_use,color=label_short)) +  
+#  geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+ # geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + 
+  geom_hline(yintercept=0,lty=1,col="dark gray")+ 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+ 
+  theme(axis.text.x = element_text(angle = 90)) + geom_abline(intercept=0,slope=1,col="gray",lty=2) +geom_text_repel()+theme(legend.position="none") + xlab("Wild-type")+ylab("daf-2(e1368)")+annotate("text",x=min(res$ci.2.5..wt)*1.01,y=max(res$ci.97.5..daf2)*.99,label="Knockdown\nin daf-2(e1368)")
+
+
+#compare WT RNAI results on WT to DAF-2 RNAI results on daf2
+daf2_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & grepl("e1368",da) & grepl("Day8",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"daf2e1368_","")
+daf2_hits[,mean_est := 1-mean_est]
+daf2_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+daf2_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+wt_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("e1368",da) & grepl("Day8",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+wt_hits[,mean_est := 1-mean_est]
+wt_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+wt_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = merge(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,],by=c("da_sub","label_short"),suffixes=c(".daf2",".wt"  ))
+res = res[1-`ci.97.5..wt`<.98 | 1-`ci.97.5..daf2`<.98,]
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+gp_matched=ggplot(res,aes(x =mean_est.wt,y=mean_est.daf2,label=label_to_use,color=label_short)) +  
+  #geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+  #geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + 
+  geom_hline(yintercept=0,lty=1,col="dark gray")+ 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+ 
+  theme(axis.text.x = element_text(angle = 90)) + 
+  geom_abline(intercept=0,slope=1,col="gray",lty=2) +
+  geom_text_repel()+theme(legend.position="none") + xlab("Wild-type")+ylab("daf-2(e1368)")+
+  annotate("text",x=min(res$ci.2.5..wt)*1.01,y=max(res$ci.97.5..daf2)*.99,label="Knockdown\nmatched")
+
+ggpubr::ggarrange(plotlist = list(gp_wt,gp_daf2,gp_matched),nrow=1,ncol=3)
+ggsave("../figures/04/S_daf2_scaling_fraction_variance_both_RNAis.pdf",width=9,height=3)
+
+```
+
+#TEMPERATURE UV GLP-1
+```{r,fig.width=8,fig.height=4}
+var_to_use = "relative_per_gene_IQD90"
+var_to_use = "relative_per_gene_variance"
+#glp-1
+daf2_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_glp1" & single_worm_submodel=="CB4037" & !grepl("e1368",da) & grepl("Day8",da),]
+daf2_hits[,mean_est := 1-mean_est]
+daf2_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+daf2_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+wt_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_glp1" & single_worm_submodel=="QZ0" & !grepl("e1368",da) & grepl("Day8",da),]
+wt_hits[,mean_est := 1-mean_est]
+wt_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+wt_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+shared = intersect(wt_hits$da,daf2_hits$da)
+
+res = merge(daf2_hits[da %in% shared,],wt_hits[da %in% shared,],by="label_short",suffixes=c(".daf2",".wt"  ))
+res = res[1-`ci.97.5..wt`<.98 | 1-`ci.97.5..daf2`<.98,]
+
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,effect:=T]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+
+gp_glp1=ggplot(res,aes(mean_est.wt,mean_est.daf2,label=label_to_use,color=label_short)) + 
+ # geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+ # geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + 
+  geom_hline(yintercept=0,lty=1,col="dark gray")+ 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+  geom_abline(intercept=0,slope=1,col="gray",lty=2)+geom_text_repel()+theme(legend.position="none")  + xlim(0,.5) + ylim(0,.5)
+
+#UV
+daf2_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_UV" & single_worm_submodel=="NEC937_UV" & !grepl("e1368",da) & grepl("Day8",da),]
+daf2_hits[,mean_est := 1-mean_est]
+daf2_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+daf2_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+wt_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_UV" & single_worm_submodel=="NEC937" & !grepl("e1368",da) & grepl("Day8",da),]
+wt_hits[,mean_est := 1-mean_est]
+wt_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+wt_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+shared = intersect(wt_hits$da,daf2_hits$da)
+
+res = merge(daf2_hits[da %in% shared,],wt_hits[da %in% shared,],by="label_short",suffixes=c(".daf2",".wt"  ))
+res = res[1-`ci.97.5..wt`<.98 | 1-`ci.97.5..daf2`<.98,]
+
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,effect:=T]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+
+gp_UV=ggplot(res,aes(x =mean_est.wt,y=mean_est.daf2,label=label_to_use,color=label_short)) +  
+#  geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+ # geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + 
+  geom_hline(yintercept=0,lty=1,col="dark gray")+ 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+ 
+  theme(axis.text.x = element_text(angle = 90)) + geom_abline(intercept=0,slope=1,col="gray",lty=2) +geom_text_repel()+theme(legend.position="none") + xlab("Live ")+ylab("UV-inactivated") + xlim(0,.15) + ylim(0,.15)
+
+
+#25C
+daf2_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_20v25C" & single_worm_submodel=="25" & !grepl("e1368",da) & grepl("Day8",da),]
+daf2_hits[,mean_est := 1-mean_est]
+daf2_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+daf2_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+wt_hits = scaling_model_hit_genes[type == var_to_use & single_worm_model=="d8_20v25C" & single_worm_submodel=="20" & !grepl("e1368",da) & grepl("Day8",da),]
+wt_hits[,mean_est := 1-mean_est]
+wt_hits[, `ci.97.5.` := 1-`ci.97.5.`]
+wt_hits[, `ci.2.5.` := 1-`ci.2.5.`]
+shared = intersect(wt_hits$da,daf2_hits$da)
+
+res = merge(daf2_hits[da %in% shared,],wt_hits[da %in% shared,],by=c("da","label_short"),suffixes=c(".daf2",".wt"  ))
+res = res[1-`ci.97.5..wt`<.98 | 1-`ci.97.5..daf2`<.98,]
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,effect:=T]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+gp_25C=ggplot(res,aes(x =mean_est.wt,y=mean_est.daf2,label=label_to_use,color=label_short)) +  
+  #geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+  #geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + 
+  geom_hline(yintercept=0,lty=1,col="dark gray")+ 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+ 
+  theme(axis.text.x = element_text(angle = 90)) + 
+  geom_abline(intercept=0,slope=1,col="gray",lty=2) +
+  geom_text_repel()+theme(legend.position="none") + xlab("20 C")+ylab("25 c") + xlim(0,.5) + ylim(0,.5)
+
+ggpubr::ggarrange(plotlist = list(gp_glp1,gp_UV,gp_25C),nrow=1,ncol=3)
+ggsave("../figures/04/S_intervention_scaling_fraction_variance_both_RNAis.pdf",width=9,height=3)
+
+```
+```{r}
+
+if (0){
+models_to_plot = unique(scaling_models$single_worm_model)
+models_to_plot = models_to_plot[models_to_plot!="n2_series_all"]
+
+lapply(models_to_plot,function(cur_model){
+  day = substring(cur_model,2,2)
+  if(day == 3)
+    day = 4;
+  #ref = models[models$Name==cur_model,"ControlGroup1"]
+ # all_submodels = unique(scaling_models[type == "relative_total_IQD90" & single_worm_model==model,single_worm_submodel])
+#compare WT RNAI results on WT to WT RNAI results on daf2
+int_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model==cur_model& !grepl("e1368",da) & grepl("Day8",da) & ! (single_worm_submodel %in% c("QZ0","HT115_EV")),]
+if (length(unique(int_hits$single_worm_submodel))>1) stop(paste("too many groups:",paste(unique(int_hits$single_worm_submodel),collapse=",")))
+
+int_hits$da_sub = str_replace(int_hits$da,"N2_","")
+wt_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="n2_series_all" & single_worm_submodel==day & !grepl("e1368",da) & grepl("Day8",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = merge(int_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,],by="label_short",suffixes=c(".daf2",".wt"  ))
+res = res[`ci.97.5..wt`<.98 | `ci.97.5..daf2`<.98,]
+
+res[,effect:=abs(`ci.97.5..wt`-`ci.97.5..daf2`)>.05]
+res[,label_to_use:=ifelse(effect,label_short,"")]
+#browser()
+gp_wt=ggplot(res,aes(mean_est.wt,mean_est.daf2,label=label_to_use,color=label_to_use) + 
+  geom_errorbar(aes(x = mean_est.wt,ymin=`ci.2.5..daf2`,ymax=`ci.97.5..daf2`,width=0),col="gray") +
+  geom_errorbar(aes(xmin=`ci.2.5..wt`,xmax=`ci.97.5..wt`,y = mean_est.daf2,width=0),col="gray") +
+  geom_point() + geom_hline(yintercept=1)+ geom_vline(xintercept=1)+
+  theme(axis.text.x = element_text(angle = 90)) + geom_abline(intercept=0,slope=1,col="gray",lty=2)+geom_text_repel()+theme(legend.position="none") + xlab("Wild-type")+ylab(cur_model)+annotate("text",x=min(res$ci.2.5..wt)*1.01,y=max(res$ci.97.5..daf2)*.99,label=cur_model)
+gp_wt
+})
+}
+```
+
+```{r,fig.width=20,fig.height=10}
+#compare WT RNAI results on WT to WT RNAI results on glp1, 20vs25,and UV
+daf2_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_glp1" & single_worm_submodel=="CB4037" & !grepl("e1368",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"N2_","")
+wt_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_glp1" & single_worm_submodel=="QZ0" & !grepl("e1368",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = rbind(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,] )
+ggplot(res,aes(x = factor(da_sub),mean_est,color=single_worm_submodel)) + geom_point() + geom_errorbar(aes(x = factor(da_sub),ymin=`ci.2.5.`,ymax=`ci.97.5.`,width=0.2)) + theme(axis.text.x = element_text(angle = 90)) + geom_hline(yintercept=1,col="gray",lty=2) + ggtitle("WT RNAi on WT single worms, WT RNAi on glp1 single worms")
+
+#compare WT RNAI results on WT to WT RNAI results on daf2
+daf2_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("e1368",da),]
+daf2_hits$da_sub = str_replace(daf2_hits$da,"N2_","")
+wt_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_20v25C" & single_worm_submodel=="25" & !grepl("e1368",da),]
+wt_hits$da_sub = str_replace(wt_hits$da,"N2_","")
+shared = intersect(wt_hits$da_sub,daf2_hits$da_sub)
+
+res = rbind(daf2_hits[da_sub %in% shared,],wt_hits[da_sub %in% shared,] )
+ggplot(res,aes(x = factor(da_sub),mean_est,color=single_worm_submodel)) + geom_point() + geom_errorbar(aes(x = factor(da_sub),ymin=`ci.2.5.`,ymax=`ci.97.5.`,width=0.2)) + theme(axis.text.x = element_text(angle = 90)) + geom_hline(yintercept=1,col="gray",lty=2) + ggtitle("WT RNAi on WT single worms, WT RNAi on 25C single worms")
+
+```
+
+#make nice plots showing correlation among scale factors
+```{r}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day3",da)&(! grepl("e1368",da) | grepl("vs",da)),]
+
+to_plot = c("N2_pghm1_Set4_Day8","N2_vha11_Set3_Day8","N2_atp5_Set5_Day8","N2_egl3_Set4_Day8")
+wt_hits = wt_hits[da%in% to_plot]
+nms = unique(wt_hits$current_da)
+nms = substring(nms,1,nchar(nms)-9)
+score_dat = rbindlist(lapply(nms,function(x){
+  print(x)
+  d = qread(paste0(path,x,"=all.qs"))
+  dd = melt(d$dat$coef)
+  dd$id = names(d$dat$coef)
+  dd$da = d$da;
+  dd
+}))
+score_dat_wide= dcast(score_dat,id~da,value.column="value")
+
+```
+```{r}
+cr = cor(score_dat_wide$N2_atp5_Set5_Day8,score_dat_wide$N2_pghm1_Set4_Day8,method='p')
+rng=range(score_dat_wide$N2_atp5_Set5_Day8,score_dat_wide$N2_pghm1_Set4_Day8)
+gp1=ggplot(score_dat_wide,aes(N2_atp5_Set5_Day8,N2_pghm1_Set4_Day8)) + 
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point(alpha=.4,cex=.9)+
+  xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("atp-5(RNAi) Scale Factor")+ylab("pghm-1(RNAi) scale factor")
+
+cr = cor(score_dat_wide$N2_atp5_Set5_Day8,score_dat_wide$N2_vha11_Set3_Day8,method='p')
+rng=range(score_dat_wide$N2_atp5_Set5_Day8,score_dat_wide$N2_vha11_Set3_Day8)
+gp2=ggplot(score_dat_wide,aes(N2_atp5_Set5_Day8,N2_vha11_Set3_Day8)) + 
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=-1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point(alpha=.4,cex=.9)+
+  xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("atp-5(RNAi) Scale Factor")+ylab("vha-11(RNAi) scale factor")
+
+cr = cor(score_dat_wide$N2_atp5_Set5_Day8,score_dat_wide$N2_egl3_Set4_Day8,method='p')
+rng=range(score_dat_wide$N2_atp5_Set5_Day8,score_dat_wide$N2_egl3_Set4_Day8)
+gp3=ggplot(score_dat_wide,aes(N2_atp5_Set5_Day8,N2_egl3_Set4_Day8)) + 
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=-1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point(alpha=.4,cex=.9)+
+  xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("atp-5(RNAi) Scale Factor")+ylab("egl-3(RNAi) scale factor")
+
+ggpubr::ggarrange(plotlist=list(gp1,gp2,gp3),nrow=1,ncol=3)
+ggsave("../figures/03/S_scale_factor_scatter_plot_examples.pdf",width=12,height=4)
+
+```
+
+```{r,fig.width=16,fig.height=5}
+if (0){
+gx = fread("../data/differential_analysis/tables/net_validation/N2_nlp28_Set3_Day8.csv.gz")
+
+g1 = fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_col122.csv.gz")
+g2 = fread("../data/differential_analysis/tables/net_validation/N2_col122_Set5_Day8.csv.gz")
+g3 = fread("../data/differential_analysis/tables/net_validation/N2_col122_Set3_Day8.csv.gz")
+g4 = fread("../data/differential_analysis/tables/net_validation/N2_col122_Set5_Day1.csv.gz")
+names(g1)[3] = "FC"
+names(g2)[3] = "FC"
+names(g3)[3] = "FC"
+names(g4)[3] = "FC"
+names(g1)[6] = "padj"
+names(g2)[6] = "padj"
+names(g3)[6] = "padj"
+names(g4)[6] = "padj"
+g1$source = "single"
+g2$source = "pooled_set5"
+g3$source = "pooled_set3"
+g4$source = "pooled_set3_d1"
+r = merge(g1[,.(GeneName,FC)],g2[,.(GeneName,FC)],by="GeneName",suffixes=c(".single",".pooled_set5"))
+r2 = merge(g3[,.(GeneName,FC)],g4[,.(GeneName,FC)],by="GeneName",suffixes=c(".pooled_set3",".pooled_set5_d1"))
+r = merge(r,r2,by="GeneName")
+setkey(tissues_df,GeneName)
+r$tissue = tissues_df[r$GeneName,Tissue]
+r$tissue[is.na(r$tissue)] = "multi"
+
+
+cor(r$FC.single,r$FC.pooled_set5)
+ggplot(r,aes(FC.single,FC.pooled_set5)) + geom_point(data=r[tissue=="multi",])+
+  geom_point(data=r[tissue!="multi",],aes(color=tissue)) 
+cor(r$FC.pooled_set3,r$FC.pooled_set5)
+ggplot(r,aes(FC.pooled_set5,FC.pooled_set3)) + geom_point(data=r[tissue=="multi",])+
+  geom_point(data=r[tissue!="multi",],aes(color=tissue)) + xlim(-5,5)+ylim(-5,5)
+r[FC.pooled_set5 == min(r$FC.pooled_set5),]
+ggplot(r,aes(FC.pooled_set5,FC.pooled_set5_d1)) + geom_point(data=r[tissue=="multi",])+
+  geom_point(data=r[tissue!="multi",],aes(color=tissue)) + xlim(-5,5)+ylim(-5,5)
+
+ggplot(r,aes(FC.pooled_set3,FC.pooled_set5_d1)) + geom_point(data=r[tissue=="multi",])+
+  geom_point(data=r[tissue!="multi",],aes(color=tissue)) + xlim(-5,5)+ylim(-5,5)
+
+
+ga = rbind(g1[,.(GeneName,FC,padj,source)],g2[,.(GeneName,FC,padj,source)],g3[,.(GeneName,FC,padj,source)])
+
+ga$tissue = tissues_df[ga$GeneName,Tissue]
+ga$tissue[is.na(ga$tissue)] = "multi"
+ggplot(ga,aes(FC,-log10(padj))) + geom_point(data=ga[tissue=="multi",])+
+  geom_point(data=ga[tissue!="multi",],aes(color=tissue)) +facet_wrap(~source) + ylim(0,25)+xlim(-2.5,2.5)
+}
+```
+
+#COMPARE RNAis based on DA REGRESSION SCORES generated from single da models, to see if worms that score high for one DA also score high for others
+#Very clear way of showing which  RNAis are anticorrelated!
+```{r,fig.width=8,fig.height=8}
+
+lifespan_data = fread("../data/lifespan/scaling_hits_survival_summary.csv")
+lifespan_data$FC = exp(lifespan_data$coefficient)
+
+single_worm_model = "d8_sw"
+wt_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+wt_all = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+RNAi_scaling_correlation_group_lookup_tables = list()
+for ( ii in 1:2){
+  if (ii == 1){
+    wt_data = wt_hits;
+  }else
+    wt_data = wt_all;
+  nm_lookup = unique(data.table(da=wt_data$da,label = wt_data$da))
+  setkey(nm_lookup,da)
+  nm_lookup["n2_series_d2", label:="n2_d4_vs_2"]
+  nm_lookup["n2_series_d4", label:="n2_d6_vs_4"]
+  nm_lookup["n2_series_d10", label:="n2_d12_vs_10"]
+  
+  
+  nms = wt_data$current_da
+  if (length(nms) != length(unique(nms)))
+    stop("duplicates found")
+  nms = substring(nms,1,nchar(nms)-9)
+  path = "../data/scaling_models/all_30min/"
+  score_dat = lapply(nms,function(x){
+    print(x)
+    r = qread(paste0(path,x,"=all.qs"))
+    if (r$da %in% names(n2_series_da_aging_direction)){
+      if (n2_series_da_aging_direction[r$da] == "reverse")
+        r$dat$coef = -r$dat$coef
+      print("Reversing")
+    }
+    r
+  })
+  
+  nm_lookup$da_short = nm_lookup$da
+  for (i in c("_Day8","_Set1","_Set2","_Set3","_Set4","_Set5","N2_")){#remove decorations
+    #we have multiple reps of col122
+    nm_lookup$da_short = ifelse(!grepl("col122",nm_lookup$da_short) | !grepl("Set",i) ,
+                                  str_replace(nm_lookup$da_short,i,""),nm_lookup$da_short)
+    nm_lookup$label = ifelse(!grepl("col122",nm_lookup$da_short) | !grepl("Set",i) | ii==1,str_replace(nm_lookup$label,i,""),nm_lookup$label)
+  }
+  
+  
+    geneid$GeneSymbol_mangled = str_replace(geneid$GeneSymbol,"-","")
+    setkey(geneid,GeneSymbol_mangled)
+    nm_lookup$label_ed = geneid[nm_lookup$label,GeneSymbol]
+    nm_lookup$label[!is.na( nm_lookup$label_ed)]  = nm_lookup$label_ed[!is.na( nm_lookup$label_ed)]
+  
+    nms_short = nms = names(score_dat) = nm_lookup[sapply(score_dat,function(x)x$da),da_short]
+  
+    coef_cor = matrix(NA,nrow = length(nms),ncol=length(nms))
+    rownames(coef_cor) = colnames(coef_cor) =nms_short;
+    
+    lm_b = matrix(NA,nrow = length(nms),ncol=length(nms))
+    rownames(lm_b) = colnames(lm_b) =nms_short;
+    
+    for (i in 1:length(nms)){ 
+      m = score_dat[[nms[[i]]]]$dat$coef
+      for (j in i:length(nms)){
+        #print(j)
+        if (i==j) next;
+        m2 = score_dat[[nms[[j]]]]$dat$coef
+        coef_cor[i,j] = coef_cor[j,i] = cor(m,m2,method="p")
+        res = lm(m2~m)
+        lm_b[i,j] = coef(res)[2]
+        lm_b[j,i] = 1/coef(res)[2]
+      }
+    }
+    sf_coef_corr = coef_cor
+    
+    if (0){
+      ref = "n2_d6_vs_8"
+      age_resids = list()
+      for (g in names(score_dat)){
+        m = score_dat[[ref]]$dat$coef
+        m2 = score_dat[[g]]$dat$coef
+        dat = data.frame(a=m,b=m2)
+        #plot(ggplot(dat,aes(a,b))+xlab(ref)+ylab(g) + geom_point())
+        res = lm(m2~m)
+        age_resids[[g]] = residuals(res)
+      } 
+      ref = "d8_glp1"
+      glp1_resids = list()
+      for (g in names(score_dat)){
+        m = score_dat[[ref]]$dat$coef
+        m2 = score_dat[[g]]$dat$coef
+        dat = data.frame(a=m,b=m2)
+        #plot(ggplot(dat,aes(a,b))+xlab(ref)+ylab(g) + geom_point())
+        res = lm(m2~m)
+        glp1_resids[[g]] = residuals(res)
+      }
+    }
+      if (ii==1){
+      ngroups = 2
+      	clustered_dat =hclust(as.dist((1-(coef_cor))), method = "complete")
+      }else{
+        
+        ngroups = 7
+        clustered_dat =hclust(as.dist((1-(coef_cor))), method = "complete")
+      }
+    
+      scaling_group_colors = c("black",brewer.pal(ngroups-1,"Dark2"))
+    	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+    	RNAi_scaling_groups = cutree(clustered_dat,k=ngroups)
+    	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+    	
+    	
+    	RNA_scaling_group_lookup_table = data.frame(GeneSymbol = names(RNAi_scaling_groups),
+  					group= RNAi_scaling_groups,color = scaling_group_colors[RNAi_scaling_groups])
+    	RNA_scaling_group_lookup_table$relative_per_gene_variance = sapply(RNA_scaling_group_lookup_table$GeneSymbol,function(x)score_dat[[x]]$stats["relative_per_gene_variance","mean_est"])
+    	
+    	RNA_scaling_group_lookup_table$relative_per_gene_variance_label =	round((1-RNA_scaling_group_lookup_table$relative_per_gene_variance)*100,0)
+  	RNA_scaling_group_lookup_table$relative_pefr_gene_variance_label = ifelse(RNA_scaling_group_lookup_table$relative_per_gene_variance_label>0,RNA_scaling_group_lookup_table$relative_per_gene_variance_label,0)
+    	
+    
+    	#set up annotation to mark fraction variance explained
+    	pal <- colorRamp(c("orange", "black"))
+    	rng = range(RNA_scaling_group_lookup_table$relative_per_gene_variance)
+    	RNA_scaling_group_lookup_table$relative_per_gene_variance_color = 
+    	  rgb(pal((RNA_scaling_group_lookup_table$relative_per_gene_variance-rng[1])/(rng[2]-rng[1]))/255)
+    	
+    	#set up annotation to mark effect on lifespan
+    	setkey(lifespan_data,RNAi)
+      RNA_scaling_group_lookup_table$lifespan_FC = NA;
+      RNA_scaling_group_lookup_table$lifespan_FC = lifespan_data[transfer_day == 4,][RNA_scaling_group_lookup_table$GeneSymbol,FC]
+      max_fc = max(abs(log(RNA_scaling_group_lookup_table$lifespan_FC)),na.rm=T)
+      col_fun = colorRamp2(c(-max_fc, 0, max_fc), c("red", "white", "blue"))
+      RNA_scaling_group_lookup_table$lifespan_FC_color = "black"
+      RNA_scaling_group_lookup_table$lifespan_FC_color[!is.na(RNA_scaling_group_lookup_table$lifespan_FC)] = col_fun(log(RNA_scaling_group_lookup_table$lifespan_FC[!is.na(RNA_scaling_group_lookup_table$lifespan_FC)]))
+   
+  	RNA_scaling_group_lookup_table$GeneSymbol_mangled = str_replace(RNA_scaling_group_lookup_table$GeneSymbol,"-","")
+     	if (ii == 1){
+    	 RNAi_scaling_correlation_group_lookup_tables[["hits"]] = RNA_scaling_group_lookup_table;
+    	}else RNAi_scaling_correlation_group_lookup_tables[["all"]] = RNA_scaling_group_lookup_table;
+  	
+      
+    	right_annotation = rowAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"group"], 
+  		location = 0.5, just = "center",
+  		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"color"],
+  		 col = "white"),width = max_text_width("1")*2),
+  		
+  		bar = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_label"], 
+  		 location = 0.5, just = "center",
+  		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_color"],
+  		 col = "white"),width = max_text_width("1")*2,)#,
+  		
+  		#	bar2 = anno_text(rep(" ",nrow(coef_cor)), 
+  		# location = 0.5, just = "center",
+  		# gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"lifespan_FC_color"],
+  		# col = "white"),width = max_text_width("1")*2,)
+  		)
+  	
+  		 
+  	bottom_annotation = columnAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"group"], 
+  		location = 0.5, just = "center",
+  		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"color"],
+  		 col = "white"),height = max_text_height("1")*2),
+  		bar = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_label"], 
+  		location = 0.5, just = "center",
+  		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_color"],
+  		 col = "white"),height = max_text_height("1")*2)#,
+  		
+  		#	bar2 = anno_text(rep(" ",nrow(coef_cor)), 
+  		# location = 0.5, just = "center",
+  		# gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"lifespan_FC_color"],
+  		# col = "white"),height = max_text_height("1")*2,)
+  		)
+    		
+    #	plot(RNAi_dendogram)
+    col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+    cm = ColorMapping(col_fun = col_fun)
+    nm_lookup_short = unique(nm_lookup[,.(da_short,label)])
+    setkey(nm_lookup_short,da_short)
+    to_disp = coef_cor;
+    if (ii == 2) to_disp = (coef_cor)
+    	gp = Heatmap(to_disp,row_labels = rownames(to_disp),#nm_lookup_short[rownames(to_disp),label],
+    	             column_labels = nm_lookup_short[colnames(to_disp),label],
+    	             
+    	             cluster_rows=RNAi_scaling_dendogram,cluster_columns=RNAi_scaling_dendogram,col = cm,column_title=single_worm_model,bottom_annotation = bottom_annotation,right_annotation=right_annotation) 
+    	draw(gp)
+    	if (ii == 1){
+      	pdf("../figures/03/hits_sorted_by_scale_factor.pdf",width=8,height=8)
+    	}else{
+      	pdf("../figures/03/SM_all_sorted_by_scale_factor.pdf",width=24,height=24)
+    	}
+    	draw(gp)
+    	dev.off()
+    #	list(RNAis = nms,
+    	#     coef_cor = coef_cor,
+    	#     lm_b = lm_b)
+}
+```
+
+
+#cluster hits based on the FOLD CHANGE IN RELATIVER VARIANCE across all genes
+
+```{r,fig.width=15,fig.height=15}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+wt_all = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+for ( ii in 1:2){
+  if (ii == 1){
+    wt_data = wt_hits;
+  }else
+    wt_data = wt_all;
+  
+nms = unique(wt_data[,.(current_da,da)])
+nms[,current_da:=substring(current_da,1,nchar(current_da)-9)]
+setkey(nms,current_da)
+
+resids = lapply(nms$current_da,function(x){
+  qread(paste0(path,x,"=all.qs"))
+})
+names(resids) = nms$current_da
+resid_dat = rbindlist(lapply(names(resids),function(x){
+  r = data.frame(resids[[x]]$dat$residuals)
+  r$GeneName = rownames(r)
+  r$IQD90_ratio = r$residuals_IQD90/r$orig_IQD90
+  r$IQD90_ratio[is.infinite(r$IQD90_ratio)]= NA;
+  r$Name = x;
+  r$da = nms[x,da]
+  r
+}))
+
+
+
+full_names = unique(resid_dat[,.(Name,da)]);
+
+  setkey(da_model_name_lookup,name)
+  nms_short = nms = full_names$label_short = da_model_name_lookup[full_names$da,label_short]
+  res_var_coef_cor = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(res_var_coef_cor) = colnames(res_var_coef_cor) =nms_short;
+
+
+  lm_b = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(lm_b) = colnames(lm_b) =nms_short;
+  
+  for (i in 1:length(nms)){ 
+    m = resid_dat[Name==full_names$Name[i],]
+    setkey(m,GeneName)
+    for (j in i:length(nms)){
+      #print(j)
+      if (i==j) next;
+      m2 = resid_dat[Name==full_names$Name[j],]
+      setkey(m2,GeneName)
+      genes_in_common = intersect(m$GeneName,m2$GeneName)
+      res_var_coef_cor[i,j] = res_var_coef_cor[j,i] = cor(m[genes_in_common,IQD90_ratio],m2[genes_in_common,IQD90_ratio],method="p",use="complete.obs")
+      res = lm(m2[genes_in_common,IQD90_ratio]~m[genes_in_common,IQD90_ratio],na.action=na.omit)
+      lm_b[i,j] = coef(res)[2]
+      lm_b[j,i] = 1/coef(res)[2]
+    }
+  }
+
+  
+
+score_dat = lapply(full_names$Name,function(x){
+  print(x)
+ # qread(paste0(path,x,"=all.qs"))
+  #path2_tmp = "Z:/nstroustrup/projects/asynch-seq-2022/data/scaling_models/"
+  path2_tmp = "../data/scaling_models/all_30min/"
+  qread(paste0(path2_tmp,x,"=all.qs"))
+})
+names(score_dat) = full_names$Name
+
+if (ii==2){
+  ngroups = 7
+ }else ngroups = 2
+    scaling_group_colors = c("black",brewer.pal(ngroups-1,"Dark2"),"gray","dark gray","pink")
+  	clustered_dat =hclust(as.dist((1-(res_var_coef_cor))), method = "complete")
+  	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+  	RNAi_scaling_groups = cutree(clustered_dat,k=ngroups)
+  	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+  	
+  	setkey(full_names,label_short)
+  	RNA_scaling_group_lookup_table = data.frame(GeneSymbol = names(RNAi_scaling_groups),
+					group= RNAi_scaling_groups,
+					color = scaling_group_colors[RNAi_scaling_groups],
+					Name = full_names[ names(RNAi_scaling_groups),Name])
+  	
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance = sapply(RNA_scaling_group_lookup_table$Name,function(x)score_dat[[x]]$stats["relative_per_gene_variance","mean_est"])  	
+    RNA_scaling_group_lookup_table$relative_per_gene_variance_label =	round((1-RNA_scaling_group_lookup_table$relative_per_gene_variance)*100,0)
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance_label = ifelse(RNA_scaling_group_lookup_table$relative_per_gene_variance_label>0,RNA_scaling_group_lookup_table$relative_per_gene_variance_label,0)
+  	
+  	#set up annotation to mark fraction variance explained
+  	pal <- colorRamp(c("orange", "black"))
+  	rng = range(RNA_scaling_group_lookup_table$relative_per_gene_variance)
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance_color = 
+  	  rgb(pal((RNA_scaling_group_lookup_table$relative_per_gene_variance-rng[1])/(rng[2]-rng[1]))/255)
+  	
+  	#set up annotation to mark effect on lifespan
+  	RNA_scaling_group_lookup_table$GeneSymbol_mangled = str_replace(RNA_scaling_group_lookup_table$GeneSymbol,"-","")
+    RNA_scaling_group_lookup_table$lifespan_FC = NA;
+  	setkey(lifespan_data,RNAi)
+      RNA_scaling_group_lookup_table$lifespan_FC = lifespan_data[transfer_day == 4,][RNA_scaling_group_lookup_table$GeneSymbol_mangled,FC]
+      max_fc = max(abs(log(RNA_scaling_group_lookup_table$lifespan_FC)),na.rm=T)
+      col_fun = colorRamp2(c(-max_fc, 0, max_fc), c("red", "white", "blue"))
+      RNA_scaling_group_lookup_table$lifespan_FC_color = "black"
+      RNA_scaling_group_lookup_table$lifespan_FC_color[!is.na(RNA_scaling_group_lookup_table$lifespan_FC)] = col_fun(log(RNA_scaling_group_lookup_table$lifespan_FC[!is.na(RNA_scaling_group_lookup_table$lifespan_FC)]))
+ 
+  	
+  	right_annotation = rowAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"group"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"color"],
+		 col = "white"),width = max_text_width("1")*2),
+		
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"relative_per_gene_variance_label"], 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"relative_per_gene_variance_color"],
+		 col = "white"),width = max_text_width("1")*2,),
+		
+			bar2 = anno_text(rep(" ",nrow(res_var_coef_cor)), 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"lifespan_FC_color"],
+		 col = "white"),width = max_text_width("1")*2,)
+		)
+	
+		 
+	bottom_annotation = columnAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"group"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"color"],
+		 col = "white"),height = max_text_height("1")*2),
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"relative_per_gene_variance_label"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"relative_per_gene_variance_color"],
+		 col = "white"),height = max_text_height("1")*2),
+		
+			bar2 = anno_text(rep(" ",nrow(res_var_coef_cor)), 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(res_var_coef_cor),"lifespan_FC_color"],
+		 col = "white"),height = max_text_height("1")*2,)
+		)
+  		
+  #	plot(RNAi_dendogram)
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  setkey(nm_lookup,da_short)
+  	gp = Heatmap(res_var_coef_cor,row_labels = rownames(res_var_coef_cor),
+  	             column_labels = colnames(res_var_coef_cor),
+  	             
+  	             cluster_rows=RNAi_scaling_dendogram,cluster_columns=RNAi_scaling_dendogram,col = cm,bottom_annotation = bottom_annotation,right_annotation=right_annotation) 
+  	draw(gp)
+  	#pdf("../figures/03/hits_sorted_by_effect_on_residual_variance.pdf",width=8,height=8)
+  	if (ii == 1){
+  	  pdf("Z:/nstroustrup/projects/asynch-seq-2022/figures/03/S_hits_sorted_by_effect_on_residual_variance.pdf",width=8,height=8)
+  	}else
+  	  pdf("Z:/nstroustrup/projects/asynch-seq-2022/figures/03/SM_all_sorted_by_effect_on_residual_variance.pdf",width=16,height=16)
+  	draw(gp)
+  	dev.off()
+  #	list(RNAis = nms,
+  	#     coef_cor = coef_cor,
+  	#     lm_b = lm_b)
+}
+```
+
+```{r,fig.height=8,fig.width=8}
+rel_var = rbindlist(lapply(names(score_dat),function(x){
+  m = score_dat[[x]] 
+  m2 = m$stats["relative_per_gene_variance",];
+  m2$Name = x
+  m2
+}))
+setkey(full_names,Name)
+rel_var$label = full_names[rel_var$Name,label_short]
+rel_var = rel_var[rev(order(mean_est)),]
+rel_var$label_frac = factor(rel_var$label,levels=rel_var$label)
+rel_var$column = ifelse(1:nrow(rel_var)>nrow(rel_var)/2,2,1)
+cc <- scales::seq_gradient_pal("black", "red", "Lab")(seq(0,1,length.out=nrow(rel_var)))
+
+
+ggplot(rel_var,aes(1-mean_est,label_frac,color=label_frac)) + 
+  geom_vline(xintercept=0,lty=1,col="dark gray")+
+  geom_vline(xintercept=.1,lty=2,col="dark gray")+
+  geom_hline(yintercept=rel_var[(1-mean_est) == min(rel_var[1-mean_est>.1,1-mean_est]),label_frac],lty=2,col="dark gray")+
+  geom_errorbar(aes(xmax= 1-`ci.2.5.`, xmin= 1-`ci.97.5.`),width=.5,size=1)+
+  geom_point(size=2) + 
+  xlab("Fraction of Cohort Variance Explained")+
+  ylab("")+
+  theme(legend.position="none", axis.text.y = element_text(size=8), strip.background = element_blank(),
+  strip.text.x = element_blank()) + 
+  scale_colour_manual(values=cc) + ggforce::facet_row(vars(column),scales="free",space="free")
+  ggsave("../figures/03/fraction_variance_explained.pdf",width=7,height=8)
+
+```
+
+
+#Load in differential analysis for all the RNAi constructs, so we can construct a heatmap based on the FC similarities of each of the hits
+```{r}
+ADD_INTERVENTIONS = T
+
+#wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & `ci.97.5.`<.98 & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+wt_all = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+da_int_models_to_load = c("d1_sw","d8_sw","n2_sw","d1_glp1","d8_glp1","d1_UV","d8_UV","d8_20v25C","d1_20v25C","d8_col122",
+"n2_series_d2","n2_series_d4","n2_series_d10","n2_series_d2_d6","n2_series_d6_d10")
+
+da_models_df <- fread("../data/differential_analysis/models/net_validation.csv")
+da_models_df = da_models_df[!grepl("uls60",Name)&!grepl("ts_",Name),]
+
+
+
+da_model_names = data.table(full_name = str_replace(wt_all$current_da,"_d8_sw_QZ0=stats.qs",""),
+                            name = wt_all$current_da,
+                            da = wt_all$da)
+da_model_names$is_RNAi = da_model_names$da%in%da_models_df$Name
+da_model_names$is_interv = da_model_names$da%in%da_int_models_to_load
+
+rnai_models_to_run = da_model_names[is_RNAi==T,full_name]
+int_models_to_run = da_model_names[is_interv==T,full_name]
+n2_series_da_models_to_run = da_model_names[is_RNAi==F & is_interv == F,full_name]
+
+
+
+
+n2_series_model_to_load = data.table(
+	  Name = c("n2_d1_vs_8","n2_d2_vs_8","n2_d4_vs_8","n2_d6_vs_8","n2_d10_vs_8","n2_d12_vs_8",
+		     "n2_d8_vs_1","n2_d2_vs_1","n2_d4_vs_1","n2_d6_vs_1",'n2_d10_vs_1','n2_d12_vs_1'),
+          Source = c(rep("n2_series_d8_ref",6),rep("n2_series",6)),
+	  Day = c(1,2,4,6,10,12,8,2,4,6,10,12),
+	  Genotype = rep("QZ0",12),	
+	  Set = rep(100,12)
+	  )
+
+#Load in differential analysis data
+
+cat("Loading DA data...\n")
+if (length(rnai_models_to_run) == 0){
+	da_df = data.frame();
+}else{	
+	
+	da_df <- rbindlist(lapply(rnai_models_to_run, function(model) {
+	  out <- fread(paste0("../data/differential_analysis/tables/net_validation/", model,".csv.gz"))
+	  colnames(out)[3:ncol(out)] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+	  out[, Name := model]
+	  out
+	}))
+	da_df <- merge(da_models_df[, .(Name, RNAi, Genotype,Set,Day)], da_df, by = "Name")
+
+
+	 RNAi_name_fix = matrix(c("C15C74", "C15C7.4"   ,
+	  "K02F25",   "K02F2.5" ,
+	  "R1022",   "R102.2" ,
+	  "Y44A6D2",  "Y44A6D.2", 
+	  "Y9C2VA1", "Y9C2UA.1" ,
+	  "casy1", "casy-1"   ,
+	  "egl21","egl-21"    ,
+	  "flp12",   "flp-12" ,
+	  "flp14",    "flp-14" , 
+	  "flp1","flp-1",
+	  "flp5","flp-5",
+	  "flp9","flp-9",
+	  "ida1","ida-1",
+	  "ins24","ins-24",
+	  "ins26","ins-26",
+	  "ins30","ins-30",
+	  "ins6","ins-6",
+	  "mec12","mec-12",
+	  "nlp15","nlp-15",
+	  "nlp21","nlp-21",
+	  "nlp50","nlp-50",
+	  "pdf1","pdf-1",
+	  "pgal1","pgal-1",
+	  "pghm1","pghm-1",
+	  "sbt1","sbt-1",
+	  "snet1","snet-1",
+	  "snt4","snt-4",
+	  "ttr29","ttr-29",
+	  "zig2","zig-2"),ncol=2,byrow=T)
+
+	  for ( i in 1:nrow(RNAi_name_fix)){da_df[RNAi==RNAi_name_fix[i],]$RNAi = RNAi_name_fix[i,2]}
+}
+
+if (ADD_INTERVENTIONS){
+#browser()
+da_annots = fread("../data/annotations/sample_annotations_single_and_pooled_worms.csv")
+
+#Load in differential analysis for all other interventiosn (glp-1, aging, etc)
+if (length(int_models_to_run) == 0){
+	da_int_df = data.frame();
+}
+tmp = list()
+if (length(n2_series_da_models_to_run)>0){
+	setkey(n2_series_model_to_load,Name)
+	#series_model_to_load$RNAi = series_model_to_load$model
+	
+	if ("n2_series_d8_ref" %in% n2_series_model_to_load[n2_series_da_models_to_run,Source]){
+		#load timseries data
+		 out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d8_ref.csv.gz"))
+		 tmp[["n2_d1_vs_8"]] = out[,1:6] # 1 vs 8
+		 tmp[["n2_d2_vs_8"]] = out[,c(1:2,7:10)] # 2 vs 8
+		 tmp[["n2_d4_vs_8"]] = out[,c(1:2,11:14)] # 4 vs 8
+		 tmp[["n2_d6_vs_8"]] = out[,c(1:2,15:18)] # 6 vs 8
+		 tmp[['n2_d10_vs_8']] = out[,c(1:2,19:22)] # 10 vs 8
+		 tmp[['n2_d12_vs_8']] = out[,c(1:2,23:26)] # 12 vs 8
+
+		for (n in names(tmp)){
+		  colnames(tmp[[n]])[3:6] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+		  tmp[[n]][,Name:=n]
+		}
+	}
+	if ("n2_series" %in% n2_series_model_to_load[n2_series_da_models_to_run,Source]){
+		 out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/n2_series.csv.gz"))
+		 tmp[["n2_d8_vs_1"]] = out[,1:6] # 1 vs 8
+		 tmp[["n2_d2_vs_1"]] = out[,c(1:2,7:10)] # 2 vs 8
+		 tmp[["n2_d4_vs_1"]] = out[,c(1:2,11:14)] # 2 vs 8
+		 tmp[["n2_d6_vs_1"]] = out[,c(1:2,15:18)] # 2 vs 8
+		 tmp[['n2_d10_vs_1']] = out[,c(1:2,19:22)] # 2 vs 8
+		 tmp[['n2_d12_vs_1']] = out[,c(1:2,23:26)] # 2 vs 8
+		for (n in names(tmp)){
+		  colnames(tmp[[n]])[3:6] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+		  tmp[[n]][,Name:=n]
+		}
+	}
+	tmp = tmp[n2_series_da_models_to_run];
+}
+
+if (length(int_models_to_run) > 0){
+	tmp2 = lapply(int_models_to_run, function(model) {
+	  out <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/", model, ".csv.gz"))
+	  colnames(out)[3:6] <- c("log2FoldChange", "lfcSE", "pvalue", "padj")
+	  out = out[,1:6]
+	  out[, Name := model]
+	  out;
+	})
+	names(tmp2) = int_models_to_run
+	tmp = c(tmp,tmp2)
+	rm(tmp2)
+	
+}
+if (length(tmp) > 0){
+	da_int_df <- rbindlist(tmp,fill=T)
+
+ 
+da_int_models_metadata = data.frame(model = da_int_models_to_load,
+		  RNAi = c("daf-2_vs_N2","daf-2_vs_N2","N2 d8_vs_d1","glp-1_vs_N2","glp-1_vs_N2","Live_vs_UV","Live_vs_UV","25_vs_20C","25_vs_20C","col122 RNAi vs WT",
+		  "n2_series day 2 vs 4","n2_series day 4 vs 6","n2_series day 10 vs 12","n2_series day 2 vs 6","n2_series day 6 vs 10"),
+		  Day = c(1,8,8,1,8,1,8,3,8,8,1,8,2,4,10,2,6),
+		  Genotype = rep("QZ0",length(da_int_models_to_load)), #everything is relative to wildtype (like each RNAi is relative to the EV)
+		  Set = rep(100,length(da_int_models_to_load)))
+rownames(da_int_models_metadata) = da_int_models_metadata$model;
+
+#da_int_models_metadata = da_int_models_metadata[grepl("series",da_int_models_metadata$model),]
+
+
+	#add in metadata
+	series_data = grepl("n2_d",da_int_df$Name)
+	if (any(!series_data)){
+		da_int_df$RNAi = da_int_models_metadata[da_int_df$Name,"RNAi"]
+		da_int_df$Day = da_int_models_metadata[da_int_df$Name,"Day"]
+		da_int_df$Genotype = da_int_models_metadata[da_int_df$Name,"Genotype"]
+		da_int_df$Set = da_int_models_metadata[da_int_df$Name,"Set"]
+	}
+
+	if (any(series_data)){
+		setkey(n2_series_model_to_load,Name)
+		da_int_df$RNAi[series_data] = n2_series_model_to_load[da_int_df$Name[series_data],]$Name
+		da_int_df$Day[series_data] = n2_series_model_to_load[da_int_df$Name[series_data],]$Day
+		da_int_df$Genotype[series_data] = n2_series_model_to_load[da_int_df$Name[series_data],]$Genotype
+		da_int_df$Set[series_data] = n2_series_model_to_load[da_int_df$Name[series_data],]$Set
+	}
+
+}
+
+if (nrow(da_int_df) > 0 && nrow(da_df) > 0 ){
+	da_df = rbind(da_int_df,da_df)
+}else if (nrow(da_int_df) > 0){
+	da_df = da_int_df;
+}else if (nrow(da_df) > 0){
+	da_df = da_df
+}else stop("No DA data!")
+#da_df[,Name:=str_replace(Name,"n2_d","d")]
+#da_df[,Name:=str_replace(Name,"d6_vs","n2_d6_vs")]
+}
+
+```
+
+#function to get covariance data from differential analysis (LOGFOLDCHANGE)
+```{r}
+get_covariance_data_for_interventions = function(intervention_names,intervention_labels,remove_self_references=T,GeneNames = NULL){
+  
+  all_cols = c("Name","GeneSymbol","GeneName","log2FoldChange","padj")
+	differential_expression = da_df[Name %in% intervention_names,all_cols,with=F];
+
+	cols = c("Name","GeneSymbol","GeneName","log2FoldChange")
+	if (is.null(GeneNames)){tmp = differential_expression[,cols,with=F]}else{
+    tmp = differential_expression[differential_expression$GeneName%in%GeneNames,cols,with=F]}
+ # browser()
+  fc = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="log2FoldChange"))
+  
+  cols = c("Name","GeneSymbol","GeneName","padj")
+  if (is.null(GeneNames)){tmp = differential_expression[,cols,with=F]}else{
+    tmp = differential_expression[differential_expression$GeneName%in%GeneNames,cols,with=F]}
+  pv = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="padj"))
+  
+	RNAi_GeneNames = geneid$GeneName[geneid$GeneSymbol %in% unique(da_df$RNAi)]
+	
+  rownames(fc) = fc$GeneName
+  rownames(pv) = pv$GeneName
+  #get rid of name columns, since we have the info in the rownames now
+  pv = pv[,!(colnames(pv) %in% c("GeneName","GeneSymbol"))]
+  fc = fc[,!(colnames(fc) %in% c("GeneName","GeneSymbol"))]
+  
+  #get rid of NAs
+	pv_ts = apply(pv,2,FUN = function(x){x[is.na(x)] = 1; return(x)})
+	fc_ts = apply(fc,2,FUN = function(x){x[is.na(x)] = 0; return(x)})
+	
+	#get rid of NAs
+	pv_ts = apply(pv_ts,2,FUN = function(x){x[is.na(x)] = 1; return(x)})
+	fc_ts = apply(fc_ts,2,FUN = function(x){x[is.na(x)] = 0; return(x)})
+	
+	sig_in_any_sample = apply(pv_ts,1,FUN=function(x)return( any(x<.001) ) );
+	fc_sig_ts = fc_ts[sig_in_any_sample,]
+	pv_sig_ts = pv_ts[sig_in_any_sample,]
+	
+	if (remove_self_references){
+	  to_keep = which(!(rownames(pv_sig_ts) %in% RNAi_GeneNames))
+  	fc_sig_ts = fc_sig_ts[to_keep,]
+  	pv_sig_ts = pv_sig_ts[to_keep,]
+	}
+	recalc_corr=T
+	name_lookup = data.table(a=intervention_names,b=intervention_labels)
+	setkey(name_lookup,a)
+	if (recalc_corr){
+		corr_m = matrix(NA,nrow=ncol(fc_sig_ts),ncol=ncol(fc_sig_ts))
+		rownames(corr_m) = colnames(corr_m) = name_lookup[colnames(fc_sig_ts),b]
+		for (i in 1:dim(fc_sig_ts)[2]){
+			for (j in 1:dim(fc_sig_ts)[2]){
+			 # if(colnames(fc_sig_ts)[i] == "d8_glp1" & colnames(fc_sig_ts)[j] == "d1_glp1")
+			 #   browser()
+				corr_m[i,j] = cor(fc_sig_ts[,i],fc_sig_ts[,j], method = "s")
+			}
+		}
+	}
+	
+	
+	list(fc_sig_ts=fc_sig_ts,
+	     pv_sig_ts=pv_sig_ts,
+	     corr_m = corr_m)
+}
+
+crop_fc = function(fc,thresh,cols){
+  for(i in cols){
+   f=abs(fc[,i])
+   fc[!is.na(f) & f>thresh,i] = thresh
+   fc[!is.na(f) & f< -thresh,i] = -thresh
+  }
+    fc
+}
+```
+
+
+```{r}
+
+
+all_cols = c("Name","GeneSymbol","GeneName","log2FoldChange","padj","pvalue")
+differential_expression = da_df[Name =="N2_aexr1_Set3_Day8",all_cols,with=F];
+
+cols = c("Name","GeneSymbol","GeneName","log2FoldChange")
+tmp = differential_expression[,cols,with=F]
+# browser()
+fc = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="log2FoldChange"))
+
+df_o = differential_expression[order(abs(differential_expression$log2FoldChange),decreasing=T),][1:100,]
+
+cols = c("Name","GeneSymbol","GeneName","padj")
+tmp = differential_expression[,cols,with=F]
+padj = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="padj"))
+
+dff = differential_expression[GeneSymbol %in% c("aexr-2","aexr-1","nhr-120")]
+
+```
+
+```{r}
+
+
+all_cols = c("Name","GeneSymbol","GeneName","log2FoldChange","padj","pvalue")
+differential_expression = da_df[Name =="N2_egl3_Set4_Day8",all_cols,with=F];
+
+cols = c("Name","GeneSymbol","GeneName","log2FoldChange")
+tmp = differential_expression[,cols,with=F]
+# browser()
+fc = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="log2FoldChange"))
+
+df_o = differential_expression[order(abs(differential_expression$log2FoldChange),decreasing=T),][1:100,]
+
+cols = c("Name","GeneSymbol","GeneName","padj")
+tmp = differential_expression[,cols,with=F]
+padj = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="padj"))
+
+dff = differential_expression[GeneSymbol %in% c("sbt-1","egl-3","kpc-1")]
+dff$fold_change = 2^dff$log2FoldChange
+
+```
+
+```{r,fig.width=24,fig.height=12}
+da_focus= da_df[ Genotype=="N2" & Day == 8, ];
+
+vits = rbindlist(lapply(unique(da_focus$Name),function(x){
+  all_cols = c("Name","GeneSymbol","GeneName","log2FoldChange","padj","pvalue")
+  #differential_expression = da_df[Name =="N2_aexr1_Set3_Day8",all_cols,with=F];
+  differential_expression = da_focus[Name ==x,all_cols,with=F ];
+  
+  cols = c("Name","GeneSymbol","GeneName","log2FoldChange")
+  tmp = differential_expression[,cols,with=F]
+  # browser()
+  fc = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="log2FoldChange"))
+  
+  df_o = differential_expression[order(abs(differential_expression$log2FoldChange),decreasing=T),][1:100,]
+  
+  cols = c("Name","GeneSymbol","GeneName","padj")
+  tmp = differential_expression[,cols,with=F]
+  padj = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="padj"))
+  
+  dff = differential_expression[grep("vit",GeneSymbol )]
+  dff$fold_change = 2^dff$log2FoldChange
+  dff$Name = x;
+  dff
+}))
+
+
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% c(cohort_scaling_model_hits$da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+vits$hit = F;
+vits$hit[vits$Name %in% wt_hits$da] = T
+
+ggplot(vits[hit==T],aes(x = reorder(Name,log2FoldChange),log2FoldChange)) + geom_point()+facet_wrap(~hit)+geom_hline(yintercept=0,col="gray",lty=2)+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+```{r}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day3",da)&(! grepl("e1368",da) | grepl("vs",da)),]
+
+to_plot = c("N2_pghm1_Set4_Day8","N2_vha11_Set3_Day8","N2_atp5_Set5_Day8","N2_egl3_Set4_Day8","N2_pcn1_Set5_Day8","N2_nlp15_Set3_Day8","N2_pap1_Set5_Day8","N2_nlp15_Set3_Day8")
+wt_hits = wt_hits[da%in% to_plot]
+
+all_cols = c("Name","GeneSymbol","GeneName","log2FoldChange","padj")
+differential_expression = da_df[Name %in% wt_hits$da,all_cols,with=F];
+
+cols = c("Name","GeneSymbol","GeneName","log2FoldChange")
+tmp = differential_expression[,cols,with=F]
+# browser()
+fc = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="log2FoldChange"))
+
+cols = c("Name","GeneSymbol","GeneName","padj")
+tmp = differential_expression[,cols,with=F]
+padj = data.frame(dcast(tmp,GeneName+GeneSymbol~Name,value.var="padj"))
+
+crop_fc = function(fc,thresh,cols){
+  for(i in cols){
+   f=abs(fc[,i])
+   fc[!is.na(f) & f>thresh,i] = thresh
+   fc[!is.na(f) & f< -thresh,i] = -thresh
+  }
+    fc
+}
+```
+
+```{r,fig.height=8,fig.width=4}
+to_plot = c("N2_pghm1_Set4_Day8","N2_vha11_Set3_Day8","N2_atp5_Set5_Day8","N2_egl3_Set4_Day8","N2_pcn1_Set5_Day8","N2_pap1_Set5_Day8","N2_nlp15_Set3_Day8")
+res = rbindlist(lapply(to_plot,function(x){
+  #browser()
+  r = score_dat[[paste0(x,"_d8_sw_QZ0")]]$dat$coef
+  d = data.table(coef=unlist(r),sample=names(r))
+  d$RNAi = x;
+  d
+}))
+
+score_mat = dcast(res,sample~RNAi,value.var="coef")
+r = lm(N2_nlp15_Set3_Day8~N2_pap1_Set5_Day8,score_mat);
+pap1_one=predict(r,newdata=data.table(N2_pap1_Set5_Day8=1))
+r = lm(N2_pap1_Set5_Day8~N2_nlp15_Set3_Day8,score_mat);
+nlp15_one=predict(r,newdata=data.table(N2_nlp15_Set3_Day8=1))
+
+g1=ggplot(score_mat,aes(N2_pap1_Set5_Day8,N2_nlp15_Set3_Day8)) + geom_point() + 
+  annotate("text", x=.3, y=-.3, label= paste("cor = ",round(cor(score_mat$N2_pap1_Set5_Day8,score_mat$N2_nlp15_Set3_Day8),2)))+
+    geom_smooth(method="lm",se=F,color="red")+xlab("Scale factor along pap-1 axis") +ylab("Scale factor along nlp-15 axis")+
+  
+   geom_hline(yintercept=0,color="gray",lty=2)+geom_vline(xintercept=0,color="gray",lty=2)+
+    geom_point(data=data.table(N2_pap1_Set5_Day8=0,N2_nlp15_Set3_Day8=0),size=5,color="blue")
+   # geom_point(data=data.table(N2_pap1_Set5_Day8=1,N2_nlp15_Set3_Day8=pap1_one),size=8,color="green")+
+   # geom_point(data=data.table(N2_pap1_Set5_Day8=nlp15_one,N2_nlp15_Set3_Day8=1),size=8,color="orange")
+
+g2=ggplot(score_mat,aes(N2_vha11_Set3_Day8,N2_pcn1_Set5_Day8)) + geom_point()+
+  annotate("text", x=-1, y=-.3, label= paste("cor = ",round(cor(score_mat$N2_vha11_Set3_Day8,score_mat$N2_pcn1_Set5_Day8),2)))+
+    geom_smooth(method="lm",se=F,color="red")+xlab("Scale factor along vha-11 axis") +ylab("Scale factor along pcn-1 axis")+
+  
+   geom_hline(yintercept=0,color="gray",lty=2)+geom_vline(xintercept=0,color="gray",lty=2)+
+    geom_point(data=data.table(N2_vha11_Set3_Day8=0,N2_pcn1_Set5_Day8=0),size=5,color="blue")
+
+g3 = ggpubr::ggarrange(g1,g2,ncol=2,nrow=1)
+g3
+ggsave("../figures/03/scale_factor_RNAi_comparrison.pdf",width=6,height=4)
+```
+
+
+```{r}
+
+
+
+max_fc = 8
+fc2 = fc[!fc$GeneSymbol %in% c("atp-5","pghm-1"),]
+fc2 = crop_fc(fc2,max_fc,c("N2_atp5_Set5_Day8","N2_pghm1_Set4_Day8"))
+cr = cor(fc2$N2_atp5_Set5_Day8,fc2$N2_pghm1_Set4_Day8,method='p',use="complete.obs")
+rng=range(fc2$N2_atp5_Set5_Day8,fc2$N2_pghm1_Set4_Day8,na.rm=T)
+gp1=ggplot(fc2,aes(N2_atp5_Set5_Day8,N2_pghm1_Set4_Day8)) + 
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(alpha=.4,cex=.9,raster.dpi=600)+
+  xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after atp-5(RNAi)")+ylab("Fold-Change after pghm-1(RNAi)")
+
+fc2 = fc[!fc$GeneSymbol %in% c("atp-5","vha-11"),]
+fc2 = crop_fc(fc2,max_fc,c("N2_atp5_Set5_Day8","N2_vha11_Set3_Day8"))
+cr = cor(fc2$N2_atp5_Set5_Day8,fc2$N2_vha11_Set3_Day8,method='p',use="complete.obs")
+rng=range(fc2$N2_atp5_Set5_Day8,fc2$N2_vha11_Set3_Day8,na.rm=T)
+gp2=ggplot(fc2,aes(N2_atp5_Set5_Day8,N2_vha11_Set3_Day8)) + 
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(alpha=.4,cex=.9,raster.dpi=600)+
+  xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after atp-5(RNAi)")+ylab("Fold-Change after vha-11(RNAi)")
+
+fc2 = fc[!fc$GeneSymbol %in% c("atp-5","egl-3"),]
+fc2 = crop_fc(fc2,max_fc,c("N2_atp5_Set5_Day8","N2_egl3_Set4_Day8"))
+cr = cor(fc2$N2_atp5_Set5_Day8,fc2$N2_egl3_Set4_Day8,method='p',use="complete.obs")
+rng=range(fc2$N2_atp5_Set5_Day8,fc2$N2_egl3_Set4_Day8,na.rm=T)
+gp3=ggplot(fc2,aes(N2_atp5_Set5_Day8,N2_egl3_Set4_Day8)) + 
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(alpha=.4,cex=.9,raster.dpi=600)+
+  xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after atp-5(RNAi)")+ylab("Fold-Change after egl-3(RNAi)")
+
+ggpubr::ggarrange(plotlist=list(gp1,gp2,gp3),nrow=1,ncol=3)
+ggsave("../figures/03/S_fc_scatter_plot_examples.pdf",width=12,height=4)
+```
+#calculage PCA on wt day 8 population
+```{r}
+x = norm[["d8_sw"]][,counts_annots[model=="d8_sw" & Strain == "QZ0",Sample]]
+#x <- x[apply(x,1,function(x)!any(x < 5)), ]
+wt_d8_pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE) 
+wt_d8_pca_weights = data.frame(wt_d8_pca$rotation)
+wt_d8_pca_weights$GeneName = rownames(wt_d8_pca$rotation)
+rownames(wt_d8_pca_weights) = wt_d8_pca_weights$GeneName
+highly_expressed_genes = rownames(x[apply(x,1,function(x)!any(x < 2)), ])
+```
+
+```{r,fig.width=4,fig.height=4}
+
+max_fc = 8
+
+scale_factor_effect = fread("../data/differential_analysis/tables/scale_factor_effect.csv.gz")
+genes_that_change_a_lot_wrt_scale_factor = scale_factor_effect[abs(scale_factor_category_upper_25_vs_lower_25_log2FoldChange) >1 & scale_factor_category_upper_25_vs_lower_25_padj < .00001,GeneName]
+fc2 = crop_fc(fc[!fc$GeneSymbol %in% c("pcn-1","vha-11","vha-3"),],max_fc,c("N2_vha11_Set3_Day8","N2_pcn1_Set5_Day8"))
+fc2 = fc2[fc2$GeneName %in% highly_expressed_genes,]     
+rownames(padj) = padj$GeneName
+padj2 = padj[fc2$GeneName,]
+fc2$sig = apply(padj2,1,function(x)x[["N2_vha11_Set3_Day8"]]<.000001 | x[["N2_pcn1_Set5_Day8"]]<.000001) | fc2$GeneName %in% genes_that_change_a_lot_wrt_scale_factor
+
+             
+cr = cor(fc2$N2_vha11_Set3_Day8,fc2$N2_pcn1_Set5_Day8,method='p',use="complete.obs")
+rng=range(fc2$N2_vha11_Set3_Day8,fc2$N2_pcn1_Set5_Day8,na.rm=T)
+fc2$core_scaling_genes = fc2$GeneName %in% genes_that_change_a_lot_wrt_scale_factor;
+gp3=ggplot(fc2[fc2$sig,],aes(N2_vha11_Set3_Day8,N2_pcn1_Set5_Day8,label=GeneSymbol,color=core_scaling_genes)) + 
+  geom_text_repel(data=fc2[fc2$sig& (abs(fc2$N2_vha11_Set3_Day8)>2 | abs(fc2$N2_pcn1_Set5_Day8)>2),]) +
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(data=fc2[fc2$sig&fc2$core_scaling_genes==F,],color="black",fill="black",alpha=.4,cex=.9,rast.dpi=600)+
+  geom_point_rast(data=fc2[fc2$sig&fc2$core_scaling_genes==T,],color="red",fill="red",alpha=.4,cex=.9,rast.dpi=600)+
+ # xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after vha-11-5(RNAi)")+ylab("Fold-Change after pcn-1(RNAi)")+theme(legend.position="none")
+gp3
+
+fc2$pca_weight = wt_d8_pca_weights[fc2$GeneName,"PC1"]
+fc2$pca_weight_large = abs(fc2$pca_weight)>quantile(abs(fc2$pca_weight),.5,na.rm=T)
+fc2$sig2 = apply(padj2,1,function(x)x[["N2_vha11_Set3_Day8"]]<.000001 | x[["N2_pcn1_Set5_Day8"]]<.000001) 
+fc2$sig2=T
+gp4=ggplot(fc2[fc2$sig2,],aes(N2_vha11_Set3_Day8,N2_pcn1_Set5_Day8,label=GeneSymbol,color=pca_weight)) + 
+  geom_text_repel(data=fc2[fc2$sig2& (abs(fc2$N2_vha11_Set3_Day8)>2 | abs(fc2$N2_pcn1_Set5_Day8)>2),],        color="black",alpha=1,size=3) +
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(data=fc2[fc2$sig2&fc2$pca_weight_large==F,],alpha=.4,cex=.9,raster.dpi=600)+
+  geom_point_rast(data=fc2[fc2$sig2&fc2$pca_weight_large==T,],alpha=.4,cex=.9,raster.dpi=600)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after vha-11(RNAi)")+ylab("Fold-Change after pcn-1(RNAi)")+  
+  scale_color_gradient2(
+  low = ("dark blue"),
+  mid = "dark gray",
+  high = ("dark red"),
+  midpoint = 0
+)
+gp4
+ggsave("../figures/03/gene_expression_vs_scale_factor_correlations_pcn1_vha11_with_legend.pdf",width=4,height=4)
+gp4+theme(legend.position="none")
+
+ggsave("../figures/03/gene_expression_vs_scale_factor_correlations_pcn1_vha11.pdf",width=4,height=4)
+```
+
+```{r,fig.width=4,fig.height=4}
+
+max_fc = 8
+
+fc2 = crop_fc(fc[!fc$GeneSymbol %in% c("pap-1","nlp-15","nlp-30"),],max_fc,c("N2_pap1_Set5_Day8","N2_nlp15_Set3_Day8"))
+fc2 = fc2[fc2$GeneName %in% highly_expressed_genes,]     
+rownames(padj) = padj$GeneName
+padj2 = padj[fc2$GeneName,]
+fc2$sig = apply(padj2,1,function(x)x[["N2_pap1_Set5_Day8"]]<.000001 | x[["N2_nlp15_Set3_Day8"]]<.000001) | fc2$GeneName %in% genes_that_change_a_lot_wrt_scale_factor
+
+             
+cr = cor(fc2$N2_pap1_Set5_Day8,fc2$N2_nlp15_Set3_Day8,method='p',use="complete.obs")
+rng=range(fc2$N2_pap1_Set5_Day8,fc2$N2_nlp15_Set3_Day8,na.rm=T)
+fc2$core_scaling_genes = fc2$GeneName %in% genes_that_change_a_lot_wrt_scale_factor;
+gp3=ggplot(fc2[fc2$sig,],aes(N2_pap1_Set5_Day8,N2_nlp15_Set3_Day8,label=GeneSymbol,color=core_scaling_genes)) + 
+  geom_text_repel(data=fc2[fc2$sig& (abs(fc2$N2_pap1_Set5_Day8)>2 | abs(fc2$N2_nlp15_Set3_Day8)>2),]) +
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(data=fc2[fc2$sig&fc2$core_scaling_genes==F,],color="black",fill="black",alpha=.4,cex=.9,rast.dpi=600)+
+  geom_point_rast(data=fc2[fc2$sig&fc2$core_scaling_genes==T,],color="red",fill="red",alpha=.4,cex=.9,rast.dpi=600)+
+ # xlim(rng)+ylim(rng)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after vha-11-5(RNAi)")+ylab("Fold-Change after pcn-1(RNAi)")+theme(legend.position="none")
+gp3
+
+
+fc2$pca_weight = wt_d8_pca_weights[fc2$GeneName,"PC1"]
+fc2$pca_weight_large = abs(fc2$pca_weight)>quantile(abs(fc2$pca_weight),.5,na.rm=T)
+fc2$sig2 = apply(padj2,1,function(x)x[["N2_pap1_Set5_Day8"]]<.000001 | x[["N2_nlp15_Set3_Day8"]]<.000001) 
+fc2$sig2=T
+gp4=ggplot(fc2[fc2$sig2,],aes(N2_pap1_Set5_Day8,N2_nlp15_Set3_Day8,label=GeneSymbol,color=pca_weight)) + 
+  geom_text_repel(data=fc2[fc2$sig2& (abs(fc2$N2_pap1_Set5_Day8)>2 | abs(fc2$N2_nlp15_Set3_Day8)>2),],color="black",alpha=1,size=3) +
+  geom_hline(yintercept=0,col="dark gray",lty=2)+
+  geom_vline(xintercept=0,col="dark gray",lty=2)+
+  geom_abline(intercept=0,slope=1,col="dark gray",lty=2)+
+  geom_smooth(data=fc2[fc2$sig2,],method="lm",se=F,col="red",lwd=1)+
+  geom_point_rast(data=fc2[fc2$sig2&fc2$pca_weight_large==F,],alpha=.6,cex=.9,raster.dpi=600)+
+  geom_point_rast(data=fc2[fc2$sig2&fc2$pca_weight_large==T,],alpha=.6,cex=.9,raster.dpi=600)+
+  annotate("text", x = -Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = -.1)+
+  xlab("Fold-Change after pap-1(RNAi)")+ylab("Fold-Change after nlp-15(RNAi)")+theme(legend.position="none")+
+  scale_color_gradient2(
+  low = ("dark blue"),
+  mid = "dark gray",
+  high = ("dark red"),
+  midpoint = 0
+)
+gp4
+ggsave("../figures/03/gene_expression_vs_scale_factor_correlations_pap1_nlp-15.pdf",width=4,height=4)
+```
+
+#cluster genes relative to FC in effect of RNAi
+```{r}
+
+x = norm[["d8_sw"]][,counts_annots[model=="d8_sw" & Strain == "QZ0",Sample]]
+highly_expressed_genes = rownames(x[apply(x,1,function(x)!any(x < 2)), ])
+
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" &  da %in% cohort_scaling_model_hits$da & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+wt_all = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+da_name_lookup_tables = list()
+for ( ii in 2){
+  if (ii == 1){
+    wt_data = wt_hits;
+  }else
+    wt_data = wt_all;
+
+  da_corr_data = get_covariance_data_for_interventions(wt_data$da,wt_data$da,GeneNames=highly_expressed_genes)
+  
+  da_corr_data_backup = da_corr_data
+  
+  #extravagant way to lookup DA name information
+nms = unique(wt_data[,.(current_da,da)])
+nms[,current_da:=substring(current_da,1,nchar(current_da)-9)]
+setkey(nms,current_da)
+resids = lapply(nms$current_da,function(x){
+  path = "../data/scaling_models/all_30min/"
+  qread(paste0(path,x,"=all.qs"))
+})
+names(resids) = nms$current_da
+resid_dat = rbindlist(lapply(names(resids),function(x){
+  r = data.frame(resids[[x]]$dat$residuals)
+  r$GeneName = rownames(r)
+  r$IQD90_ratio = r$residuals_IQD90/r$orig_IQD90
+  r$Name = x;
+  r$da = nms[x,da]
+  r
+}))
+full_names = unique(resid_dat[,.(Name,da)]);
+
+score_dat = lapply(full_names$Name,function(x){
+  print(x)
+ # qread(paste0(path,x,"=all.qs"))
+  #path2_tmp = "Z:/nstroustrup/projects/asynch-seq-2022/data/scaling_models/all/"
+  path = "../data/scaling_models/all_30min/"
+  qread(paste0(path,x,"=all.qs"))
+})
+names(score_dat) = full_names$Name
+
+
+full_names = unique(resid_dat[,.(Name,da)]);
+  setkey(da_model_name_lookup,name)
+full_names$label_short = da_model_name_lookup[full_names$da,label_short]
+ if (ii==2){
+  ngroups = 12
+ }else ngroups = 3
+    scaling_group_colors = c("black",brewer.pal(ngroups-1,"Dark2"),"gray","dark gray","pink")
+  	clustered_dat =hclust(as.dist((1-(da_corr_data$corr_m))), method = "complete")
+  	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+  	RNAi_scaling_groups = cutree(clustered_dat,k=ngroups)
+  	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+  	
+  	setkey(full_names,da)
+  	RNA_scaling_group_lookup_table = data.table(long_name = names(RNAi_scaling_groups),
+					group= RNAi_scaling_groups,
+					color = scaling_group_colors[RNAi_scaling_groups],
+					GeneSymbol = full_names[ names(RNAi_scaling_groups),label_short],
+				  full_name = full_names[ names(RNAi_scaling_groups),Name])
+  	
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance = sapply(RNA_scaling_group_lookup_table$full_name,function(x)score_dat[[x]]$stats["relative_per_gene_variance","mean_est"])  	
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance_label =	round((1-RNA_scaling_group_lookup_table$relative_per_gene_variance)*100,0)
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance_label = ifelse(RNA_scaling_group_lookup_table$relative_per_gene_variance_label>0,RNA_scaling_group_lookup_table$relative_per_gene_variance_label,0)
+  	
+  	#set up annotation to mark fraction variance explained  
+  	pal <- colorRamp(c("orange", "black"))
+  	rng = range(RNA_scaling_group_lookup_table$relative_per_gene_variance)
+  	RNA_scaling_group_lookup_table$relative_per_gene_variance_color = 
+  	  rgb(pal((RNA_scaling_group_lookup_table$relative_per_gene_variance-rng[1])/(rng[2]-rng[1]))/255)
+  	
+  	#set up annotation to mark effect on lifespan
+  	RNA_scaling_group_lookup_table$GeneSymbol_mangled = str_replace(RNA_scaling_group_lookup_table$GeneSymbol,"-","")	
+  	setkey(lifespan_data,RNAi)
+      RNA_scaling_group_lookup_table$lifespan_FC = NA;
+      RNA_scaling_group_lookup_table$lifespan_FC = lifespan_data[transfer_day == 4,][RNA_scaling_group_lookup_table$GeneSymbol_mangled,FC]
+      max_fc = max(abs(log(RNA_scaling_group_lookup_table$lifespan_FC)),na.rm=T)
+      col_fun = colorRamp2(c(-max_fc, 0, max_fc), c("red", "white", "blue"))
+      RNA_scaling_group_lookup_table$lifespan_FC_color = "black"
+      RNA_scaling_group_lookup_table$lifespan_FC_color[!is.na(RNA_scaling_group_lookup_table$lifespan_FC)] = col_fun(log(RNA_scaling_group_lookup_table$lifespan_FC[!is.na(RNA_scaling_group_lookup_table$lifespan_FC)]))
+ 
+
+      if (ii==1){
+        da_name_lookup_tables[["hits"]] = RNA_scaling_group_lookup_table
+      }else{
+        
+        da_name_lookup_tables[["all"]] = RNA_scaling_group_lookup_table
+      }
+		setkey(RNA_scaling_group_lookup_table,long_name )
+  	right_annotation = rowAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),group], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),color],
+		 col = "white"),width = max_text_width("1")*2),
+		
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),relative_per_gene_variance_label], 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),relative_per_gene_variance_color],
+		 col = "white"),width = max_text_width("1")*2,)#,
+		
+		#	bar2 = anno_text(rep(" ",nrow(da_corr_data$corr_m)), 
+		# location = 0.5, just = "center",
+		# gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),lifespan_FC_color],
+		# col = "white"),width = max_text_width("1")*2,)
+		)
+	
+	bottom_annotation = columnAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),group], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),color],
+		 col = "white"),height = max_text_height("1")*2),
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),relative_per_gene_variance_label], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),relative_per_gene_variance_color],
+		 col = "white"),height = max_text_height("1")*2)#,
+		
+			#bar2 = anno_text(rep(" ",nrow(da_corr_data$corr_m)), 
+		 #location = 0.5, just = "center",
+		# gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),lifespan_FC_color],
+		# col = "white"),height = max_text_height("1")*2,)
+		)
+  		
+  #	plot(RNAi_dendogram)
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  setkey(RNA_scaling_group_lookup_table,long_name)
+  	gp = Heatmap(da_corr_data$corr_m,row_labels = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),GeneSymbol],
+  	             column_labels = RNA_scaling_group_lookup_table[colnames(da_corr_data$corr_m),GeneSymbol],
+  	             
+  	             cluster_rows=RNAi_scaling_dendogram,cluster_columns=RNAi_scaling_dendogram,col = cm,bottom_annotation = bottom_annotation,right_annotation=right_annotation) 
+  	draw(gp)
+  	if (ii==1){
+    #	pdf("../figures/03/hits_sorted_by_effect_on_fold_change_gene_expression.pdf",width=8,height=8)
+    	pdf("Z:/nstroustrup/projects/asynch-seq-2022/figures/03/S_hits_sorted_by_effect_on_fold_change_gene_expression.pdf",width=8,height=8)
+  	}else{
+    	pdf("Z:/nstroustrup/projects/asynch-seq-2022/figures/03/SM_all_sorted_by_effect_on_fold_change_gene_expression.pdf",width=16,height=16)
+  	}
+    	
+  	draw(gp)
+  	dev.off()
+}
+```
+#plot dendograms clustering RNAi knockdowns
+
+```{r,fig.height=8,fig.width=8}
+library(ape)
+library(phytools)
+
+RNA_scaling_group_lookup_table = data.table(RNA_scaling_group_lookup_table)
+setkey(RNA_scaling_group_lookup_table,long_name)
+
+#don't plot all the pseudotimes
+to_plot = !grepl("vs",RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),GeneSymbol])
+  
+  
+clustered_dat =hclust(as.dist((1-(da_corr_data$corr_m[to_plot,to_plot]))), method = "complete")
+tmp = as.dendrogram(clustered_dat)
+#RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+#tmp = RNAi_scaling_dendogram
+labels(tmp)= RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m[to_plot,to_plot])[order.dendrogram(tmp)],paste0(GeneSymbol," (",relative_per_gene_variance_label,")")]
+             
+pal2 <- colorRamp(c("orange", "black"))
+RNA_scaling_group_lookup_table$relative_per_gene_variance_color_2 = 
+  rgb(pal2((RNA_scaling_group_lookup_table$relative_per_gene_variance-rng[1])/(rng[2]-rng[1]))/255)  
+
+clr = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m)[to_plot][order.dendrogram(tmp)],relative_per_gene_variance]
+names(clr) =labels(tmp)
+plotBranchbyTrait(as.phylo(tmp),clr,"tips", type = "fan",cex=1, edge.width=2,tip.color = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m)]$relative_per_gene_variance_color_2[to_plot],palette=colorRampPalette(c("red","black")))
+
+#plot(tmp,horiz=T)
+#plot(as.phylo(tmp), type = "fan",cex=.7, tip.color = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m),]$relative_per_gene_variance_color_2)
+pdf("../figures/03/RNAi_FC_dendogram_fan.pdf",width=8,height=8)
+#plot(as.phylo(tmp), type = "fan",cex=.7, tip.color = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m)]$relative_per_gene_variance_color_2)
+plotBranchbyTrait(as.phylo(tmp),clr,"tips", type = "fan",cex=1, edge.width=2,tip.color = RNA_scaling_group_lookup_table[rownames(da_corr_data$corr_m)]$relative_per_gene_variance_color_2[to_plot],palette=colorRampPalette(c("red","black")))
+dev.off()
+```
+```{r}
+cor(da_corr_data[["fc_sig_ts"]][,c("d1_glp1","d8_glp1")],method="s")
+ggplot(as.data.frame(da_corr_data[["fc_sig_ts"]]),aes(d1_glp1,d8_glp1))+geom_point()
+da_corr_data$corr_m["d8_glp1","d1_glp1"]
+cor(da_corr_data[["fc_sig_ts"]][,c("d1_glp1","N2_eef1A.2_Set5_Day8")],method="s")
+ggplot(as.data.frame(da_corr_data[["fc_sig_ts"]]),aes(d1_glp1,N2_eef1A.2_Set5_Day8))+geom_point()
+
+d = da_corr_data[["fc_sig_ts"]][,"N2_eef1A.2_Set5_Day8"]
+```
+
+#Compare correlation of genes across different mappings
+```{r,fig.width=4,fig.height=8}
+lk = as.data.table(RNAi_scaling_correlation_group_lookup_tables[["all"]])
+lk2 = da_name_lookup_tables[["all"]]
+setkey(lk2,GeneSymbol_mangled)
+lk$GeneSymbol = lk2[lk$GeneSymbol,GeneSymbol]
+lk$GeneSymbol[is.na(lk$GeneSymbol)] = lk$GeneSymbol_mangled[is.na(lk$GeneSymbol)]
+
+
+lk_hits = as.data.table(RNAi_scaling_correlation_group_lookup_tables[["hits"]])
+lk_hits$GeneSymbol = lk2[lk_hits$GeneSymbol,GeneSymbol]
+lk_hits$GeneSymbol[is.na(lk_hits$GeneSymbol)] = lk_hits$GeneSymbol_mangled[is.na(lk_hits$GeneSymbol)]
+
+
+lk$da = substring(lk$Name,0,nchar(lk$Name)-10)
+
+#sf_coef_corr
+sf_flat = melt(sf_coef_corr)
+setkey(lk,GeneSymbol_mangled)
+sf_flat$Var1 = lk[as.character(sf_flat$Var1),GeneSymbol]
+sf_flat$Var2 = lk[as.character(sf_flat$Var2),GeneSymbol]
+
+setkey(lk_hits,GeneSymbol)
+sf_flat$scaling_group_1=lk_hits[as.character(sf_flat$Var1),group]
+sf_flat$scaling_group_2=lk_hits[as.character(sf_flat$Var2),group]
+
+resvar_flat = melt(res_var_coef_cor)
+da_flat = melt(da_corr_data$corr_m)
+da_flat$da1 = da_flat$Var1
+da_flat$da2 = da_flat$Var2
+lk2 = da_name_lookup_tables[["all"]]
+setkey(lk2,long_name)
+da_flat$Var1 = lk2[as.character(da_flat$da1),GeneSymbol]
+da_flat$Var2 = lk2[as.character(da_flat$da2),GeneSymbol]
+
+comb = merge(sf_flat,da_flat,by=c("Var1","Var2"),suffixes=c(".sf",".da"))
+comb = merge(comb,resvar_flat,by=c("Var1","Var2"))
+names(comb)[names(comb) == "value"] = "value.resvar"
+comb = comb[!is.na(comb$value.sf),]
+comb$pair = apply(comb,1,function(x)paste(x[["Var1"]],x[["Var2"]]))
+
+wt_hits = scaling_models[type == "relative_per_gene_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" &  da %in% cohort_scaling_model_hits$da & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+comb$is_hit = ifelse(comb$da1 %in% wt_hits$da & comb$da2 %in% wt_hits$da,"hit","")
+comb_hits = comb[comb$da1 %in% wt_hits$da & comb$da2 %in% wt_hits$da,]
+
+for (ii in 1:2){
+  if (ii==1){
+    to_plot = comb;
+    colors = c("black","green")
+    names(colors) = c("","hit")
+  }else{
+    to_plot = comb_hits
+    colors = c("black")
+    names(colors) = c("hit")
+  }
+  to_plot = to_plot[is.na(to_plot$scaling_group_1) &
+                      is.na(to_plot$scaling_group_2) |
+                      to_plot$scaling_group_1 == to_plot$scaling_group_2,]
+gp1 = ggplot(to_plot,aes(value.da,value.resvar,color=is_hit))+
+  geom_point(size=.75,alpha=.5)+
+  geom_vline(xintercept=.5,col="dark gray",lty=2) +
+  geom_hline(yintercept=.5,col="dark gray",lty=2) +
+  xlab("Gene-regulatory effect") + 
+  ylab("Fraction of wild-type\nvariance explained")+
+  theme(legend.position="none")+ 
+  geom_smooth(se=F,color="red",size=.75)+
+  xlim(0,1)+ylim(0,1)+
+  scale_color_manual(values=colors)
+
+gp2 = ggplot(to_plot,aes(value.da,value.sf,color=is_hit))+
+  geom_point(size=.75,alpha=.5)+
+  geom_vline(xintercept=.5,col="dark gray",lty=2) +
+  geom_hline(yintercept=.5,col="dark gray",lty=2) +
+  xlab("Gene-regulatory effect") + 
+  ylab("Scale factor")+
+  theme(legend.position="none")+ 
+  geom_smooth(se=F,color="red",size=.75)+
+  xlim(0,1)+ylim(0,1)+
+  scale_color_manual(values=colors)
+if (0)
+gp3 = ggplot(to_plot,aes(value.resvar,value.sf,color=is_hit))+
+  geom_point(size=.75,alpha=.5)+
+  geom_vline(xintercept=.5,col="dark gray",lty=2) +
+  geom_hline(yintercept=.5,col="dark gray",lty=2) +
+  xlab("Fraction of wild-type\nvariance explained") + 
+  ylab("Scale Factor")+
+  theme(legend.position=c(5,-.5))+ 
+  geom_smooth(se=F,color="red")+
+  xlim(0,1)+ylim(0,1)+
+  scale_color_manual(values=colors)
+
+  plot(ggpubr::ggarrange(gp1,gp2,nrow=2))
+}
+ggsave("Z:/nstroustrup/projects/asynch-seq-2022/figures/03/relationship_between_gene_expression_and_scaling_effects.pdf",width=4,height=8)
+
+comb_hits[comb_hits$value.da==min(comb_hits$value.da[comb_hits$value.sf>.75]),]
+```
+
+```{r,fig.width=10,fig.height=10}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" &  da %in% cohort_scaling_model_hits$da & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+
+#wt_all = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+  da_corr_data = get_covariance_data_for_interventions(wt_hits$da,wt_hits$da,remove_self_references=F)
+  genes_to_consider = intersect(wt_hits$GeneName,rownames(da_corr_data$fc_sig_ts))
+  RNAi_to_consider = c(intersect(wt_hits$da,colnames(da_corr_data$fc_sig_ts)))
+  fc = da_corr_data$fc_sig_ts[genes_to_consider,RNAi_to_consider]
+  pv = da_corr_data$pv_sig_ts[genes_to_consider,RNAi_to_consider]
+  
+  RNAi_lookup_to_use = rbind(RNAi_lookup,data.frame(Name=c("d1_glp1","d8_glp1","n2_d6_vs_8"),RNAi=c("glp-1(e2141) day 1","glp-1(e2141) day 8","Aging Day 6 vs 8"),GeneName=c("","","")))
+  recalc_corr=T
+	if (recalc_corr){
+		corr_m = matrix(NA,nrow=ncol(fc),ncol=ncol(fc))
+		setkey(RNAi_lookup_to_use,Name)
+		colnames(corr_m) = rownames(corr_m) = RNAi_lookup_to_use[colnames(fc),RNAi]
+		for (i in 1:ncol(fc)){
+		  g1_ex = RNAi_lookup[colnames(fc)[i],GeneName]
+		  if (is.na(g1_ex)) g1_ex = NULL;
+			for (j in i:ncol(fc)){
+  		  g2_ex = RNAi_lookup[colnames(fc)[j],GeneName]
+  		  if (is.na(g2_ex)) g2_ex = NULL;
+  		  rows_to_use = !rownames(fc) %in% c(g1_ex,g2_ex)
+				corr_m[j,i] = corr_m[i,j] = cor(fc[rows_to_use,i],fc[rows_to_use,j], method = "p")
+			#	if (i == 1 && j == 6)
+			#	   stop()
+			}
+		}
+	}
+   recalc_corr=T
+	if (recalc_corr){
+		corr_r = matrix(NA,nrow=nrow(fc),ncol=nrow(fc))
+		setkey(RNAi_lookup,GeneName)
+		colnames(corr_r) = rownames(corr_r) = RNAi_lookup[Name %in% colnames(fc),][rownames(fc),RNAi]
+		for (i in 1:nrow(fc)){ 
+		  g1_ex = RNAi_lookup[Name %in% colnames(fc),][rownames(fc)[i],Name]
+		  if (is.na(g1_ex)) g1_ex = NULL;
+			for (j in i:nrow(fc)){ 
+			  g2_ex = RNAi_lookup[Name %in% colnames(fc),][rownames(fc)[j],Name]
+  		  if (is.na(g2_ex)) g2_ex = NULL;
+  		  cols_to_use = !colnames(fc) %in% c(g1_ex,g2_ex)
+				corr_r[j,i] = corr_r[i,j] = cor(fc[i,cols_to_use],fc[j,cols_to_use], method = "p")
+			}
+		}
+	}
+ 
+  
+  n_RNAi_groups = 5
+    scaling_group_colors = c("black",brewer.pal(n_RNAi_groups-1,"Dark2"),"gray","dark gray","pink")
+  	clustered_dat =hclust(as.dist((1-corr_m)), method = "complete")
+  	RNAi_scaling_dendogram = as.dendrogram(clustered_dat)
+  	RNAi_scaling_groups = cutree(clustered_dat,k=n_RNAi_groups)
+  	RNAi_scaling_dendogram = color_branches(RNAi_scaling_dendogram, clusters=RNAi_scaling_groups[order.dendrogram(RNAi_scaling_dendogram)],col=scaling_group_colors[1:n_RNAi_groups],groupLabels=T)
+  
+	ngroups = 4
+  scaling_group_colors = c("black",brewer.pal(ngroups-1,"Dark2"),"gray","dark gray","pink")
+	gene_clustered_dat =hclust(as.dist((1-(corr_r))), method = "complete")
+	gene_scaling_dendogram = as.dendrogram(gene_clustered_dat)
+	gene_scaling_groups = cutree(gene_clustered_dat,k=ngroups)
+	gene_scaling_dendogram = color_branches(gene_scaling_dendogram, clusters=gene_scaling_groups[order.dendrogram(gene_scaling_dendogram)],col=scaling_group_colors[1:ngroups],groupLabels=T)
+  	
+  		  
+ setkey(tissues_df,GeneName)
+ row_tissue_loc = tissues_df[rownames(fc),Tissue]
+ setkey(RNAi_lookup,Name)
+ column_tissue_loc = tissues_df[RNAi_lookup[colnames(fc),GeneName],Tissue]
+ column_tissue_loc[grepl("glp1",colnames(fc))] = "germ_line"
+ row_tissue_loc[is.na(row_tissue_loc)] = "multiple"
+ column_tissue_loc[is.na(column_tissue_loc)] = "multiple"
+ tissue_colors_to_use = c(tissue_colors,`multiple`="dark gray")
+ 
+  	right_annotation = rowAnnotation(foo = anno_text(column_tissue_loc, 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = tissue_colors_to_use[column_tissue_loc],
+		 col = "white"),width = max_text_width("hypodermis"))
+		)
+	
+		 
+	bottom_annotation = columnAnnotation(foo = anno_text(substr(row_tissue_loc,1,1),
+		location = 0.5, just = "center",
+        rot =0,
+		 gp = gpar(fontsize = 10, fill =  tissue_colors_to_use[row_tissue_loc],
+		 col = "white"),height = max_text_height("hypodermis")*1.2)
+		)
+  		
+  	
+  fc_to_plot = fc
+  pv_to_plot = pv
+  setkey(RNAi_lookup,Name)
+	for (i in 1:nrow(fc)){ 
+	  	for (j in 1:ncol(fc)){
+	  	   g1_ex = RNAi_lookup[colnames(fc)[j],GeneName]
+	  	   if (!is.na(g1_ex) & rownames(fc)[i] == g1_ex){#print(c(i,j));
+	  	     fc_to_plot[i,j]=NA;
+	  	     pv_to_plot[i,j]=1;}
+	  	}
+	}
+#  fc_to_plot[which(pv>=.01,arr.ind=T)] = NA;
+  
+  max_fc = 2
+ 
+  col_fun = colorRamp2(c(-max_fc,0, max_fc), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+	setkey(RNAi_lookup_to_use,GeneName)
+  rownames(fc_to_plot) = RNAi_lookup_to_use[Name %in% colnames(fc),][rownames(fc),RNAi]
+	setkey(RNAi_lookup_to_use,Name)
+	colnames(fc_to_plot) =RNAi_lookup_to_use[colnames(fc),RNAi]
+	gp = Heatmap(t(fc_to_plot),
+	             #cluster_columns=gene_scaling_dendogram,
+	           # cluster_columns=F,
+	             cluster_rows=T,#RNAi_scaling_dendogram,
+	             col = cm,
+	             na_col = "dark gray",
+	             row_labels=gt_render(paste0("*",colnames(fc_to_plot),"*")),
+	             column_labels=gt_render(paste0("*",rownames(fc_to_plot),"*")),
+	             top_annotation = bottom_annotation,
+	             left_annotation=right_annotation,
+	             row_names_side = "left", row_dend_side = "right", 
+    column_names_side = "top", column_dend_side = "bottom",
+	              cell_fun = function(j, i, x, y, w, h, col) { # add text to each grid
+               # grid.text(ifelse(pv_to_plot[i, j]<.01,"*",""), x, y)
+	                if (is.na(fc_to_plot[j, i]))  grid.rect(x = x, y = y, width = w, height = h,  gp = gpar(col = "grey", fill = "grey"))
+	                else if (pv_to_plot[j, i]<.01)grid.circle(x = x, y = y, unit.c(w, h)/10,gp = gpar(col=NA,fill="black"))
+            })
+	draw(gp)
+	pdf("../figures/03/network_effects_hits.pdf",width=8,height=7)
+	draw(gp)
+	dev.off()
+
+```
+
+```{r,fig.width=10,fig.height=10}
+library(igraph)
+fc_to_graph = fc_to_plot;
+fc_to_graph[which(pv_to_plot>=.01,arr.ind=T)] = 0;
+fc_to_graph = fc_to_graph[rownames(fc_to_graph),rownames(fc_to_graph)]
+g = graph_from_adjacency_matrix(t(fc_to_graph),mode="directed",weighted=T,diag=F)
+g = delete.edges(g, which(abs(E(g)$weight)<log2(.5)))
+saveRDS(g,"graph_tmp.Rds")
+```
+
+
+```{r,fig.width=22,fig.height=10}
+
+setkey(tissues_df,GeneName);
+setkey(geneid,GeneSymbol)
+tiss = tissues_df[geneid[names(V(g)),GeneName],Tissue]
+tiss[is.na(tiss)] = "multiple"
+
+tissue_colors_to_use = c(tissue_colors,`multiple`="dark gray")
+node_colors = tissue_colors_to_use[tiss]
+V(g)$color = node_colors
+V(g)[node_colors == "black"]$label.color="white"
+V(g)[node_colors != "black"]$label.color="black"
+
+
+rg= range(abs(E(g)$weight))
+E(g)$width <- 16*(abs(E(g)$weight)-rg[1])/(rg[2]-rg[1])
+E(g)$arrow.size <- E(g)$width /2
+for (i in 1:length(V(g))){
+  if(length( E(g)[to(names(V(g))[i])]) > 0)
+    E(g)[to(names(V(g))[i])]$color <- adjustcolor(V(g)[i]$color,.5)
+}
+
+
+
+
+l <-  layout_as_tree(g,mode="all",circular=F,root=1)
+r_x = range(l[,1])
+r_y = range(l[,2])
+l[,1] = (l[,1]-r_x[1])/(r_x[2]-r_x[1])*8-4
+l[,2] = (l[,2]-r_y[1])/(r_y[2]-r_y[1])*1.9-.95
+p = which(names(V(g))=="eef-1A.2")
+l[p,1] = l[p,1]-1
+p = which(names(V(g))=="mig-6")
+l[p,1] = l[p,1]-.5
+
+p = which(names(V(g))=="ugt-36")
+l[p,1] = l[p,1]+.5
+
+p = which(names(V(g))%in%c("sbt-1","unc-15","tyr-4"))
+l[p,1] = l[p,1]-4
+l2 = l
+
+vstep = .6333333
+to_move = l2[,2]<0 & l2[,1]<.4
+
+to_move2  = l2[,2]<0
+
+to_move3  = l2[,2]>0 & l2[,2]<.6
+
+to_move4 = l2[,2]< -.5
+
+l2[to_move ,2] = l2[to_move ,2] - vstep/2
+l2[to_move ,1] = l2[to_move ,1] +2
+l2[to_move2 ,2] = l2[to_move2 ,2] +vstep
+l2[to_move3 ,2] = l2[to_move3 ,2] +vstep/2
+l2[to_move4 ,2] = l2[to_move4 ,2] +vstep/2
+l2[,1] = l2[,1]-mean(l2[,1])
+plot(g,layout=l2, vertex.size=22,vertex.label.cex=1.2, edge.curved=0,rescale=F,asp=1.3)
+pdf("../figures/03/S_RNAi_hits_graph.pdf",width=22,height=10)
+plot(g,layout=l2, vertex.size=22,vertex.label.cex=1.2, edge.curved=0,rescale=F,asp=1.3)
+dev.off()
+
+```
+
+
+
+
+#draw staring point for nice scaling figure diagram using actual FC data; everything superimposed
+```{r,fig.height=8,fig.width=8}
+d = da_corr_data$fc_sig_ts[,"N2_nlp28_Set3_Day8"]
+res = data.table(fc=d[order(d)],gene_id = 1:length(d))
+res = res[abs(fc)<4,]
+low_lambda = -.5
+lambdas = c(low_lambda,seq(2,4,by=1));
+res2 = rbindlist(lapply(lambdas,function(lambda){
+  r = res;
+  r$fc = r$fc*lambda
+  r$lambda = lambda;
+  r
+}))
+
+arrow_color = "#222222"#"black"#"#F28522"
+av_color= "#009ADE"#"black"
+da_color="#FF1F5B"
+dat_color = "black"#"#009ADE"
+arrow_length = unit(0.01, "npc")
+axis_label_range = c(-5,5)
+ axis_labels = c(paste0("1/",2^(abs(axis_label_range[1]):1)),as.character(2^c(0:axis_label_range[2])))
+  axis_labels[seq(2,length(axis_labels)-1,by=2)] = ""
+  axis_breaks = 2^(axis_label_range[1]:axis_label_range[2])
+  
+gp = ggplot(res,aes(x=gene_id,y=2^fc))+
+  geom_ribbon(data=res[fc<0,],aes(ymin=2^fc,ymax=1),fill=da_color,alpha=.2)+ geom_ribbon(data=res[fc>0,],aes(ymin=1,ymax=2^fc),fill=da_color,alpha=.2)+
+geom_hline(yintercept=1,col=av_color,size=1.5)  +geom_line(col=da_color,size=1.5) + 
+  geom_line(data=res2[lambda>0],aes(group=lambda),color=dat_color)+
+  geom_line(data=res2[lambda<0],aes(group=lambda),color=dat_color)+
+  scale_y_continuous(trans="log2",lim=c(1/64,64),breaks=axis_breaks,labels=axis_labels) + 
+  xlab("Gene ID")+ylab("Relative Expression")+
+  annotate("segment", x = 14000, y = 2^(res2[which(lambda== low_lambda & gene_id==15000),fc]-1), xend = 15000, yend = 2^res2[lambda== low_lambda & gene_id==15000,fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 14000, y = 2^(res2[which(lambda== low_lambda & gene_id==15000),fc]-1.5),label=paste("\u03BB =",low_lambda))+ 
+  
+  annotate("segment", x = 2500, y = 2^(res[which(gene_id==1500),fc]+4), xend = 1500, yend = 2^res[which(gene_id==1500),fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 3500, y = 2^(res[which(gene_id==1500),fc]+5),label="Intervention of interest")+ 
+  
+  annotate("segment", x = 4000, y = 4, xend = 3000, yend = 1,  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 6000, y = 5,label="Reference / Population Average")
+
+  
+for (i in unique(res2$lambda[res2$lambda!=low_lambda])){
+  gp = gp +  annotate("segment", x = 14000, y = 6+2^(res2[which(lambda== i & gene_id==15000),fc]+1), xend = 15000, yend = 2^res2[lambda== i & gene_id==15000,fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 12500, y = 8+2^(res2[which(lambda== i & gene_id==15000),fc]+1),label=paste("\u03BB =",i),hjust = 0)
+}
+  
+gp
+  
+```
+
+#draw staring point for nice scaling figure diagram using actual FC data; separate axes
+```{r,fig.height=8,fig.width=4}
+d = da_corr_data$fc_sig_ts[,"N2_nlp28_Set3_Day8"]
+res = data.table(fc=d[order(d)],gene_id = 1:length(d))
+#res = data.table(fc=d,gene_id = 1:length(d))
+
+#fe
+res = res[abs(fc)<4,]
+low_lambda = -1
+lambdas = c(low_lambda,0,seq(1,4,by=1));
+res2 = rbindlist(lapply(lambdas,function(lambda){
+  r = res;
+  r$fc = r$fc*lambda
+  r$lambda = lambda;
+  r
+}))
+
+arrow_color = "#222222"#"black"#"#F28522"
+av_color= "#009ADE"#"black"
+da_color="#FF1F5B"
+dat_color = "black"#"#009ADE"
+arrow_length = unit(0.01, "npc")
+axis_label_range = c(-5,5)
+ axis_labels = c(paste0("1/",2^(abs(axis_label_range[1]):1)),as.character(2^c(0:axis_label_range[2])))
+  axis_labels[seq(2,length(axis_labels)-1,by=2)] = ""
+  axis_breaks = 2^(axis_label_range[1]:axis_label_range[2])
+  
+gp = ggplot(res,aes(x=gene_id,y=2^fc))+
+  geom_ribbon(data=res[fc<0,],aes(ymin=2^fc,ymax=1),fill=da_color,alpha=.2)+ geom_ribbon(data=res[fc>0,],aes(ymin=1,ymax=2^fc),fill=da_color,alpha=.2)+
+geom_hline(yintercept=1,col=av_color,size=1.5)  +geom_line(col=da_color,size=1.5)+
+  scale_x_continuous(breaks=c())+
+  scale_y_continuous(trans="log2",lim=c(1/64,64),breaks=axis_breaks,labels=axis_labels) + 
+  xlab("Gene ID")+ylab("Relative Expression")+  annotate("text",x=0,y=49,hjust=0,label="Intervention of Interest")+
+  
+  
+  annotate("segment", x = 12000, y = 2^(res[which(gene_id==15000),fc]+3), xend = 15000, yend = 2^res[which(gene_id==15000),fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 12000, y = 2^(res[which(gene_id==15000),fc]+3.5),label="Differential Expression after intervention")+ 
+  
+  annotate("segment", x = 11000, y = 4, xend = 13000, yend = 1,  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 9000, y = 5.25,label="Reference / Population Average")
+
+    
+gp2 = ggplot(res2,aes(x=gene_id,y=2^fc))+
+  geom_hline(yintercept=1,col=av_color,size=1.5) +
+  geom_line(data=res2[lambda>0],aes(group=lambda),color=dat_color)+
+  geom_line(data=res2[lambda<=0],aes(group=lambda),color=dat_color,lty=2)+
+  geom_line(data=res2[lambda==1],aes(group=lambda),color=da_color)+
+  scale_x_continuous(breaks=c())+
+  scale_y_continuous(trans="log2",lim=c(1/64,64),breaks=axis_breaks,labels=axis_labels) + 
+  xlab("Gene ID")+ylab("Relative Expression")+     annotate("text",x=0,y=49,hjust=0,label="Scaling in Gene regulation across cohort")+  
+  annotate("segment", x = 14000, y = 2^(res2[which(lambda== low_lambda & gene_id==15000),fc]-1), xend = 15000, yend = 2^res2[lambda== low_lambda & gene_id==15000,fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 14000, y = 2^(res2[which(lambda== low_lambda & gene_id==15000),fc]-1.5),label=paste("\u03BB =",low_lambda))
+
+  
+for (i in unique(res2$lambda[res2$lambda!=low_lambda])){
+  gp2 = gp2 +  annotate("segment", x = 13000, y = 7+2^(res2[which(lambda== i & gene_id==15000),fc]+3), xend = 15000, yend = 2^res2[lambda== i & gene_id==15000,fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 12000, y = 7+2^(res2[which(lambda== i & gene_id==15000),fc]+3),label=paste("\u03BB =",i),hjust = 0)
+}
+  
+ggpubr::ggarrange(gp,gp2,nrow=2)
+  
+```
+#draw staring point for nice scaling figure diagram using simulated data
+```{r,fig.height=8,fig.width=4}
+d = da_corr_data$fc_sig_ts[,"N2_nlp28_Set3_Day8"]
+res = data.table(fc=d[order(d)],gene_id = 1:length(d))
+#res = data.table(fc=d,gene_id = 1:length(d))
+
+res = data.table(gene_id = 1:100)
+set.seed(0)
+x=seq(0,1,.1)
+y =sin(pi*x-pi/2) +runif(length(x),min=-.5,max=.5)
+v = smooth.spline(x,y,nknots=length(x),spar=.1)
+res$fc=1.5*predict(v,seq(0,1,length.out=length(res$gene_id)))$y
+  
+res = res[abs(fc)<4,]
+low_lambda = -1
+lambdas = c(low_lambda,0,seq(1,2,by=.5));
+res2 = rbindlist(lapply(lambdas,function(lambda){
+  r = res;
+  r$fc = r$fc*lambda
+  r$lambda = lambda;
+  r
+}))
+
+arrow_color = "#222222"#"black"#"#F28522"
+av_color= "#009ADE"#"black"
+da_color="#FF1F5B"
+dat_color = "black"#"#009ADE"
+arrow_length = unit(0.01, "npc")
+axis_label_range = c(-5,4)
+ axis_labels = c(paste0("1/",2^(abs(axis_label_range[1]):1)),as.character(2^c(0:axis_label_range[2])))
+  axis_labels[seq(2,length(axis_labels)-1,by=2)] = ""
+  axis_breaks = 2^(axis_label_range[1]:axis_label_range[2])
+  
+gp = ggplot(res,aes(x=gene_id,y=2^fc))+
+  geom_ribbon(data=res[fc<0,],aes(ymin=2^fc,ymax=1),fill=da_color,alpha=.2)+ geom_ribbon(data=res[fc>0,],aes(ymin=1,ymax=2^fc),fill=da_color,alpha=.2)+
+geom_hline(yintercept=1,col=av_color,size=1.5)  +geom_line(col=da_color,size=1.5)+
+  scale_x_continuous(breaks=c())+
+  scale_y_continuous(trans="log2",lim=c(1/16,64),breaks=axis_breaks,labels=axis_labels) + 
+  xlab("Gene ID")+ylab("Relative Expression")+  annotate("text",x=0,y=49,hjust=0,label="Intervention of Interest")+
+  
+  
+  annotate("segment", x = 80, y = 3+2^(res[which(gene_id==90),fc]+1), xend = 90, yend = 2^res[which(gene_id==90),fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 55, y = 3+2^(res[which(gene_id==90),fc]+1),label="Effect of intervention")+ 
+  
+  annotate("segment", x = 50, y = 4, xend = 70, yend = 1,  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 35, y = 4,label="Reference")
+
+    
+gp2 = ggplot(res2,aes(x=gene_id,y=2^fc))+
+  geom_hline(yintercept=1,col=av_color,size=1.5) +
+  geom_line(data=res2[lambda>=0],aes(group=lambda),color=dat_color)+
+  geom_line(data=res2[lambda<0],aes(group=lambda),color=dat_color,lty=2)+
+  geom_line(data=res2[lambda==1],aes(group=lambda),color=da_color)+
+  scale_x_continuous(breaks=c())+
+  scale_y_continuous(trans="log2",lim=c(1/16,64),breaks=axis_breaks,labels=axis_labels) + 
+  xlab("Gene ID")+ylab("Relative Expression")+     annotate("text",x=0,y=49,hjust=0,label="Scaling across cohort")+
+  
+  annotate("segment", x = 80, y = 2^(res2[which(lambda== low_lambda & gene_id==70),fc]-1), xend = 70, yend = 2^res2[lambda== low_lambda & gene_id==70,fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 90, y = 2^(res2[which(lambda== low_lambda & gene_id==70),fc]-1),label=bquote(lambda[1]==.(low_lambda)))+
+    
+  annotate("segment", x = 80, y = 1.5, xend = 70, yend = 1,  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 90, y = 1.5,label=bquote(lambda[2]==0))
+
+
+  j=2
+for (i in unique(res2$lambda[res2$lambda>0])){
+  gp2 = gp2 +  annotate("segment", x = 57, y = 2^(res2[which(lambda== i & gene_id==68),fc]+1), xend = 68, yend = 2^res2[lambda== i & gene_id==68,fc],  arrow = arrow(type = "closed", length = arrow_length),color=arrow_color)+
+  annotate("text", x = 38, y = 2^(res2[which(lambda== i & gene_id==68),fc]+1),label=bquote(lambda[.(j)]==.(i)),hjust = 0)
+  j=j-1
+}
+  
+ggpubr::ggarrange(gp,gp2,nrow=2)
+pdf("../figures/03/scaling_diagram_dat.pdf",width=4,height=9)
+ggpubr::ggarrange(gp,gp2,nrow=2)
+dev.off()
+  
+```
+
+#plot wt "aging" residuals
+```{r}
+nms = names(score_dat);
+N = length(nms)
+for (i in 1:N){
+  g1 = nms[i]
+  for (j in j:N){
+    if (i==j) next
+     g2 = nms[j]
+     m = age_resids[[g1]]
+     m2 = age_resids[[g2]]
+     dat = data.frame(a=m,b=m2) 
+     plot(ggplot(dat,aes(a,b))+xlab(g1)+ylab(g2) + geom_point())
+  }
+}
+
+
+```
+
+
+#cluster based on age residuals
+```{r,fig.width=19,fig.height=19}
+ nms_short = nms = names(age_resids)
+  coef_cor = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(coef_cor) = colnames(coef_cor) =nms_short;
+  
+  lm_b = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(lm_b) = colnames(lm_b) =nms_short;
+  
+  for (i in 1:length(nms)){ 
+    m = age_resids[[nms[[i]]]]
+    for (j in i:length(nms)){
+      #print(j)
+      if (i==j) next;
+      m2 = age_resids[[nms[[j]]]]
+      coef_cor[i,j] = coef_cor[j,i] = cor(m,m2,method="p")
+      res = lm(m2~m)
+      lm_b[i,j] = coef(res)[2]
+      lm_b[j,i] = 1/coef(res)[2]
+    }
+  }
+ 
+  	clustered_dat =hclust(as.dist(1-(coef_cor)), method = "complete")
+  	RNAi_dendogram = as.dendrogram(clustered_dat)
+  	
+ 	
+  	#set up annotation to mark effect on lifespan
+  	setkey(lifespan_data,Group)
+    RNA_scaling_group_lookup_table$lifespan_FC = NA;
+    RNA_scaling_group_lookup_table$lifespan_FC = lifespan_data[RNA_scaling_group_lookup_table$GeneSymbol,FC]
+    RNA_scaling_group_lookup_table$lifespan_FC_color = "white"
+    RNA_scaling_group_lookup_table$lifespan_FC_color[ RNA_scaling_group_lookup_table$lifespan_FC<1] = "blue"
+    RNA_scaling_group_lookup_table$lifespan_FC_color[ RNA_scaling_group_lookup_table$lifespan_FC>1] = "red"
+ 
+  	
+  	right_annotation = rowAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"group"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"color"],
+		 col = "white"),width = max_text_width("1")*2),
+		
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_label"], 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_color"],
+		 col = "white"),width = max_text_width("1")*2,),
+		
+			bar2 = anno_text(rep(" ",nrow(coef_cor)), 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"lifespan_FC_color"],
+		 col = "white"),width = max_text_width("1")*2,)
+		)
+	
+		 
+	bottom_annotation = columnAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"group"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"color"],
+		 col = "white"),height = max_text_height("1")*2),
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_label"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_color"],
+		 col = "white"),height = max_text_height("1")*2),
+		
+			bar2 = anno_text(rep(" ",nrow(coef_cor)), 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"lifespan_FC_color"],
+		 col = "white"),height = max_text_height("1")*2,)
+		)
+  		
+  #	plot(RNAi_dendogram)
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  	gp = Heatmap(coef_cor,cluster_rows=RNAi_scaling_dendogram,cluster_columns=RNAi_scaling_dendogram,col = cm,column_title=single_worm_model,bottom_annotation = bottom_annotation,right_annotation=right_annotation) 
+  	draw(gp)
+  #	list(RNAis = nms,
+  	#     coef_cor = coef_cor,
+  	#     lm_b = lm_b)
+
+  	
+```
+
+#cluster based on glp1 residuals
+```{r,fig.width=19,fig.height=19}
+ nms_short = nms = names(age_resids)
+  coef_cor = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(coef_cor) = colnames(coef_cor) =nms_short;
+  
+  lm_b = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(lm_b) = colnames(lm_b) =nms_short;
+  
+  for (i in 1:length(nms)){ 
+    m = glp1_resids[[nms[[i]]]]
+    for (j in i:length(nms)){
+      #print(j)
+      if (i==j) next;
+      m2 =glp1_resids[[nms[[j]]]]
+      coef_cor[i,j] = coef_cor[j,i] = cor(m,m2,method="p")
+      res = lm(m2~m)
+      lm_b[i,j] = coef(res)[2]
+      lm_b[j,i] = 1/coef(res)[2]
+    }
+  }
+ 
+  	clustered_dat =hclust(as.dist(1-(coef_cor)), method = "complete")
+  	RNAi_dendogram = as.dendrogram(clustered_dat)
+  	
+ 	
+  	#set up annotation to mark effect on lifespan
+  	setkey(lifespan_data,Group)
+    RNA_scaling_group_lookup_table$lifespan_FC = NA;
+    RNA_scaling_group_lookup_table$lifespan_FC = lifespan_data[RNA_scaling_group_lookup_table$GeneSymbol,FC]
+    RNA_scaling_group_lookup_table$lifespan_FC_color = "white"
+    RNA_scaling_group_lookup_table$lifespan_FC_color[ RNA_scaling_group_lookup_table$lifespan_FC<1] = "blue"
+    RNA_scaling_group_lookup_table$lifespan_FC_color[ RNA_scaling_group_lookup_table$lifespan_FC>1] = "red"
+ 
+  	
+  	right_annotation = rowAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"group"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"color"],
+		 col = "white"),width = max_text_width("1")*2),
+		
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_label"], 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_color"],
+		 col = "white"),width = max_text_width("1")*2,),
+		
+			bar2 = anno_text(rep(" ",nrow(coef_cor)), 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"lifespan_FC_color"],
+		 col = "white"),width = max_text_width("1")*2,)
+		)
+	
+		 
+	bottom_annotation = columnAnnotation(foo = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"group"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"color"],
+		 col = "white"),height = max_text_height("1")*2),
+		bar = anno_text(RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_label"], 
+		location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"relative_per_gene_variance_color"],
+		 col = "white"),height = max_text_height("1")*2),
+		
+			bar2 = anno_text(rep(" ",nrow(coef_cor)), 
+		 location = 0.5, just = "center",
+		 gp = gpar(fontsize = 10, fill = RNA_scaling_group_lookup_table[rownames(coef_cor),"lifespan_FC_color"],
+		 col = "white"),height = max_text_height("1")*2,)
+		)
+  		
+  #	plot(RNAi_dendogram)
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  	gp = Heatmap(coef_cor,cluster_rows=RNAi_scaling_dendogram,cluster_columns=RNAi_scaling_dendogram,col = cm,column_title=single_worm_model,bottom_annotation = bottom_annotation,right_annotation=right_annotation) 
+  	draw(gp)
+  #	list(RNAis = nms,
+  	#     coef_cor = coef_cor,
+  	#     lm_b = lm_b)
+
+```
+
+
+#COMPARE RNAis based on DA REGRESSION SCORES generated from single da models, to see if worms that score high for one DA also score high for others
+#Very clear way of showing which  RNAis are anticorrelated!
+```{r,fig.width=19,fig.height=19}
+single_worm_model = "d8_sw"
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ120" & `ci.97.5.`<.98 & !grepl("Day3",da)&( grepl("e1368",da) | grepl("vs",da)),]
+
+
+nms = unique(wt_hits$current_da)
+nms = substring(nms,1,nchar(nms)-9)
+score_dat = lapply(nms,function(x){
+  print(x)
+  qread(paste0(path,x,"=all.qs"))
+})
+names(score_dat) = lapply(score_dat,function(x)x$da)
+
+frac_explained = rbindlist(lapply(score_dat,function(x){
+  r = as.numeric(x$dat$residuals$residuals_IQD90/x$dat$residuals$orig_IQD90)
+  data.frame(GeneName = rownames(x$dat$residuals),frac = r) 
+}))
+frac_exp = aggregate(frac~GeneName,frac_explained,FUN=function(x)median(x)<.9)
+gene_names_for_fitting_consensus_scale_factor = frac_exp$GeneName[frac_exp$frac]
+write.csv(gene_names_for_fitting_consensus_scale_factor,"../data/gene_names_for_fitting_consensus_scale_factor.csv",row.names=F)
+
+for (i in c("_Day8","_Set1","_Set2","_Set3","_Set4","_Set5","N2_")) #remove decorations
+  names(score_dat) = str_replace(names(score_dat),i,"")
+
+  nms_short = nms = names(score_dat)
+  coef_cor = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(coef_cor) = colnames(coef_cor) =nms_short;
+  
+  lm_b = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(lm_b) = colnames(lm_b) =nms_short;
+  
+  for (i in 1:length(nms)){ 
+    m = score_dat[[nms[[i]]]]$dat$coef
+    for (j in i:length(nms)){
+      #print(j)
+      if (i==j) next;
+      m2 = score_dat[[nms[[j]]]]$dat$coef
+      coef_cor[i,j] = coef_cor[j,i] = cor(m,m2,method="p")
+      res = lm(m2~m)
+      lm_b[i,j] = coef(res)[2]
+      lm_b[j,i] = 1/coef(res)[2]
+    }
+  } 
+  
+  ref = "n2_d6_vs_8"
+  age_resids = list()
+  for (g in names(score_dat)){
+    m = score_dat[[ref]]$dat$coef
+    m2 = score_dat[[g]]$dat$coef
+    dat = data.frame(a=m,b=m2)
+    #plot(ggplot(dat,aes(a,b))+xlab(ref)+ylab(g) + geom_point())
+    res = lm(m2~m)
+    age_resids[[g]] = residuals(res)
+  }
+ 
+  	clustered_dat =hclust(as.dist(1-(coef_cor)), method = "complete")
+  	RNAi_dendogram = as.dendrogram(clustered_dat)
+  	
+  #	plot(RNAi_dendogram)
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  	gp = Heatmap(coef_cor,cluster_rows=RNAi_dendogram,cluster_columns=RNAi_dendogram,col = cm,column_title=single_worm_model,) 
+  	draw(gp)
+  #	list(RNAis = nms,
+  	#     coef_cor = coef_cor,
+  	#     lm_b = lm_b)
+
+```
+
+#cluster daf-2 based on  age residuals
+```{r,fig.width=14,fig.height=14}
+ nms_short = nms = names(age_resids)
+  coef_cor = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(coef_cor) = colnames(coef_cor) =nms_short;
+  
+  lm_b = matrix(NA,nrow = length(nms),ncol=length(nms))
+  rownames(lm_b) = colnames(lm_b) =nms_short;
+  
+  for (i in 1:length(nms)){ 
+    m = age_resids[[nms[[i]]]]
+    for (j in i:length(nms)){
+      #print(j)
+      if (i==j) next;
+      m2 = age_resids[[nms[[j]]]]
+      coef_cor[i,j] = coef_cor[j,i] = cor(m,m2,method="p")
+      res = lm(m2~m)
+      lm_b[i,j] = coef(res)[2]
+      lm_b[j,i] = 1/coef(res)[2]
+    }
+  }
+ 
+  	clustered_dat =hclust(as.dist(1-(coef_cor)), method = "complete")
+  	RNAi_dendogram = as.dendrogram(clustered_dat)
+  	
+  #	plot(RNAi_dendogram)
+  col_fun = colorRamp2(c(-1,0, 1), c("blue","white", "red"))
+  cm = ColorMapping(col_fun = col_fun)
+  	gp = Heatmap(coef_cor,cluster_rows=RNAi_dendogram,cluster_columns=RNAi_dendogram,col = cm,column_title=single_worm_model,) 
+  	draw(gp)
+  #	list(RNAis = nms,
+  	#     coef_cor = coef_cor,
+  	#     lm_b = lm_b)
+
+```
+
+```{r}
+#calculate consensus scale factor
+ref = "d1_glp1_d8_sw_QZ0"
+
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+path="../data/scaling_models/all/"
+
+
+nms = unique(wt_hits$current_da)
+nms = substring(nms,1,nchar(nms)-9)
+score_dat = lapply(nms,function(x){
+    print(x)
+    qread(paste0(path,x,"=all.qs"))
+  })
+names(score_dat) = nms
+
+
+ref_score_dat = score_dat[[ref]]$dat$coef
+nms = names(score_dat);
+N = length(nms)
+scale_factors = (sapply(nms,function(x){
+  sf = score_dat[[x]]$dat$coef
+  if (cor(sf,ref_score_dat,method="p")>0)
+    return(sf);
+  print(paste(x,"pos"))
+  return(-sf)
+}))
+
+consensus_scale_factor = rowMeans(scale_factors)
+consensus_scale_factor_sd = apply(scale_factors,1,sd)
+scale_factors_to_write = as.data.frame(scale_factors)
+scale_factors_to_write$consensus_scale_factor = consensus_scale_factor;
+fwrite(scale_factors_to_write,"../data/csm_scale_factors.csv.gz")
+
+plot(ref_score_dat,consensus_scale_factor)
+scale_factor_sorting = data.table(Sample = names(consensus_scale_factor),sf = consensus_scale_factor)
+qt = quantile(scale_factor_sorting$sf,c(.25,.75))
+scale_factor_sorting$category = ifelse(scale_factor_sorting$sf<qt[1],"lower_25",ifelse(scale_factor_sorting$sf>qt[2],"upper_25","middle_50"))
+
+
+
+```
+
+```{r}
+#calculate consensus age residuals
+ref = "nlp28"
+ref_age_resid_dat = age_resids[[ref]]
+nms = names(score_dat);
+N = length(nms)
+age_residuals = (sapply(nms,function(x){
+  sf = age_resids[[x]]
+  if (cor(sf,ref_score_dat,method="p")>0)
+    return(sf);
+  print(paste(x,"pos"))
+  return(-sf)
+}))
+
+consensus_age_residual = rowMedians(age_residuals)
+names(consensus_age_residual) = rownames(age_residuals)
+consensus_age_residual_sd = apply(age_residuals,1,sd)
+plot(ref_age_resid_dat,consensus_age_residual)
+```
+
+```{r}
+#calculate consensus fraction_age_explained
+
+nms = names(score_dat);
+N = length(nms)
+var_explained = rbindlist(lapply(nms,function(x){
+  res = score_dat[[x]]$dat$residuals
+  res$GeneName = rownames(res)
+  res
+}))
+var_explained$frac_explained = 1-var_explained$residuals_var/var_explained$orig_var
+var_explained$frac_explained[var_explained$frac_explained <0] = 0
+v_exp = aggregate(frac_explained~GeneName,var_explained,mean)
+orig_var = aggregate(orig_var~GeneName,var_explained,mean)
+var_exp = merge(v_exp,orig_var,by="GeneName")
+var_exp$GeneSymbol = geneid[var_exp$GeneName,GeneSymbol]
+var_exp$GeneSymbol[(var_exp$orig_var < quantile(var_exp$orig_var,.95) | var_exp$frac_explained < .1) &  var_exp$frac_explained < quantile(var_exp$frac_explained,.95)] = ""
+gp = ggplot(var_exp,aes(x=log2(orig_var),label=GeneSymbol,y=frac_explained))+geom_point()+geom_text_repel() + xlab("Variance") + ylab(paste("Fraction of variance explained by\n",wt_hits_var$da[i]))
+plot(ggMarginal(gp, type="densigram"))
+
+```
+### Counts
+
+```{r}
+models = read.csv("../data/differential_analysis/models/single_and_pooled_worms.csv");
+model_names = c("n2_series_all","d8_sw","d1_sw");
+
+#model_names = c("d_glp1_m");
+#model_names = c("d8_20v25C")
+#model_names = c("ts_d_25C");
+data <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+bc <- readRDS("../data/batch_corrected_counts/single_and_pooled_worms.rds")
+
+counts =lapply(model_names, function(x){
+                                  r = bc$batch_counts_list[[x]]
+                                  r[,colnames(r) %in% data$annots$Sample]
+                                 })
+names(counts) = model_names
+
+counts_annots <- unique(rbindlist(lapply(model_names,function(x){
+                  r = data$annots[Sample %in% colnames(counts[[x]])]
+                  r$model = x;
+                  r
+                })))
+setkey(counts_annots, Sample)
+counts_annots[, Strain := droplevels(Strain)]
+counts_annots[, Genotype := droplevels(Genotype)]
+counts_annots[, Day := droplevels(Day)]
+counts_annots[, Group := droplevels(Group)]
+
+nf <- lapply(model_names,function(x){print(x);
+  normalizationFactor(counts[[x]], groups = counts_annots[counts_annots$model==x,][colnames(counts[[x]]),Group])})
+names(nf) = model_names;
+
+norm <- lapply(model_names,function(x){normalizeCounts(counts[[x]], nf[[x]])})
+names(norm) = model_names;
+
+rm(data, bc)
+```
+
+#check to see if the scale factor is correlated with an individuals' normalization factor from count analysis. REsult: It's not!
+```{r}
+nfs = nf[["d8_sw"]][names(consensus_scale_factor)]
+nf_test = data.table(nf = nfs, name=names(consensus_scale_factor), sf = consensus_scale_factor)
+ggplot(nf_test,aes(nf,sf)) + geom_point()
+```
+
+#run DESeq comparing animals with large and small scale factors
+```{r}
+source("../scripts/helpers/differential_analysis.R")
+annots_temp = counts_annots[Sample %in% scale_factor_sorting$Sample,]
+setkey(scale_factor_sorting,Sample)
+annots_temp$scale_factor_category = scale_factor_sorting[annots_temp$Sample,category]
+counts_temp = counts[["d8_sw"]][,annots_temp$Sample]
+nf_temp = nf[["d8_sw"]][annots_temp$Sample]
+deseq_res = runDESeq(counts_temp, annots_temp, nf_temp, ~scale_factor_category)
+deseq_res_out = formatDESeq(deseq_res)
+fwrite(deseq_res_out,"../data/differential_analysis/tables/scale_factor_effect.csv.gz")
+```
+
+
+```{r,fig.width=8,fig.height=8}
+
+rng = range(deseq_res_out$scale_factor_category_upper_25_vs_lower_25_padj)
+inv_log = 
+  scales::trans_new(
+    "-log10",
+    function(x){-log10(x)},
+    function(x){10^(-x)})
+    
+ggplot(deseq_res_out,aes(scale_factor_category_upper_25_vs_lower_25_log2FoldChange ,scale_factor_category_upper_25_vs_lower_25_padj )) +geom_point() + scale_y_continuous(trans=inv_log,breaks=1000^seq(0,-50,by=-8))+ geom_hline(yintercept=.001,col="dark gray",lty=2)
+
+
+table(deseq_res_out$scale_factor_category_upper_25_vs_lower_25_padj<.001)
+glp1_da = fread("../data/differential_analysis/tables/single_and_pooled_worms/d8_glp1.csv.gz")
+mg = merge(deseq_res_out,glp1_da[,.(GeneName,Strain_CB4037_vs_QZ0_log2FoldChange,Strain_CB4037_vs_QZ0_padj)],by="GeneName")
+
+
+
+n2_series_da = fread("../data/differential_analysis/tables/single_and_pooled_worms/n2_series_d8_ref.csv.gz")
+mg = merge(mg,n2_series_da[,.(GeneName,Day_6_vs_8_log2FoldChange,Day_6_vs_8_padj)],by="GeneName")
+mg$Day_6_vs_8_log2FoldChange = -1*mg$Day_6_vs_8_log2FoldChange
+
+pcn1_da = fread("../data/differential_analysis/tables/net_validation/N2_pcn1_Set5_Day8.csv.gz")
+mg = merge(mg,pcn1_da[,.(GeneName,RNAi_pcn1_vs_EV_log2FoldChange,RNAi_pcn1_vs_EV_pvalue)],by="GeneName")
+
+mg[RNAi_pcn1_vs_EV_log2FoldChange<log2(1/2048),RNAi_pcn1_vs_EV_log2FoldChange:=log2(1/2048)]
+
+nlp28_da = fread("../data/differential_analysis/tables/net_validation/N2_nlp28_Set3_Day8.csv.gz")
+mg = merge(mg,nlp28_da[,.(GeneName,RNAi_nlp28_vs_EV_log2FoldChange,RNAi_nlp28_vs_EV_padj)],by="GeneName")
+mg[GeneName=="WBGene00003766",RNAi_nlp28_vs_EV_log2FoldChange:=NA]
+setkey(tissues_df,GeneName)
+mg$Tissue = tissues_df[mg$GeneName,Tissue]
+
+ mg$Tissue[is.na(mg$Tissue)] = "multiple"
+ tissue_colors = c(tissue_colors,`multiple`="dark gray")
+sm_span=2
+scale_factor_label = "Effect of increasing scale factor"
+g1=ggplot(mg,aes(2^scale_factor_category_upper_25_vs_lower_25_log2FoldChange ,2^Strain_CB4037_vs_QZ0_log2FoldChange )) +
+  geom_hline(yintercept=1,col="black",lty=2)+
+  geom_vline(xintercept=1,col="black",lty=2)+
+  geom_point_rast(data=mg[Tissue=="multiple"],alpha=.4,raster.dpi=600,aes(color=Tissue))  + 
+  geom_point(data=mg[Tissue!="multiple"],aes(color=Tissue))  + 
+   geom_smooth(se=F,col="white",lwd=1.5,span=sm_span)+
+  geom_smooth(se=F,col="black",lwd=1,span=sm_span)+
+  scale_color_manual(values=tissue_colors)+
+  xlab(scale_factor_label)+ylab("glp-1(e2141) effect")+
+    scale_x_continuous(trans="log2", breaks = 2^seq(-10,10,by=1), labels = c(paste("1/",2^seq(10,1,by=-1)),2^seq(0,10,by=1))) +
+    scale_y_continuous(trans="log2", breaks = 2^seq(-10,10,by=2), labels = c(paste("1/",2^seq(10,2,by=-2)),2^seq(0,10,by=2)))
+  
+  
+g2= ggplot(mg,aes(2^scale_factor_category_upper_25_vs_lower_25_log2FoldChange ,2^Day_6_vs_8_log2FoldChange ))  +
+  geom_hline(yintercept=1,col="black",lty=2)+
+  geom_vline(xintercept=1,col="black",lty=2)+
+  geom_point_rast(data=mg[Tissue=="multiple"],alpha=.4,raster.dpi=600,aes(color=Tissue))  + 
+  geom_point(data=mg[Tissue!="multiple"],aes(color=Tissue))  + 
+   geom_smooth(se=F,col="white",lwd=1.5,span=sm_span)+
+  geom_smooth(se=F,col="black",lwd=1,span=sm_span)+
+  scale_color_manual(values=tissue_colors)+
+  xlab(scale_factor_label)+ylab("Aging Pseudotime effect")+
+    scale_x_continuous(trans="log2", breaks = 2^seq(-10,10,by=1), labels = c(paste("1/",2^seq(10,1,by=-1)),2^seq(0,10,by=1))) +
+    scale_y_continuous(trans="log2", breaks = 2^seq(-10,10,by=2), labels = c(paste("1/",2^seq(10,2,by=-2)),2^seq(0,10,by=2)))
+    
+g3= ggplot(mg,aes(2^scale_factor_category_upper_25_vs_lower_25_log2FoldChange ,2^RNAi_pcn1_vs_EV_log2FoldChange )) +
+  geom_hline(yintercept=1,col="black",lty=2)+
+  geom_vline(xintercept=1,col="black",lty=2)+
+  geom_point_rast(data=mg[Tissue=="multiple"],alpha=.4,raster.dpi=600,aes(color=Tissue))  + 
+  geom_point(data=mg[Tissue!="multiple"],aes(color=Tissue))  + 
+   geom_smooth(se=F,col="white",lwd=1.5,span=sm_span)+
+  geom_smooth(se=F,col="black",lwd=1,span=sm_span)+
+  scale_color_manual(values=tissue_colors)+
+  xlab(scale_factor_label)+ylab("pcn-1(RNAi) effect")+
+    scale_x_continuous(trans="log2", breaks = 2^seq(-10,10,by=1), labels = c(paste("1/",2^seq(10,1,by=-1)),2^seq(0,10,by=1))) +
+    scale_y_continuous(trans="log2", breaks = 2^seq(-10,10,by=2), labels = c(paste("1/",2^seq(10,2,by=-2)),2^seq(0,10,by=2)))
+    
+g4=ggplot(mg,aes(2^scale_factor_category_upper_25_vs_lower_25_log2FoldChange ,2^RNAi_nlp28_vs_EV_log2FoldChange )) +
+  geom_hline(yintercept=1,col="black",lty=2)+
+  geom_vline(xintercept=1,col="black",lty=2)+
+  geom_point_rast(data=mg[Tissue=="multiple"],alpha=.4,raster.dpi=600,aes(color=Tissue))  + 
+  geom_point(data=mg[Tissue!="multiple"],aes(color=Tissue))  + 
+   geom_smooth(se=F,col="white",lwd=1.5,span=sm_span)+
+  geom_smooth(se=F,col="black",lwd=1,span=sm_span)+
+  scale_color_manual(values=tissue_colors)+
+  xlab(scale_factor_label)+ylab("nlp-28(RNAi) effect")+
+    scale_x_continuous(trans="log2", breaks = 2^seq(-10,10,by=1), labels = c(paste("1/",2^seq(10,1,by=-1)),2^seq(0,10,by=1))) +
+    scale_y_continuous(trans="log2", breaks = 2^seq(-10,10,by=2), labels = c(paste("1/",2^seq(10,2,by=-2)),2^seq(0,10,by=2)))
+    
+gm = ggpubr::ggarrange(plotlist=list(g1,g2,g3,g4),nrow=2,ncol=2,common.legend=T,legend="top")
+plot(g4)
+plot(gm)
+ggsave("../figures/03/scale_factor_vs_da.pdf",width=7,height=8)
+
+cors = rbindlist(lapply(c("Day_6_vs_8_log2FoldChange","Strain_CB4037_vs_QZ0_log2FoldChange","RNAi_pcn1_vs_EV_log2FoldChange","RNAi_nlp28_vs_EV_log2FoldChange"),function(col){
+  tmp = mg[!Tissue %in% c("germ_line","multiple"),]
+  somatic=cor(tmp$scale_factor_category_upper_25_vs_lower_25_log2FoldChange,tmp[,get(col)],method="s",use="complete.obs")
+  tmp = mg[Tissue %in% c("germ_line"),]
+  germ_line=cor(tmp$scale_factor_category_upper_25_vs_lower_25_log2FoldChange,tmp[,get(col)],method="s",use="complete.obs")
+  tmp = mg[Tissue %in% c("multiple"),]
+  multiple=cor(tmp$scale_factor_category_upper_25_vs_lower_25_log2FoldChange,tmp[,get(col)],method="s",use="complete.obs")
+  tmp = mg
+  all=cor(tmp$scale_factor_category_upper_25_vs_lower_25_log2FoldChange,tmp[,get(col)],method="s",use="complete.obs")
+  data.frame(somatic=somatic,germ_line=germ_line,multiple=multiple,all=all,col=col)
+}))
+ 
+```
+
+#calculate PCA of scaling model HITS
+```{r}
+wt_data = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & `ci.97.5.`<.98 & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+da_corr_data = get_covariance_data_for_interventions(wt_data$da,wt_data$da)
+pca_res = prcomp(t(da_corr_data[["fc_sig_ts"]]))
+RNAi_PCA_loadings = data.frame(pca_res$x)
+RNAi_PCA_loadings$da = rownames(pca_res$x)
+RNAi_PCA_loadings$RNAi = substring(RNAi_PCA_loadings$da,4,100)
+RNAi_PCA_loadings$RNAi = substring(RNAi_PCA_loadings$RNAi,1,regexpr("_",RNAi_PCA_loadings$RNAi)-1)
+RNAi_PCA_loadings = RNAi_PCA_loadings[RNAi_PCA_loadings$RNAi != "",]
+ggplot(RNAi_PCA_loadings,aes(PC1,PC2,label=RNAi)) + geom_point() +geom_text_repel()
+
+RNAi_PCA_weights = data.frame(pca_res$rotation)
+RNAi_PCA_weights$GeneName = rownames(pca_res$rotation)
+
+
+```
+
+#calculate PCA of scaling model NOT HITS
+```{r}
+wt_data_not_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !da %in% cohort_scaling_model_hits$da  & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+da_corr_data = get_covariance_data_for_interventions(wt_data_not_hits$da,wt_data_not_hits$da)
+pca_not_hit_res = prcomp(t(da_corr_data[["fc_sig_ts"]]))
+RNAi_PCA_not_hit_loadings = data.frame(pca_not_hit_res$x)
+RNAi_PCA_not_hit_loadings$da = rownames(pca_not_hit_res$x)
+RNAi_PCA_not_hit_loadings$RNAi = substring(RNAi_PCA_not_hit_loadings$da,4,100)
+RNAi_PCA_not_hit_loadings$RNAi = substring(RNAi_PCA_not_hit_loadings$RNAi,1,regexpr("_",RNAi_PCA_not_hit_loadings$RNAi)-1)
+RNAi_PCA_not_hit_loadings = RNAi_PCA_not_hit_loadings[RNAi_PCA_not_hit_loadings$RNAi != "",]
+ggplot(RNAi_PCA_not_hit_loadings,aes(PC1,PC2,label=RNAi)) + geom_point() +geom_text_repel()
+
+RNAi_PCA_not_hit_weights = data.frame(pca_not_hit_res$rotation)
+RNAi_PCA_not_hit_weights$GeneName = rownames(pca_not_hit_res$rotation)
+
+
+```
+#calculage PCA on wt day 8 population
+```{r}
+x = norm[["d8_sw"]][,counts_annots[model=="d8_sw" & Strain == "QZ0",Sample]]
+x <- x[apply(x,1,function(x)!any(x < 30)), ]
+wt_d8_pca <- prcomp(t(log(x + 1)), center = TRUE, scale. = TRUE) 
+wt_d8_pca_weights = data.frame(wt_d8_pca$rotation)
+wt_d8_pca_weights$GeneName = rownames(wt_d8_pca$rotation)
+
+```
+
+#generage plots to compare RNAi knockdown corpus and scaling summary effects to wt day 8
+```{r,fig.width=4,fig.height=8}
+gp_list = list()
+for(i in 1:2){
+  if (i == 1){
+      cur_title = "Hits"
+      suffix = "";
+      weights_to_plot = RNAi_PCA_weights;
+  }else{
+    cur_title = "not hits"
+    suffix = "_not_hits";
+      weights_to_plot = RNAi_PCA_not_hit_weights;
+  }
+  
+dat = merge(weights_to_plot[,c("PC1","GeneName")],deseq_res_out,by="GeneName",suffixes=c(".corpus",".SF"))
+dat = merge(wt_d8_pca_weights[,c("PC1","GeneName")],dat,by="GeneName",suffixes=c(".wt",".corpus"))
+setkey(tissues_df,GeneName)
+dat$Tissue = tissues_df[dat$GeneName,Tissue]
+dat$Tissue[is.na(dat$Tissue)] = "multiple";
+tissue_colors_to_use = c(tissue_colors,`multiple`="dark gray")
+
+
+rng = quantile(dat$PC1.wt,c(.01,.99))
+cr = cor(dat$PC1.wt,dat$scale_factor_category_middle_50_vs_lower_25_log2FoldChange,method="s")
+gp_sf_vs_wt = ggplot(dat,aes(PC1.wt,scale_factor_category_middle_50_vs_lower_25_log2FoldChange,color=Tissue)) +
+  geom_point_rast(data=dat[dat$Tissue=="multiple",],raster.dpi=600)+
+  geom_point(data=dat[dat$Tissue != "multiple",])+
+  #  geom_point(data=dat[dat$Tissue!="multiple",])
+     geom_point(data=dat[dat$Tissue!="multiple",]) + scale_color_manual(values=tissue_colors_to_use) + #geom_smooth(method="loess",se=F,lwd=1.5,color="white",data=dat[dat$PC1> rng[1] & dat$PC1 < rng[2],]) +
+# geom_smooth(method="loess",se=F,color="black",data=dat[dat$PC1> rng[1] & dat$PC1 < rng[2],])+
+  geom_smooth(method="lm",se=F,lwd=1.5,color="white",data=dat[dat$PC1.wt> rng[1] & dat$PC1.wt < rng[2],])+
+  geom_smooth(method="lm",se=F,lty=1,color="black",data=dat[dat$PC1.wt> rng[1] & dat$PC1.wt < rng[2],]) +
+  xlab("Wildtype Cohort\nFirst Principal Component")+
+  ylab("Effect of decreasing scale factor") +
+  annotate("text", x = Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = 1)
+
+nPC = ncol(weights_to_plot)-1
+res = lapply(1:nPC,function(PC){
+  cn = paste0("PC",PC)
+  dat = merge(weights_to_plot[,c(cn,"GeneName")],deseq_res_out,by="GeneName",suffixes=c(".PC1",".SF"))
+  cor(dat[,cn],dat$scale_factor_category_middle_50_vs_lower_25_log2FoldChange,method="s")
+})
+PC_cor = data.frame(cr = unlist(res),PC = 1:nPC)
+gp_sf_vs_wt_corr = ggplot(PC_cor,aes(PC,cr)) + geom_point() + geom_line() + xlab("Knockdown effects\nPrincipal Component")+ylab("Correlation\nwith scale factor effect")
+
+
+mrg = merge(wt_d8_pca_weights,weights_to_plot,by="GeneName",suffixes=c(".wt",".RNAi"))
+mrg$Tissue = tissues_df[mrg$GeneName,Tissue]
+mrg$Tissue[is.na(mrg$Tissue)] = "multiple";
+rng = quantile(mrg$PC1.wt,c(.01,.99))
+
+cr = cor(mrg$PC1.wt,mrg$PC1.RNAi,method="s")
+
+gp_RNAi_vs_wt = ggplot(mrg,aes(PC1.wt,PC1.RNAi,color=Tissue)) +
+  geom_point_rast(data=mrg[mrg$Tissue=="multiple",],raster.dpi=600) +
+  geom_point(data=mrg[mrg$Tissue!="multiple",]) + scale_color_manual(values=tissue_colors_to_use) + #geom_smooth(method="loess",se=F,lwd=1.5,color="white",data=dat[dat$PC1> rng[1] & dat$PC1 < rng[2],]) +
+# geom_smooth(method="loess",se=F,color="black",data=dat[dat$PC1> rng[1] & dat$PC1 < rng[2],])+
+  geom_smooth(method="lm",se=F,lwd=1.5,color="white",data=mrg[mrg$PC1.wt> rng[1] & mrg$PC1.wt < rng[2],])+
+  geom_smooth(method="lm",se=F,lty=1,color="black",data=mrg[mrg$PC1.wt> rng[1] & mrg$PC1.wt < rng[2],]) +
+  ylab("Knockdown effects\nFirst Principal Component")+
+  xlab("Wildtype cohort\nFirst Principal Component")+
+annotate("text", x = Inf, y = Inf, label = paste0("cor=",round(cr,2)), vjust = 2, hjust = 2)
+ggpubr::ggarrange(plotlist=list(gp_RNAi_vs_wt,gp_sf_vs_wt),ncol=2,common.legend=T,legend="none")
+
+ggsave(paste0("../figures/03/SF_and_RNAi_PCA",suffix,".pdf"),width=8,height=4)
+plot(gp_sf_vs_wt_corr)
+ggsave(paste0("../figures/03/SF_RNAi_corr_mag",suffix,".pdf"),width=4,height=4)
+
+}
+```
+
+
+#find genes that correlate with scale factor
+```{r,fig.width=8,fig.height=8}
+cnts = norm[["d8_sw"]]
+cnts = cnts[,counts_annots[Sample %in% colnames(cnts) & Strain == "QZ0",Sample]]
+cnts <- cnts[apply(cnts,1,function(x)!any(x < 10)), ]	
+csf = consensus_scale_factor[colnames(cnts)]
+csf_gene_cor = apply(cnts,1,function(x)cor(x,csf,method="s"))
+most_cor_genes = csf_gene_cor
+
+most_cor_genes = data.table(GeneName = names(most_cor_genes),cor=most_cor_genes)
+setkey(geneid,GeneName)
+setkey(tissues_df,GeneName)
+most_cor_genes$GeneSymbol = geneid[most_cor_genes$GeneName,GeneSymbol]
+most_cor_genes$Tissue = tissues_df[most_cor_genes$GeneName,Tissue]
+most_cor_genes[is.na(Tissue),Tissue:="multiple"]
+most_cor_genes = most_cor_genes[order(abs(most_cor_genes$cor),decreasing=T),]
+
+
+ggplot(most_cor_genes,aes(cor,color=Tissue)) + geom_vline(xintercept=0,lty=2,col="dark gray")+stat_ecdf(lwd=1) + xlim(c(-1,1)) +  annotate('rect', xmin=-1, xmax=-.7, ymin=0, ymax=1, alpha=.2, fill='black')+  annotate('rect', xmin=1, xmax=.5, ymin=0, ymax=1, alpha=.2, fill='red') + xlab("Correlation with scale factor")+theme(legend.position="top")
+ggsave("../figures/03/S_correlation_with_scale_factor.pdf",width=6,height=8)
+                        
+                          
+fwrite(most_cor_genes,"../data/scaling_models/genes_that_correlate_with_scale_factor.csv.gz")
+fwrite(most_cor_genes[which(abs(most_cor_genes$cor)>.5)],"../data/scaling_models/genes_that_correlate_with_scale_factor_top.csv.gz")
+```
+
+
+```{r}
+top_hits = most_cor_genes[which(abs(most_cor_genes$cor)>.7)]
+
+enrich_up <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   data.table(GeneName = top_hits$GeneName[top_hits$cor > 0]), 
+                   "Annotation", 
+                   universe = rownames(cnts))
+})
+names(enrich_up) <- names(gene_annotations)
+
+enrich_down <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   data.table(GeneName = top_hits$GeneName[top_hits$cor < 0]), 
+                   "Annotation", 
+                   universe = rownames(cnts))
+})
+names(enrich_down) <- names(gene_annotations)
+
+
+
+tmp = enrich_up[[1]]$qvalue[,"GeneName"]
+wcat = data.table(cat = names(tmp),qval = tmp)
+wcat = wcat[qval<.05]
+wcat$database = "wormcat"
+wcat$correlation = "+"
+wcat_up = wcat[order(wcat,decreasing=F)]
+
+
+tmp2 = enrich_up[[2]]$qvalue[,"GeneName"]
+wormexp = data.table(cat = names(tmp2),qval = tmp2)
+wormexp = wormexp[qval<.05]
+wormexp$database = "wormexp"
+wormexp$correlation = "+"
+wormexp_up = wormexp[order(qval,decreasing=F)]
+
+tmp = enrich_down[[1]]$qvalue[,"GeneName"]
+wcat = data.table(cat = names(tmp),qval = tmp)
+wcat = wcat[qval<.05]
+wcat$database = "wormcat"
+wcat$correlation = "-"
+wcat_down = wcat[order(wcat,decreasing=F)]
+
+tmp2 = enrich_down[[2]]$qvalue[,"GeneName"]
+wormexp = data.table(cat = names(tmp2),qval = tmp2)
+wormexp = wormexp[qval<.05]
+wormexp$database = "wormexp"
+wormexp$correlation = "-"
+wormexp_down = wormexp[order(qval,decreasing=F)]
+
+all_res = rbind(wcat_up,wormexp_up,wcat_down,wormexp_down)
+View(all_res)
+fwrite(all_res,"../data/scaling_models/scale_fator_correlates_functional_enrichment.csv")
+
+
+```
+
+
+
+```{r}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & da %in% cohort_scaling_model_hits$da  & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+wt_all = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & !grepl("Day1",da) & !grepl("Day3",da) & !grepl("e1368",da),]
+
+#for ( ii in 2){
+ # if (ii == 1){
+    wt_data = wt_hits;
+ # }else
+ #   wt_data = wt_all;
+  
+
+  da_corr_data = get_covariance_data_for_interventions(wt_data$da,wt_data$da)
+```
+```{r}
+pca_res = prcomp(t(da_corr_data[["fc_sig_ts"]]))
+loadings = data.frame(pca_res$x)
+loadings$da = rownames(pca_res$x)
+loadings$RNAi = substring(loadings$da,4,100)
+loadings$RNAi = substring(loadings$RNAi,1,regexpr("_",loadings$RNAi)-1)
+loadings = loadings[loadings$RNAi != "",]
+
+ggplot(loadings,aes(PC1,PC2,label=RNAi)) + geom_point() +geom_text_repel()
+```
+
+```{r}
+cnts = norm[["d8_sw"]]
+cnts = cnts[,counts_annots[Sample %in% colnames(cnts) & Strain == "QZ0",Sample]]
+ref_resid = consensus_age_residual[colnames(cnts)]
+resid_gene_cor = apply(cnts,1,function(x)cor(x,ref_resid,method="s"))
+most_resid_cor_genes = resid_gene_cor[which(abs(resid_gene_cor)>.4)]
+most_resid_cor_genes = data.table(GeneName = names(most_resid_cor_genes),cor=most_resid_cor_genes)
+setkey(geneid,GeneName)
+setkey(tissues_df,GeneName)
+most_resid_cor_genes$GeneSymbol = geneid[most_resid_cor_genes$GeneName,GeneSymbol]
+most_resid_cor_genes$Tissue = tissues_df[most_resid_cor_genes$GeneName,Tissue]
+
+
+enrich_hvg_up <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   most_resid_cor_genes[most_resid_cor_genes$cor>0,], 
+                   "Annotation", 
+                   universe = rownames(cnts))
+})
+names(enrich_hvg_up) <- names(gene_annotations)
+
+enrich_hvg_down <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   most_resid_cor_genes[most_resid_cor_genes$cor<0,], 
+                   "Annotation", 
+                   universe = rownames(cnts))
+})
+names(enrich_hvg_down) <- names(gene_annotations)
+
+tmp = enrich_hvg[[1]]$qvalue[,"GeneName"]
+wcat = data.table(cat = names(tmp),qval = tmp)
+wcat = wcat[qval<.05]
+wcat = wcat[order(wcat,decreasing=F)]
+
+
+tmp = enrich_hvg[[2]]$qvalue[,"GeneName"]
+wormexp = data.table(cat = names(tmp),qval = tmp)
+wormexp = wormexp[qval<.000001]
+wormexp = wormexp[order(qval,decreasing=F)]
+
+```
+
+
+### Load Gene variability data TO SEE IF GENES VARY EARLY IN LIFE
+
+```{r}
+model_names = c("n2_series","d8_sw","d1_sw");
+params_df = NULL;
+trend_df = NULL
+  for (model in model_names){
+    p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,".csv.gz"))
+    if (!("Food" %in% names(p))) p[,Food:=""]
+    if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+    p$model = model
+    params_df = rbind(p,params_df,fill=TRUE);
+     p <- fread(paste0("../data/gene_variability/summary_trend_",model,".csv.gz"))
+  p$model = model
+  trend_df = rbind(p,trend_df,fill=TRUE);
+  }
+  params_df[, Day := factor(Day, levels(counts_annots$Day))]
+  params_df[, Strain := factor(Strain, levels(counts_annots$Strain))]
+  params_df[, Food := factor(Food, levels(counts_annots$Food))]
+  params_df[, Temperature := factor(Temperature, levels(counts_annots$Temperature))]
+  params_df <- params_df[AllZeroProp == 0]
+  params_df$ResDisp = as.numeric(params_df$ResDisp)
+  dva_df = list();#differential mean and variability analysis
+  #mean analysis columns have suffixes "DeSeq"
+ if(0) for (model in model_names){ 
+    dva_df[[model]] <-  fread(paste0("../data/gene_variability/regression_effects_",model,".csv.gz"))
+    dva_df[[model]] <-  dva_df[[model]][MeanMissingValueProp == 0]
+    dma_df_tmp <- fread(paste0("../data/differential_analysis/tables/single_and_pooled_worms/",model,".csv.gz"))
+    colnames(dma_df_tmp)[3:ncol(dma_df_tmp)] <- paste0(colnames(dma_df_tmp)[3:ncol(dma_df_tmp)], "_DESeq")
+    dva_df[[model]] <- merge(dva_df[[model]], dma_df_tmp, by = "GeneName")
+  }
+
+params_shared_tech_df = NULL;
+trend_shared_tech_df= NULL
+for (model in model_names){
+  p <- fread(paste0("../data/gene_variability/summary_residual_overdispersion_",model,"_shared_tech.csv.gz"))  
+  if (!("Food" %in% names(p))) p[,Food:=""]
+  if (!("Temperature" %in% names(p))) p[,Temperature:=""]
+  p$model = model
+  params_shared_tech_df = rbind(p,params_shared_tech_df,fill=TRUE);
+  p <- fread(paste0("../data/gene_variability/summary_trend_",model,"_shared_tech.csv.gz"))
+  p$model = model
+  trend_shared_tech_df = rbind(p,trend_shared_tech_df,fill=TRUE);
+}
+params_shared_tech_df[, Day := factor(Day, levels(counts_annots$Day))]
+params_shared_tech_df[, Strain := factor(Strain, levels(counts_annots$Strain))]
+params_shared_tech_df[, Food := factor(Food, unique(counts_annots$Food))]
+params_shared_tech_df[, Temperature := factor(Temperature, levels(counts_annots$Temperature))]
+params_shared_tech_df <- params_shared_tech_df[AllZeroProp == 0]
+params_shared_tech_df$ResDisp = as.numeric(params_shared_tech_df$ResDisp)
+```
+
+```{r}
+#RNAi_annots = fread("../data/annotations/sample_annotations_net_validation.csv")
+da_models_df <- fread("../data/differential_analysis/models/net_validation.csv")
+	 RNAi_name_fix = matrix(c("C15C74", "C15C7.4"   ,
+	  "K02F25",   "K02F2.5" ,
+	  "R1022",   "R102.2" ,
+	  "Y44A6D2",  "Y44A6D.2", 
+	  "Y9C2VA1", "Y9C2UA.1" ,
+	  "casy1", "casy-1"   ,
+	  "egl21","egl-21"    ,
+	  "flp12",   "flp-12" ,
+	  "flp14",    "flp-14" , 
+	  "flp1","flp-1",
+	  "flp5","flp-5",
+	  "flp9","flp-9",
+	  "ida1","ida-1",
+	  "ins24","ins-24",
+	  "ins26","ins-26",
+	  "ins30","ins-30",
+	  "ins6","ins-6",
+	  "mec12","mec-12",
+	  "nlp15","nlp-15",
+	  "nlp21","nlp-21",
+	  "nlp50","nlp-50",
+	  "pdf1","pdf-1",
+	  "pgal1","pgal-1",
+	  "pghm1","pghm-1",
+	  "sbt1","sbt-1",
+	  "egl3","egl-3",
+	  "ceh91","ceh-91",
+	  "Y9C2UA1","Y9C2UA.1",
+	  "snet1","snet-1",
+	  "snt4","snt-4",
+	  "ttr29","ttr-29",
+	  "zig2","zig-2"),ncol=2,byrow=T)
+
+	  for ( i in 1:nrow(RNAi_name_fix)){da_models_df[RNAi==RNAi_name_fix[i],]$RNAi = RNAi_name_fix[i,2]}
+	 
+RNAi_lookup = da_models_df[,.(Name,RNAi)]
+setkey(geneid,GeneSymbol)
+RNAi_lookup$GeneName = geneid[da_models_df$RNAi,GeneName]
+```
+#look on day 1 in wildtype
+```{r}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & `ci.97.5.`<.98 & !grepl("Day3",da),]
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+hit_params = params_shared_tech_df[model=="d1_sw"& GeneName %in% wt_hits$GeneName & !bad_fit & SequenceType=="Biological" & Strain=="QZ0",]
+setkey(geneid,GeneName)
+hit_params$GeneSymbol = geneid[hit_params$GeneName,GeneSymbol]
+bg_params = params_shared_tech_df[model=="d1_sw"& !bad_fit & SequenceType=="Biological"& Strain=="QZ0",]
+
+bg_r = bg_params$ResVar[!is.na(bg_params$ResVar)]
+
+m = ecdf(bg_r)
+plot(m)
+for (i in 1:nrow(hit_params)){
+ abline(v=hit_params$ResVar[i],col="red") 
+}
+hit_params = hit_params[order(hit_params$ResVar,decreasing=T),]
+hit_params[,.(GeneName,GeneSymbol,ResVar)]
+```
+
+#look on day 1 in glp1 #answer: NONE
+```{r}
+glp1_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_glp1" & single_worm_submodel=="CB4037" & da %in% cohort_scaling_model_hits$da  & !grepl("Day3",da),]
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+hit_params = params_shared_tech_df[model=="d1_sw"& GeneName %in% wt_hits$GeneName & !bad_fit & SequenceType=="Biological" & Strain=="CB4037",]
+setkey(geneid,GeneName)
+hit_params$GeneSymbol = geneid[hit_params$GeneName,GeneSymbol]
+bg_params = params_shared_tech_df[model=="d1_sw"& !bad_fit & SequenceType=="Biological"& Strain=="QZ0",]
+
+bg_r = bg_params$ResVar[!is.na(bg_params$ResVar)]
+
+m = ecdf(bg_r)
+plot(m)
+for (i in 1:nrow(hit_params)){
+ abline(v=hit_params$ResDisp[i],col="red") 
+}
+```
+
+
+#plot variation of each gene throughout life
+```{r,fig.width=8,fig.height=8}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel == "QZ0" & da %in% cohort_scaling_model_hits$da & !grepl("Day3",da),]
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+write.csv(wt_hits,"../data/scaling_models/hits_list.csv")
+tmp = scaling_models
+tmp$GeneName = RNAi_lookup[tmp$da,GeneName]
+write.csv(tmp,"../data/scaling_models/all_list.csv")
+
+bg = params_shared_tech_df[model=="n2_series"& !(GeneName %in% wt_hits$GeneName) & !bad_fit & SequenceType=="Biological" & LogMean> log2(30),]
+bg_avg = aggregate(ResVar~Day,bg,median)
+bg_avg$Day = as.integer(as.character(bg_avg$Day))
+
+bg_avg_mean = aggregate(LogMean~Day,bg,median)
+bg_avg_mean$Day = as.integer(as.character(bg_avg_mean$Day))
+
+hit_params = params_shared_tech_df[model=="n2_series"& GeneName %in% wt_hits$GeneName & !bad_fit & SequenceType=="Biological",]
+setkey(geneid,GeneName)
+hit_params$GeneSymbol = geneid[hit_params$GeneName,GeneSymbol]
+hit_params = hit_params[,.(GeneName,GeneSymbol,Day,ResVar,LogMean)]
+hit_params$Day = as.integer(as.character(hit_params$Day))
+dc = dcast(hit_params,GeneName~Day,value.var = "ResVar")
+dc_mean = dcast(hit_params,GeneName~Day,value.var = "LogMean")
+hit_params$point_label = "";
+hit_params[Day==12,point_label:=GeneSymbol]
+ggplot(hit_params,aes(Day,2^ResVar,color=GeneSymbol))  + geom_hline(yintercept=1,lty=2,col="dark gray")+ geom_line(data=bg_avg,lwd=2,col="black") + geom_line(lwd=1) + geom_point() +
+  scale_x_continuous("Age (days)", 1:12, 1:12, limits=c(1,15))+
+  scale_y_continuous("Expression variance across cohort",trans="log10",breaks=c(1,5,10,50,100,500,1000,5000))+
+  geom_text_repel(data=hit_params,aes(label=point_label,overlaps =0),xlim=c(13,14),segment.color="dark gray")+ theme(legend.position="none")
+ggsave("../figures/03/S_hit_variance_over_time.pdf",width=8,height=8)
+
+ggplot(hit_params,aes(Day,2^LogMean,color=GeneSymbol))  + geom_hline(yintercept=1,lty=2,col="dark gray")+ geom_line(data=bg_avg_mean,lwd=2,col="black") + geom_line(lwd=1) + geom_point() +
+  scale_x_continuous("Age (days)", 1:12, 1:12, limits=c(1,15))+
+  scale_y_continuous("Expression mean across cohort",trans="log10",breaks=c(1,5,10,50,100,500,1000,5000))+
+  geom_text_repel(data=hit_params,aes(label=point_label,overlaps =0),xlim=c(13,14),segment.color="dark gray")+ theme(legend.position="none")
+ggsave("../figures/03/S_hit_mean_over_time.pdf",width=8,height=8)
+
+
+
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel == "QZ0" & da %in% cohort_scaling_model_hits$da  & !grepl("Day3",da),]
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+
+bg = params_shared_tech_df[model=="n2_series"& !(GeneName %in% wt_hits$GeneName) & !bad_fit & SequenceType=="Biological" & LogMean> log2(30),]
+bg_avg = aggregate(ResVar~Day,bg,median)
+bg_avg$Day = as.integer(as.character(bg_avg$Day))
+hit_params = params_shared_tech_df[model=="n2_series"& GeneName %in% wt_hits$GeneName & !bad_fit & SequenceType=="Biological",]
+setkey(geneid,GeneName)
+hit_params$GeneSymbol = geneid[hit_params$GeneName,GeneSymbol]
+hit_params = hit_params[,.(GeneName,GeneSymbol,Day,ResVar)]
+hit_params$Day = as.integer(as.character(hit_params$Day))
+dc = dcast(hit_params,GeneName~Day,value.var = "ResVar")
+hit_params$point_label = "";
+hit_params[Day==12,point_label:=GeneSymbol]
+
+to_plot = c("pcn-1","mig-6","col-122","nlp-28","nlp-15","ceh-91","rheb-1")
+ggplot(hit_params[GeneSymbol %in% to_plot],aes(Day,2^ResVar,color=GeneSymbol))  + geom_hline(yintercept=1,lty=2,col="dark gray")+ geom_line(data=bg_avg,lwd=2,col="black") + geom_line(lwd=1) + geom_point() +
+  scale_x_continuous("Age (days)", 1:12, 1:12, limits=c(1,15))+
+  scale_y_continuous("Cohort Variation",trans="log10",breaks=c(1,5,10,50,100,500,1000,5000))+
+  geom_text_repel(data=hit_params[GeneSymbol %in% to_plot],aes(label=point_label,overlaps =0),xlim=c(13,14),segment.color="dark gray")+ theme(legend.position="none")
+```
+
+```{r,fig.width=15,fig.height=10}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel == "QZ0" & da %in% cohort_scaling_model_hits$da  & !grepl("Day3",da),]
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+wt_hits = wt_hits[!is.na(GeneName),]
+cnts = norm[["d1_sw"]]
+cnts = cnts[wt_hits$GeneName,counts_annots[Sample %in% colnames(cnts) & Strain == "QZ0",Sample]]
+r = melt(cnts)
+names(r) = c("GeneName","Sample","Count")
+setkey(geneid,GeneName)
+r$GeneSymbol = geneid[as.character(r$GeneName),GeneSymbol]
+ggplot(r,aes(x=Count,color=GeneSymbol,bg=GeneSymbol)) + geom_histogram() + facet_wrap(~GeneSymbol,scales="free")
+```
+
+```{r,fig.width=15,fig.height=10}
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel == "QZ0" & da %in% cohort_scaling_model_hits$da  & !grepl("Day3",da),]
+setkey(RNAi_lookup,Name)
+wt_hits$GeneName = RNAi_lookup[wt_hits$da,GeneName]
+wt_hits = wt_hits[!is.na(GeneName),]
+cnts = norm[["d1_sw"]]
+cnts = cnts[wt_hits$GeneName,]
+cannots = counts_annots[Sample %in% colnames(cnts) & model == "d1_sw" ,]
+r = melt(cnts)
+names(r) = c("GeneName","Sample","Count")
+setkey(cannots,Sample)
+r$Strain = cannots[as.character(r$Sample),Strain]
+setkey(geneid,GeneName)
+r$GeneSymbol = geneid[as.character(r$GeneName),GeneSymbol]
+ggplot(r,aes(x=Count,color=Strain,bg=Strain)) + geom_histogram(aes(y = stat(density))) + facet_wrap(~GeneSymbol,scales="free")
+```
+#################################################Interventions!###############
+
+```{r}
+self_matches = scaling_models[single_worm_model == da,]
+ggplot(self_matches[type=="relative_per_gene_variance",],aes(da,(mean_est),color=single_worm_submodel)) + geom_point() + facet_wrap(~type) + ylim(.7,1.3) + theme(axis.text.x=element_text(angle = 90)) + geom_hline(yintercept=1)
+```
+
+
+```{r,fig.width=10,fig.height=10}
+
+wt_hits = scaling_models[type == "relative_total_IQD90" & single_worm_model=="d8_sw" & single_worm_submodel=="QZ0" & `ci.97.5.`<.98 & !grepl("Day3",da) & !grepl("e1368",da),]
+
+wt_hits_across_all_conditions = scaling_model_hit_genes[type=="relative_per_gene_IQD90" & da%in% wt_hits$da,]
+
+tmp = wt_hits_across_all_conditions[da=="d1_glp1",]
+tmp[mean_est > 1,mean_est := 1]
+tmp[`ci.97.5.` > 1,`ci.97.5.` := NA]
+tmp[`ci.2.5.` > 1,`ci.2.5.` := NA]
+tmp[`ci.97.5.` <0,`ci.97.5.` := NA]
+tmp[`ci.2.5.` <0,`ci.2.5.` := NA]
+
+ggplot(tmp,aes(x=single_worm_model,y=mean_est,color=single_worm_submodel,label = single_worm_submodel)) + 
+  geom_point(position=position_dodge(width=0.5))+
+  geom_errorbar(aes(ymin=`ci.2.5.`,ymax=`ci.97.5.`),width=0,position=position_dodge(width=0.5))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),legend.position="none")+geom_text_repel()
+
+tmp2 = rbindlist(lapply(unique(tmp$single_worm_model),function(model){
+  dat = tmp[single_worm_model == model,]
+  dat$subgroup_num = as.integer(factor(dat$single_worm_submodel))
+  dat$subgroup_comp = paste(unique(dat$single_worm_submodel),collapse="vs")
+  dat
+}))
+tmp3= dcast(tmp2[single_worm_model!="n2_series",],single_worm_model+subgroup_comp~subgroup_num,value.var="mean_est")
+ggplot(tmp3,aes(`1`,`2`,label=subgroup_comp,color=subgroup_comp)) + geom_point() + geom_text_repel() + geom_abline(slope=1,intercept=0,lty=2,col="dark gray")
+```
+

@@ -1,0 +1,1138 @@
+---
+title: "Gene Network"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(ComplexHeatmap)
+library(pbapply)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(ggpubr)
+
+theme_set(theme_cowplot())
+
+
+source("../scripts/notebooks_helpers/gene_network.R")
+source("../scripts/helpers/preprocess.R")
+source("../scripts/helpers/enrichment_analysis.R")
+source("../scripts/helpers/graphs.R")
+#source("../scripts/helpers/heatmap_v1.R")
+source("../scripts/helpers/group_pca.R")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load data
+
+### Counts
+
+```{r}
+formatted_counts <- readRDS("../data/formated_counts/counts_and_annots_single_and_pooled_worms.rds")
+
+```
+
+### Genes annotations
+
+```{r}
+geneid <- fread("../data/annotations/c_elegans.PRJNA13758.WS265.geneIDs.txt.gz")
+geneid[V3 == "", V3 := V4]
+geneid <- geneid[, .(GeneName = V2, GeneSymbol = V3, GeneType = V6)]
+geneid <- geneid[! duplicated(GeneName)]
+
+gene_annotations <- readRDS("../data/annotations/gene_annotations.rds")
+gene_annotations <- gene_annotations[c("Wormcat", "Wormexp", "KEGG")]
+```
+
+### Tissues
+
+```{r}
+tissues_df <- fread("../data/tissue_unique_genes/genes_unique_to_tissues.csv.gz")
+tissues <- pull(tissues_df, "Tissue", "GeneName")
+```
+
+### Network
+
+```{r}
+if (0){
+data <- readRDS("../data/gene_network/all_genes_gene_network_d1.rds")
+for (var in names(data)) {
+  assign(paste0("d1_", var), data[[var]])
+}
+rm(data)
+}
+
+# d1_tissue_rho_list <- lapply(d1_tissue_norm_list, function(x)
+#   cor(t(x), method = "s"))
+
+network_data <- readRDS("../data/gene_network/all_genes_communities_d8_compact_file_inclusive.rds")
+high_confidence_communities = readRDS("../data/gene_network/all_genes_communities_d8_high_confidence.rds")
+#high_confidence_communities = readRDS("../data/gene_network/all_genes_gene_network_d8.rds")
+
+high_confidence_tissue_graph = subgraph(network_data$tissue_graph[[1]],unlist(high_confidence_communities))
+#for (var in names(data)) {
+#  assign(paste0("d8_", var), data[[var]])
+#}
+#rm(data)
+
+#also load tissue-specific communities for comparrison
+if (0){
+data <- readRDS("../data/gene_network/gene_network_d8.rds")
+for (var in names(data)) {
+  assign(paste0("ts_d8_", var), data[[var]])
+}
+rm(data)
+}
+
+# d8_tissue_rho_list <- lapply(d8_tissue_norm_list, function(x)
+#   cor(t(x), method = "s"))
+```
+
+
+```{r}
+#write out centrality files
+results = NULL
+setkey(geneid,GeneName)
+#degree(d8_tissue_graph[["n2"]],v=V(d8_tissue_graph[["n2"]]))
+for (i in 1:length(high_confidence_communities)){
+ gr = high_confidence_tissue_graph
+ deg = degree(gr,v=V(gr));
+ eig = evcent(gr)$vector
+ res2 = data.frame(GeneName=names(deg),degree_centrality=deg,eigenvector_centrality=eig,community=i)
+
+ res2$GeneSymbol = geneid[res2$GeneName,GeneSymbol]
+ rownames(res2) = (length(results$degree_centrality)+1):(length(results$degree_centrality)+length(res2$degree_centrality))
+ if (!is.null(results))rownames(results) = 1:length(results$degree_centrality)
+ results = rbind(as.data.table(res2),as.data.table(results))
+}
+write.csv(results,"../data/gene_network/all_gene_network_node_centrality.csv")
+
+```
+
+```{r}
+if (0){
+#compare ts to all gene networks
+all_N = length(d8_tissue_communities)
+ts_N = length(ts_d8_tissue_communities)
+mapping = matrix(NA,nrow=all_N+1,ncol = ts_N);
+labels = matrix("",nrow=all_N+1,ncol = ts_N);
+rownames(mapping) = c(paste("Tissue non-specific",1:all_N),"No Group")
+colnames(mapping) = paste("Tissue Specific",1:ts_N)
+genelist = NULL
+for (j in 1:ts_N){
+  found_in_all = c()
+  genes_ts =ts_d8_tissue_communities[[j]]
+  for (i in 1:all_N){
+    genes_all =d8_tissue_communities[[i]]
+      inter = intersect(genes_all,genes_ts)
+      genelist = rbind(data.frame(GeneName=inter,ts_group=rep(j,length(inter)),tissue_non_specific_group=rep(i,length(inter))),genelist)
+      
+      found_in_all = c(inter,found_in_all);
+      mapping[i,j] = length(inter)/length(genes_ts) 
+      labels[i,j]  = length(inter)
+  }
+  not_in_any = genes_ts[! (genes_ts %in% found_in_all)]; 
+  genelist = rbind(data.frame(GeneName=not_in_any,ts_group=rep(j,length(not_in_any)),tissue_non_specific_group=rep("none",length(not_in_any))),genelist)
+  mapping[all_N+1,j] = length(not_in_any)/length(genes_ts) 
+  labels[all_N+1,j]  = length(not_in_any)
+}
+genelist$GeneSymbol = unlist(geneid[genelist$GeneName,"GeneSymbol"])
+write.csv(genelist,"../data/gene_network/ts_all_community_mapping.csv",row.names=F)
+}
+```
+
+
+```{r,fig.width=10,fig.height=7}
+for (i in 1:2){
+  if (i == 2) pdf("../figures/sup_figure_5/ts_all_community_mapping.pdf",width=10,height=7);
+plot(Heatmap(mapping,column_order = colnames(mapping),col=c("black","pink"),
+cell_fun = function(j, i, x, y, w, h, col) { # add text to each grid
+        grid.text(labels[i, j], x, y,gp=gpar(col="white"))
+}))
+  if (i==2) dev.off()
+}
+
+```
+
+### Differential analysis
+
+```{r}
+#d1_da <- fread("../data/tissue_specific_regression/tables/single_and_pooled_worms/d1_sw.csv.gz")
+d8_da <- fread("../data/tissue_specific_regression/tables/single_and_pooled_worms/d8_sw.csv")
+# n2_day_da <- fread("../data/tissue_specific_regression/tables/single_and_pooled_worms/")
+```
+
+## Colors
+
+```{r}
+genotype_colors <- c(N2 = "#990000ff", `daf-2(e1368)` = "#0b5394ff")
+day_colors <- c("goldenrod1", "darkgreen")
+
+tissue_colors <- c("germ_line" = "black", 
+                   "hypodermis" = "#5ac134", 
+                   "intestine" = "#79bbe9", 
+                   "muscle" = "#f68528",
+                   "neurons" = "#E92128")
+
+community_colors <- colorspace::rainbow_hcl(length(high_confidence_communities))
+names(community_colors) <- paste0("Community", seq_along(community_colors))
+```
+
+## Genes
+
+### Day 1
+
+```{r}
+for (community in names(d1_tissue_communities)) {
+  cat(community)
+  cat("\n")
+  cat(sort(geneid[d1_tissue_communities[[community]]]$GeneSymbol))
+  cat("\n\n")
+}
+```
+
+### Day 8
+
+```{r}
+for (community in names(d8_tissue_communities)) {
+  cat(community)
+  cat("\n")
+  cat(sort(geneid[d8_tissue_communities[[community]]]$GeneSymbol))
+  cat("\n\n")
+}
+```
+
+## Number of genes
+
+```{r, fig.width=8, fig.height=6}
+
+                           
+ggdf <- c("Measured genes" = nrow(formatted_counts$counts), 
+          "High-abundance genes" = nrow(network_data$filter_tissue_rho_list[[1]]),
+          "Tissue-specific genes" = length(tissues), 
+          "Genes in communities" = length(unique(unlist(high_confidence_communities))))
+ggdf <- data.table(Type = names(ggdf), NumberOfGenes = ggdf)
+ggdf[, Type := factor(Type, rev(Type))]
+
+ggplot(ggdf, aes(NumberOfGenes, Type)) +
+  geom_point() +
+  ggrepel::geom_text_repel(aes(label = NumberOfGenes)) +
+  scale_x_log10(limits = c(1, 20000), breaks = c(10^(0:4))) +
+  ylab(NULL) +
+  xlab("Number of Genes")
+
+ggsave("../figures/03/S_all_genes_gene_network_number_of_genes.pdf", width = 8, height = 6)
+```
+
+## Mean correlation
+
+```{r}
+# gp <- plotMeanCor(d8_mu_list$n2, d8_tissue_rho_list$n2)
+# ggsave("../figures/sup_figure_7/all_genes_gene_network_correlation_mean_n2_d8.pdf", gp[[1]], width = 7, height = 7)
+```
+
+```{r}
+# gp <- plotMeanCor(d8_mu_list$daf2, d8_tissue_rho_list$daf2)
+# ggsave("../figures/sup_figure_7/all_genes_gene_network_correlation_mean_daf2_d8.pdf", gp[[1]], width = 7, height = 7)
+```
+
+## Heatmap with all genes
+
+### Day 8 N2
+
+```{r, fig.width=17, fig.height=16}
+cor_mat = network_data$filter_tissue_rho_list[[1]]
+dend <- as.dendrogram(hclust(as.dist(1-cor_mat), "ward.D2"))
+
+gp <- Heatmap(cor_mat, 
+              name = "Correlation",
+              use_raster = TRUE,
+              show_row_names = FALSE, 
+              show_column_names = FALSE,
+              cluster_rows = dend, 
+              cluster_columns = dend, 
+              col = circlize::colorRamp2(c(-1, 0, 1), c("royalblue4", "white", "firebrick")))
+draw(gp)
+
+pdf("../figures/03/all_genes_gene_network_heatmap_all_genes_correlation_n2_d8.pdf",
+    width = 17, height = 16)
+draw(gp)
+dev.off()
+```
+
+### Day 8 daf-2
+
+```{r, fig.width=17, fig.height=16}
+if (0){
+dend <- as.dendrogram(hclust(as.dist(1-d8_filter_tissue_rho_list$daf2), "ward.D2"))
+
+gp <- Heatmap(d8_filter_tissue_rho_list$daf2, 
+              name = "Correlation",
+              use_raster = TRUE,
+              show_row_names = FALSE, 
+              show_column_names = FALSE,
+              cluster_rows = dend, 
+              cluster_columns = dend, 
+              col = circlize::colorRamp2(c(-1, 0, 1), c("royalblue4", "white", "firebrick")))
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_all_genes_correlation_daf2_d8.pdf", 
+    width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+### Day 1 N2
+
+```{r, fig.width=17, fig.height=16}
+if(0){
+dend <- as.dendrogram(hclust(as.dist(1-d1_filter_tissue_rho_list$n2), "ward.D2"))
+
+gp <- Heatmap(d1_filter_tissue_rho_list$n2, 
+              name = "Correlation",
+              use_raster = TRUE,
+              show_row_names = FALSE, 
+              show_column_names = FALSE,
+              cluster_rows = dend, 
+              cluster_columns = dend, 
+              col = circlize::colorRamp2(c(-1, 0, 1), c("royalblue4", "white", "firebrick")))
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_all_genes_correlation_n2_d1.pdf", 
+    width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+### Day 1 daf-2
+
+```{r, fig.width=17, fig.height=16}
+if(0){
+dend <- as.dendrogram(hclust(as.dist(1-d1_filter_tissue_rho_list$daf2), "ward.D2"))
+
+gp <- Heatmap(d1_filter_tissue_rho_list$daf2, 
+              name = "Correlation",
+              use_raster = TRUE,
+              show_row_names = FALSE, 
+              show_column_names = FALSE,
+              cluster_rows = dend, 
+              cluster_columns = dend, 
+              col = circlize::colorRamp2(c(-1, 0, 1), c("royalblue4", "white", "firebrick")))
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_all_genes_correlation_daf2_d1.pdf", 
+    width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+## Difference day 8 and day 1 
+
+```{r, fig.width=17, fig.height=16}
+if (0){
+  intersect_genes <- intersect(rownames(d1_filter_tissue_rho_list$n2), rownames(d8_filter_tissue_rho_list$n2))
+diff <- (abs(d8_filter_tissue_rho_list$n2[intersect_genes, intersect_genes])
+         - abs(d1_filter_tissue_rho_list$n2[intersect_genes, intersect_genes]))
+
+dend <- as.dendrogram(hclust(as.dist(diff), "ward.D2"))
+
+gp <- Heatmap(diff, 
+              name = "Correlation",
+              use_raster = TRUE,
+              show_row_names = FALSE, 
+              show_column_names = FALSE,
+              cluster_rows = dend, 
+              cluster_columns = dend, 
+              col = circlize::colorRamp2(c(-1, 0, 1), c("royalblue4", "white", "firebrick")))
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_all_genes_correlation_difference_d8_with_d1.pdf", 
+    width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+```{r}
+if (0){
+ggdf <- data.table(Difference = diff[lower.tri(diff)])
+ggplot(ggdf[sample(.N, 10000)], aes(Difference)) +
+  stat_ecdf() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  xlab("Difference in correlation between day 8 and day 1") +
+  ylab("ECDF")
+ggsave("../figures/sup_figure_7/all_genes_gene_network_heatmap_all_genes_correlation_difference_d8_with_d1_ecdf.pdf", width = 7, height = 6)
+}
+```
+
+## Heatmap
+
+#### N2 Day 1
+
+```{r, fig.width=17, fig.height=16}
+if (0){
+plotSplitCorrelationHeatmap(d1_filter_tissue_rho_list$n2, 
+                            setNames(d1_tissue_communities, NULL))
+}
+```
+
+#### daf-2 Day 1
+
+```{r, fig.width=17, fig.height=16}
+if (0)
+plotSplitCorrelationHeatmap(d1_filter_tissue_rho_list$daf2, 
+                            setNames(d1_tissue_communities, NULL))
+```
+
+#### N2 Day 8
+
+```{r, fig.width=8, fig.height=8}
+cor_mat = network_data$filter_tissue_rho_list[[1]]
+gp <- plotSplitCorrelationHeatmap(cor_mat, 
+                                  setNames(high_confidence_communities, NULL), 
+                                  colors = community_colors)
+draw(gp)
+
+pdf("../figures/03/all_genes_gene_network_heatmap_n2_d8_grouped_by_community.pdf", width = 8, height = 8)
+draw(gp)
+dev.off()
+```
+
+#### daf-2 Day 8
+
+```{r, fig.width=17, fig.height=16}
+if(0){
+gp <- plotSplitCorrelationHeatmap(d8_filter_tissue_rho_list$daf2, 
+                                  setNames(d8_tissue_communities, NULL), 
+                                  colors = community_colors)
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_daf2_d8.pdf", width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+#### Difference Day 8
+
+```{r, fig.width=17, fig.height=16}
+if(0){
+gp <- plotSplitCorrelationHeatmap(abs(d8_filter_tissue_rho_list$daf2) - abs(d8_filter_tissue_rho_list$n2), 
+                                  setNames(d8_tissue_communities, NULL),
+                                  community_colors)
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_difference_d8.pdf", width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+#### N2 Day 1 with Day 8 communities
+
+```{r, fig.width=17, fig.height=16}
+if (0){
+gp <- plotSplitCorrelationHeatmap(d1_filter_tissue_rho_list$n2, 
+                                  setNames(d8_tissue_communities, NULL), 
+                                  colors = community_colors)
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_n2_d1.pdf", width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+#### daf-2 Day 1 with Day 8 communities
+
+```{r, fig.width=17, fig.height=16}
+if(0){
+gp <- plotSplitCorrelationHeatmap(d1_filter_tissue_rho_list$daf2, 
+                                  setNames(d8_tissue_communities, NULL), 
+                                  colors = community_colors)
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_daf2_d1.pdf", width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+#### Difference Day 1 with Day 8 communities
+
+```{r, fig.width=17, fig.height=16}
+if (0){
+gp <- plotSplitCorrelationHeatmap(abs(d1_filter_tissue_rho_list$daf2) - abs(d1_filter_tissue_rho_list$n2), 
+                                  setNames(d8_tissue_communities, NULL),
+                                  community_colors)
+draw(gp)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_heatmap_difference_d1.pdf", width = 17, height = 16)
+draw(gp)
+dev.off()
+}
+```
+
+## Do the clusters exist? One-sample correlation test
+
+```{r}
+if(0){
+#d1_r2_dist_results <- lapply(d1_filter_tissue_norm_list, function(x) 
+#  bootstrapR2(norm1 = x, clusters = d8_tissue_communities))
+d8_r2_dist_results <- lapply(d8_filter_tissue_norm_list, function(x) 
+  bootstrapR2(norm1 = x, clusters = d8_tissue_communities))
+
+obs_r2_dist_df <- rbind(
+  cbind(d1_r2_dist_results$n2$boot_ecdf_quantiles_df1, Day = 1, Genotype = "N2"),
+  cbind(d1_r2_dist_results$daf2$boot_ecdf_quantiles_df1, Day = 1, Genotype = "daf-2(e1368)"),
+  cbind(d8_r2_dist_results$n2$boot_ecdf_quantiles_df1, Day = 8, Genotype = "N2"),
+  cbind(d8_r2_dist_results$daf2$boot_ecdf_quantiles_df1, Day = 8, Genotype = "daf-2(e1368)"))
+obs_r2_dist_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+obs_r2_dist_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(obs_r2_dist_df$Community) <- gsub("Community", "", levels(obs_r2_dist_df$Community))
+
+random_r2_dist_df <- rbind(
+  cbind(d1_r2_dist_results$n2$boot_ecdf_quantiles_df2, Day = 1, Genotype = "N2"),
+  cbind(d1_r2_dist_results$daf2$boot_ecdf_quantiles_df2, Day = 1, Genotype = "daf-2(e1368)"),
+  cbind(d8_r2_dist_results$n2$boot_ecdf_quantiles_df2, Day = 8, Genotype = "N2"),
+  cbind(d8_r2_dist_results$daf2$boot_ecdf_quantiles_df2, Day = 8, Genotype = "daf-2(e1368)"))
+random_r2_dist_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+random_r2_dist_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(random_r2_dist_df$Community) <- gsub("Community", "", levels(random_r2_dist_df$Community))
+
+r2_dist_labels_df <- rbind(
+  
+  data.table(Community = names(d1_r2_dist_results$n2$pvalue), 
+             PValue = d1_r2_dist_results$n2$pvalue, 
+             Day = 1, 
+             Genotype = "N2"),
+  
+  data.table(Community = names(d1_r2_dist_results$daf2$pvalue), 
+             PValue = d1_r2_dist_results$daf2$pvalue, 
+             Day = 1, 
+             Genotype = "daf-2(e1368)"),
+  
+  data.table(Community = names(d8_r2_dist_results$n2$pvalue), 
+             PValue = d8_r2_dist_results$n2$pvalue, 
+             Day = 8, 
+             Genotype = "N2"),
+  
+  data.table(Community = names(d8_r2_dist_results$daf2$pvalue), 
+             PValue = d8_r2_dist_results$daf2$pvalue, 
+             Day = 8, 
+             Genotype = "daf-2(e1368)"))
+r2_dist_labels_df[, PValue := round(p.adjust(PValue, "fdr"), 3)]
+r2_dist_labels_df[, PValue := as.character(PValue)]
+r2_dist_labels_df[PValue == 0, PValue := "<0.001"]
+r2_dist_labels_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+r2_dist_labels_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(r2_dist_labels_df$Community) <- gsub("Community", "", levels(r2_dist_labels_df$Community))
+}
+```
+
+
+```{r, fig.width=11, fig.height=21}
+if (0){
+ggplot(mapping = aes(Rho, ECDF)) +
+  geom_line(aes(color = Community), data = obs_r2_dist_df) + 
+  geom_line(data = random_r2_dist_df) + 
+  geom_ribbon(aes(Rho, ymin = CI01, ymax = CI99, fill = Community), obs_r2_dist_df, alpha = .3) + 
+  geom_ribbon(aes(Rho, ymin = CI01, ymax = CI99), random_r2_dist_df, alpha = .3, fill = "black") + 
+  facet_grid(Community ~ paste("Day", Day) + Genotype) +
+  ggpp::geom_text_npc(aes(npcx = "right", npcy = "bottom", label = PValue), data = r2_dist_labels_df) + 
+  xlab("Squared Correlation") +
+  ylab("Empirical Cumulative Distribution Function") +
+  scale_fill_discrete(name = NULL) +
+  scale_color_manual(values = setNames(community_colors, gsub("y", "y ", names(community_colors))), 
+                     name = NULL) +
+  scale_x_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  theme(legend.position = "none") + 
+  theme(panel.spacing = unit(0.5, "lines"))
+ggsave("../figures/sup_figure_7/all_genes_gene_network_bootstrap_ecdf_one_sample.pdf",
+       width = 11, height = 21)
+}
+```
+
+## Are the clusters stronger in one condition or the other? Two-sample correlation test
+
+```{r}
+if (0){
+extractCorVector <- function(rho, genes) {
+  out <- rho[rownames(rho) %in% genes, colnames(rho) %in% genes]
+  out <- out[lower.tri(out)]
+  out <- as.vector(out)
+  out
+}
+}
+```
+
+```{r}
+if (0){
+r2_dist_df <- rbindlist(lapply(names(d8_tissue_communities), function(comm_name) {
+  
+  genes <- d8_tissue_communities[[comm_name]]
+  
+  rbind(
+    data.table(
+      Genotype = "N2",
+      Day = 1,
+      Community = comm_name,
+      Correlation = extractCorVector(d1_filter_tissue_rho_list$n2, genes)),
+    
+    data.table(
+      Genotype = "daf-2(e1368)",
+      Day = 1,
+      Community = comm_name,
+      Correlation = extractCorVector(d1_filter_tissue_rho_list$daf2, genes)),
+    
+    data.table(
+      Genotype = "N2",
+      Day = 8,
+      Community = comm_name,
+      Correlation = extractCorVector(d8_filter_tissue_rho_list$n2, genes)),
+    
+    data.table(
+      Genotype = "daf-2(e1368)",
+      Day = 8,
+      Community = comm_name,
+      Correlation = extractCorVector(d8_filter_tissue_rho_list$daf2, genes)))
+  
+}))
+
+r2_dist_df[, Condition := NA_character_]
+r2_dist_df[Genotype == "N2", Condition := paste0("Day ", Day, "; N2")]
+r2_dist_df[Genotype == "daf-2(e1368)", Condition := paste0("Day ", Day, "; daf-2")]
+r2_dist_df[, Condition := factor(Condition, rev(unique(r2_dist_df$Condition)))]
+r2_dist_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(r2_dist_df$Community) <- gsub("Community", "C", levels(r2_dist_df$Community))
+}
+```
+
+```{r, fig.width=12, fig.height=10}
+if (0){
+dodge <- position_dodge(width = 0.1)
+
+ggplot(r2_dist_df, aes(Correlation^2, Condition, fill = Condition)) +
+  geom_violin(position = dodge, alpha = .7)+
+  geom_boxplot(width = .3, outlier.colour = NA, position = dodge, alpha = .7)  +
+  # geom_density_ridges2() +
+  # geom_density_ridges2(stat = "binline", bins = 15, draw_baseline = TRUE) +
+  facet_wrap(~ Community) +
+  ylab(NULL) +
+  scale_x_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
+  xlab("Squared Correlations") +
+  # scale_fill_manual(values = genotype_colors) + 
+  scale_fill_manual(values = setNames(c(rev(genotype_colors), "lightskyblue1", "lightpink"), NULL)) +
+  scale_color_manual(values = setNames(c(rev(genotype_colors), "lightskyblue1", "lightpink"), NULL)) +
+  theme(legend.position = "none")
+
+ggsave("../figures/sup_figure_7/all_genes_gene_network_squared_correlation_boxplot.pdf",
+       width = 12, height = 10)
+}
+```
+
+```{r}
+if (0){
+sig_r2_dist_df <- rbindlist(apply(combn(levels(r2_dist_df$Condition), 2), 2, function(conds) {
+  
+  res <- sapply(levels(r2_dist_df$Community), function(comm_name) {
+    
+    x <- r2_dist_df[Condition == conds[1] & Community == comm_name]$Correlation^2
+    y <- r2_dist_df[Condition == conds[2] & Community == comm_name]$Correlation^2
+    
+    out <- wilcox.test(x, y)
+    
+    c(Statistic = setNames(out$statistic, NULL), PValue = setNames(out$p.value, NULL))
+  })
+  
+  cbind(Community = colnames(res),
+        Condition1 = conds[1],
+        Condition2 = conds[2],
+        as.data.table(t(res)))
+  
+}))
+sig_r2_dist_df <- sig_r2_dist_df[order(Community, Condition1, Condition2)]
+sig_r2_dist_df[, FDR := p.adjust(PValue, "fdr")]
+sig_r2_dist_df
+
+fwrite(sig_r2_dist_df, "../figures/sup_figure_7/all_genes_gene_network_squared_correlation_boxplot_wilcox_pvalues.csv")
+}
+```
+
+### old
+
+```{r}
+# day 8 vs day 1 in N2
+d8_vs_d1_n2_r2_dist_results <- bootstrapR2(d8_filter_tissue_norm_list$n2, 
+                                           d1_filter_tissue_norm_list$n2, 
+                                           clusters = d8_tissue_communities)
+
+d8_vs_d1_n2_r2_dist_df <- rbind(
+  cbind(d8_vs_d1_n2_r2_dist_results$boot_ecdf_quantiles_df1, Day = 8, Genotype = "N2"),
+  cbind(d8_vs_d1_n2_r2_dist_results$boot_ecdf_quantiles_df2, Day = 1, Genotype = "N2"))
+d8_vs_d1_n2_r2_dist_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+d8_vs_d1_n2_r2_dist_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(d8_vs_d1_n2_r2_dist_df$Community) <- gsub("Community", "", levels(d8_vs_d1_n2_r2_dist_df$Community))
+
+d8_vs_d1_n2_r2_labels_df <- data.table(
+  Community = names(d8_vs_d1_n2_r2_dist_results$pvalue), 
+  PValue = d8_vs_d1_n2_r2_dist_results$pvalue, 
+  Day = 8, 
+  Genotype = "N2")
+d8_vs_d1_n2_r2_labels_df[, PValue := round(p.adjust(PValue, "fdr"), 3)]
+d8_vs_d1_n2_r2_labels_df[, PValue := as.character(PValue)]
+d8_vs_d1_n2_r2_labels_df[PValue == 0, PValue := "<0.001"]
+d8_vs_d1_n2_r2_labels_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+d8_vs_d1_n2_r2_labels_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(d8_vs_d1_n2_r2_labels_df$Community) <- gsub("Community", "", levels(d8_vs_d1_n2_r2_labels_df$Community))
+
+# daf-2 vs N2 in day 8
+daf2_vs_n2_d8_r2_dist_results <- bootstrapR2(d8_filter_tissue_norm_list$n2, 
+                                             d8_filter_tissue_norm_list$daf2, 
+                                             clusters = d8_tissue_communities)
+
+daf2_vs_n2_d8_r2_dist_df <- rbind(
+  cbind(daf2_vs_n2_d8_r2_dist_results$boot_ecdf_quantiles_df1, Day = 8, Genotype = "N2"),
+  cbind(daf2_vs_n2_d8_r2_dist_results$boot_ecdf_quantiles_df2, Day = 8, Genotype = "daf-2(e1368)"))
+daf2_vs_n2_d8_r2_dist_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+daf2_vs_n2_d8_r2_dist_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(daf2_vs_n2_d8_r2_dist_df$Community) <- gsub("Community", "", levels(daf2_vs_n2_d8_r2_dist_df$Community))
+
+daf2_vs_n2_d8_r2_labels_df <- data.table(
+  Community = names(daf2_vs_n2_d8_r2_dist_results$pvalue), 
+  PValue = daf2_vs_n2_d8_r2_dist_results$pvalue, 
+  Day = 8, 
+  Genotype = "N2")
+daf2_vs_n2_d8_r2_labels_df[, PValue := round(p.adjust(PValue, "fdr"), 3)]
+daf2_vs_n2_d8_r2_labels_df[, PValue := as.character(PValue)]
+daf2_vs_n2_d8_r2_labels_df[PValue == 0, PValue := "<0.001"]
+daf2_vs_n2_d8_r2_labels_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+daf2_vs_n2_d8_r2_labels_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(daf2_vs_n2_d8_r2_labels_df$Community) <- gsub("Community", "", levels(daf2_vs_n2_d8_r2_labels_df$Community))
+
+# daf-2 vs N2 in day 1
+daf2_vs_n2_d1_r2_dist_results <- bootstrapR2(d1_filter_tissue_norm_list$n2, 
+                                             d1_filter_tissue_norm_list$daf2, 
+                                             clusters = d8_tissue_communities)
+daf2_vs_n2_d1_r2_dist_df <- rbind(
+  cbind(daf2_vs_n2_d1_r2_dist_results$boot_ecdf_quantiles_df1, Day = 1, Genotype = "N2"),
+  cbind(daf2_vs_n2_d1_r2_dist_results$boot_ecdf_quantiles_df2, Day = 1, Genotype = "daf-2(e1368)"))
+daf2_vs_n2_d1_r2_dist_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+daf2_vs_n2_d1_r2_dist_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(daf2_vs_n2_d1_r2_dist_df$Community) <- gsub("Community", "", levels(daf2_vs_n2_d1_r2_dist_df$Community))
+
+daf2_vs_n2_d1_r2_labels_df <- data.table(
+  Community = names(daf2_vs_n2_d1_r2_dist_results$pvalue), 
+  PValue = daf2_vs_n2_d1_r2_dist_results$pvalue, 
+  Day = 8, 
+  Genotype = "N2")
+daf2_vs_n2_d1_r2_labels_df[, PValue := round(p.adjust(PValue, "fdr"), 3)]
+daf2_vs_n2_d1_r2_labels_df[, PValue := as.character(PValue)]
+daf2_vs_n2_d1_r2_labels_df[PValue == 0, PValue := "<0.001"]
+daf2_vs_n2_d1_r2_labels_df[, Genotype := factor(Genotype, c("N2", "daf-2(e1368)"))]
+daf2_vs_n2_d1_r2_labels_df[, Community := factor(Community, names(d8_tissue_communities))]
+levels(daf2_vs_n2_d1_r2_labels_df$Community) <- gsub("Community", "", levels(daf2_vs_n2_d1_r2_labels_df$Community))
+```
+
+```{r, fig.width=16, fig.height=12}
+ggplot(d8_vs_d1_n2_r2_dist_df, aes(Rho, ECDF)) +
+  geom_line(aes(color = factor(Day))) +
+  geom_ribbon(aes(ymin = CI01, ymax = CI99, fill = factor(Day)), alpha = .3) + 
+  facet_wrap( ~ Community) +
+  ggpp::geom_text_npc(aes(npcx = "right", npcy = "bottom", label = PValue), data = d8_vs_d1_n2_r2_labels_df) + 
+  xlab("Squared Correlation") +
+  ylab("ECDF") +
+  ggtitle("Day 8 vs Day 1 in N2") +
+  scale_color_manual(name = "Day", values = day_colors) + 
+  scale_fill_manual(name = "Day", values = day_colors) + 
+  scale_x_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  theme(legend.position = "top") + 
+  theme(panel.spacing = unit(0.5, "lines"))
+ggsave("../figures/sup_figure_7/all_genes_gene_network_bootstrap_ecdf_d8_vs_d1_n2.pdf",
+       width = 16, height = 12)
+```
+
+```{r, fig.width=16, fig.height=12}
+ggplot(daf2_vs_n2_d8_r2_dist_df, mapping = aes(Rho, ECDF)) +
+  geom_line(aes(color = Genotype)) +
+  geom_ribbon(aes(ymin = CI01, ymax = CI99, fill = Genotype), alpha = .3) + 
+  facet_wrap( ~ Community) +
+  ggpp::geom_text_npc(aes(npcx = "right", npcy = "bottom", label = PValue), data = daf2_vs_n2_d8_r2_labels_df) + 
+  xlab("Squared Correlation") +
+  ylab("ECDF") +
+  scale_fill_manual(values = genotype_colors) +
+  scale_color_manual(values = genotype_colors) +
+  scale_x_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  theme(legend.position = "top") + 
+  theme(panel.spacing = unit(0.5, "lines")) +
+  ggtitle("daf-2(e1368) vs N2 on Day 8")
+
+ggsave("../figures/sup_figure_7/all_genes_gene_network_bootstrap_ecdf_daf2_vs_n2_d8.pdf",
+       width = 16, height = 12)
+```
+
+```{r, fig.width=16, fig.height=12}
+ggplot(daf2_vs_n2_d1_r2_dist_df, mapping = aes(Rho, ECDF)) +
+  geom_line(aes(color =Genotype, )) +
+  geom_ribbon(aes(ymin = CI01, ymax = CI99, fill = Genotype), alpha = .3) + 
+  facet_wrap(~ Community) +
+  ggpp::geom_text_npc(aes(npcx = "right", npcy = "bottom", label = PValue), data = daf2_vs_n2_d1_r2_labels_df) + 
+  xlab("Squared Correlation") +
+  ylab("ECDF") +
+  scale_fill_manual(values = genotype_colors) +
+  scale_color_manual(values = genotype_colors) +
+  scale_x_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1")) +
+  theme(legend.position = "top") + 
+  theme(panel.spacing = unit(0.5, "lines")) +
+  ggtitle("daf-2(e1368) vs N2 on Day 1")
+
+ggsave("../figures/sup_figure_7/all_genes_gene_network_bootstrap_ecdf_daf2_vs_n2_d1.pdf",
+       width = 16, height = 12)
+```
+
+## Diff ana
+
+```{r, fig.width=13, fig.height=7}
+if (0){
+plotDiffAna(
+  d1_da[, .(GeneName,
+            log2FoldChange = StrainQZ120_log2FoldChange,
+            lfcSE = StrainQZ120_lfcSE,
+            padj = StrainQZ120_padj)], 
+  clusters = d8_tissue_communities, 
+  colors = genotype_colors) +
+  ylab("log2 Fold Change daf-2(e1368) vs N2")
+
+ggsave("../figures/sup_figure_7/all_genes_gene_network_diff_ana_day1_daf2_vs_n2.pdf", width = 13, height = 7)
+}
+```
+
+```{r, fig.width=13, fig.height=7}
+if(0){
+plotDiffAna(
+  d8_da[, .(GeneName,
+            log2FoldChange = StrainQZ120_log2FoldChange,
+            lfcSE = StrainQZ120_lfcSE,
+            padj = StrainQZ120_padj)], 
+  clusters = d8_tissue_communities, 
+  colors = genotype_colors) +
+  ylab("log2 Fold Change daf-2(e1368) vs N2")
+
+ggsave("../figures/sup_figure_7/all_genes_gene_network_diff_ana_day8_daf2_vs_n2.pdf", 
+       width = 13, height = 7)
+}
+```
+
+```{r, fig.width=13, fig.height=7}
+# plotDiffAna(
+#   n2_day_da[, .(GeneName,
+#             log2FoldChange = Day1_log2FoldChange,
+#             lfcSE = Day1_lfcSE,
+#             padj = Day1_padj)], 
+#   clusters = d8_tissue_communities, 
+#   colors = genotype_colors) +
+#   ylab("log2 Fold Change Day 8 vs Day 1 (N2)")
+# 
+# ggsave("../figures/sup_figure_7/all_genes_gene_network_diff_ana_n2_day8_vs_day1.pdf", 
+#        width = 13, height = 7)
+```
+## Enrichment
+
+```{r}
+d8_tissue_enrich <- lapply(names(gene_annotations), function(database) {
+  fisherEnrichment(gene_annotations[[database]], 
+                   high_confidence_communities, 
+                   "Annotation", 
+                   universe = rownames(counts))
+})
+names(d8_tissue_enrich) <- names(gene_annotations)
+```
+
+```{r, fig.width=10, fig.height=10}
+setkey(geneid,GeneName)
+high_confidence_communities_flat = rbindlist(lapply(names(high_confidence_communities),function(x){
+  r = data.frame(GeneName = high_confidence_communities[[x]])
+  r$GeneSymbol = geneid[r$GeneName,GeneSymbol]
+  r$Community  = x
+  r
+}))
+
+full_communities_flat = 
+full_communities_flat = rbindlist(lapply(names(network_data$tissue_communities),function(x){
+  r = data.frame(GeneName = network_data$tissue_communities[[x]])
+  r$GeneSymbol = geneid[r$GeneName,GeneSymbol]
+  r$Community  = x
+  r
+}))
+
+source("../scripts/notebooks_helpers/gene_network.R")
+orthlist = read.csv("../data/annotations/ortholist_master.csv")
+outf<-file("../tables/05_coexpression_groups_formatted.tex",open="w")
+print_pretty_table(high_confidence_communities,enrich=d8_tissue_enrich,orthlist=orthlist,many_genes=T);
+    close(outf)
+
+full_communities_flat$high_confidence = ifelse(full_communities_flat$GeneName %in% high_confidence_communities_flat$GeneName,"T","F")
+write.csv(full_communities_flat,"../tables/04_coexpression_groups.csv",row.names=F)
+```
+
+
+```{r}
+full_communities_flat = fread("../tables/04_coexpression_groups.csv")
+high_conf_communities = full_communities_flat[high_confidence=="T"]
+coms = unique(high_conf_communities$Community);
+database = "Wormexp"
+
+universe = rownames(network_data$filter_tissue_rho_list$n2)
+enrich_res = lapply(coms,function(com){
+ fisherEnrichment(gene_annotations[[database]], 
+                   high_conf_communities[Community==com,], 
+                   "Annotation", 
+                   universe = universe)
+  
+})
+names(enrich_res) <- (coms)
+
+res2 = rbindlist(lapply(names(enrich_res),function(x){
+   y = enrich_res[[x]][["qvalue"]]
+   r = data.table(f=rownames(y),qval=y[,"GeneName"])
+   r$Community = x;
+   r[qval<.05/100]
+}))
+fwrite(res2,"../tables/community_worm_exp_enrichment.csv")
+
+database = "Wormcat"
+
+enrich_worcat_res = lapply(coms,function(com){
+ fisherEnrichment(gene_annotations[[database]], 
+                   high_conf_communities[Community==com,], 
+                   "Annotation", 
+                   universe = universe)
+  
+})
+names(enrich_worcat_res) <- (coms)
+
+res2 = rbindlist(lapply(names(enrich_worcat_res),function(x){
+   y = enrich_worcat_res[[x]][["qvalue"]]
+   r = data.table(f=rownames(y),qval=y[,"GeneName"])
+   r$Community = x;
+   r[qval<.05/100]
+}))
+fwrite(res2,"../tables/community_wormcat_enrichment.csv")
+```
+
+```
+
+
+```{r}
+com_members = Reduce(rbind,lapply(names(high_confidence_communities),function(com){
+  data.frame(GeneName=high_confidence_communities[[com]],Community=rep(com,length(high_confidence_communities[[com]])))
+}));
+olist_matchup = merge(com_members,orthlist,by.x="GeneName",by.y="WormBase.ID",all.x=T,all.y=F)
+olist_matchup$has_homolog = !is.na(olist_matchup$HGNC.Symbol)
+res = as.data.table(table(olist_matchup[,c("Community","has_homolog")]))
+res2= dcast(res,Community~has_homolog)
+names(res2)[2:3] = c("yes","no")
+res2$frac = (res2$yes)/ as.double(res2$yes+res2$no)
+res2$com = as.numeric(substring(res2$Community,10))
+res2$well_conserved = res2$frac > .5
+print(res2[order(res2$well_conserved,res2$com,decreasing = F),])
+
+```
+
+
+```{r, fig.width=10, fig.height=7}
+for (database in names(gene_annotations)) {
+  for (gp in gp_d8_enrich[[database]]) plot(gp)
+}
+```
+
+### Enrichment tables
+
+```{r}
+printEnrichmentLatexTable(d8_tissue_enrich$`Biological Process`$qvalue,
+                          alpha = 0.1,
+                          file = "../figures/enrichment_tables/all_genes_gene_network_d8_communities_gene_ontology_bp.tex")
+
+printEnrichmentLatexTable(d8_tissue_enrich$Wormcat$qvalue,
+                          alpha = 0.1,
+                          file = "../figures/enrichment_tables/all_genes_gene_network_d8_communities_gene_wormcat.tex")
+
+# printEnrichmentLatexTable(d8_tissue_enrich$Wormexp$qvalue, alpha = .00001,
+#                           file = "../figures/enrichment_tables/all_genes_gene_network_d8_communities_wormexp.tex")
+
+if (0) printEnrichmentLatexTable(d8_tissue_enrich$TF$qvalue, 
+                          capitalize = FALSE,
+                          alpha = 0.1,
+                          file = "../figures/enrichment_tables/all_genes_gene_network_d8_communities_transcription_factors.tex")
+```
+
+## Tissue table
+
+```{r}
+tissue_tab <- rbindlist(lapply(seq_along(high_confidence_communities), function(i) {
+  
+  genes <- high_confidence_communities[[i]]
+  comm_tissues <- tissues[names(tissues) %in% genes]
+  
+  tab_comm_tissues <- table(comm_tissues)
+  tab_comm_tissues <- sort(tab_comm_tissues, decreasing = TRUE)
+  names(tab_comm_tissues) <- gsub("_", " ", names(tab_comm_tissues))
+  names(tab_comm_tissues) <- Hmisc::capitalize(names(tab_comm_tissues))
+  
+  out <-  paste0(names(tab_comm_tissues), " (", as.integer(tab_comm_tissues), ")")
+  out <- paste(out, collapse = " \\\\ ")
+  out <- paste0("\\makecell[l]{", out, "}")
+  
+  data.table(Community = i, Enrichment = out)
+}))
+
+options(xtable.sanitize.text.function=identity)
+
+print(xtable::xtable(tissue_tab, align = "lcl"), 
+      file = "../figures/tables/all_genes_gene_network_d8_communities_tissues.tex",
+      tabular.environment = "longtable",
+      floating = FALSE,
+      include.rownames=FALSE,
+      hline.after = 0:nrow(tissue_tab))
+```
+
+
+```{r}
+gp_d8_enrich <- lapply(names(gene_annotations), function(database) {
+  gp_list <- plotEnrichment(d8_tissue_enrich[[database]], alpha = 0.05, nmax = 30)
+  new_gp_list <- lapply(names(gp_list), function(set) gp_list[[set]] + ggtitle(paste(database, set)))
+  names(new_gp_list) <- names(gp_list)
+  new_gp_list
+})
+names(gp_d8_enrich) <- names(gene_annotations)
+```
+
+## Whole graph
+
+### Day 8
+
+```{r, fig.width=20, fig.height=20}
+mar <- par()$mar
+par(mar = c(0, 0, 0, 0))
+
+source("../scripts/notebooks_helpers/gene_network.R")
+coords <- coordsWholeGraph(high_confidence_tissue_graph, 
+                           high_confidence_communities, 
+                           radius = 150, target_area = 150)
+tissue_colors_2 = c(tissue_colors,multi="#FFFFFF")
+plotWholeGraph(high_confidence_tissue_graph, 
+               network_data$filter_tissue_rho_list[[1]][unlist(high_confidence_communities),unlist(high_confidence_communities)],
+               high_confidence_communities,
+               community_colors = community_colors,
+               tissue_colors = tissue_colors_2,
+               tissues_df = tissues_df,
+               color_nodes_by_tissue=T,
+               coords = coords)
+if (0)
+plotWholeGraph(d8_tissue_graph$daf2, 
+               d8_filter_tissue_rho_list$daf2,
+               d8_tissue_communities,
+               community_colors = community_colors,
+               coords = coords)
+
+pdf("../figures/03/all_genes_gene_network_whole_graph_d8_n2.pdf", width = 7, height = 7)
+par(mar = c(0, 0, 0, 0))
+plotWholeGraph(high_confidence_tissue_graph, 
+               network_data$filter_tissue_rho_list[[1]][unlist(high_confidence_communities),unlist(high_confidence_communities)],
+               high_confidence_communities,
+               community_colors = community_colors,
+               tissue_colors = tissue_colors_2,
+               tissues_df = tissues_df,
+               color_nodes_by_tissue=T,
+               coords = coords)
+dev.off()
+if (0){
+pdf("../figures/03/all_genes_gene_network_whole_graph_d8_daf2.pdf", width = 7, height = 7)
+par(mar = c(0, 0, 0, 0))
+plotWholeGraph(d8_tissue_graph$daf2, 
+               d8_filter_tissue_rho_list$daf2,
+               d8_tissue_communities,
+               community_colors = community_colors,
+               coords = coords)
+dev.off()
+}
+
+par(mar = mar)
+```
+```{r,fig.width=8,fig.height=8}
+
+high_confidence_communities_flat = rbindlist(lapply(names(high_confidence_communities),function(x){
+  r = data.frame(GeneName = high_confidence_communities[[x]])
+  r$GeneSymbol = geneid[r$GeneName,GeneSymbol]
+  r$Community  = x
+  r
+}))
+setkey(tissues_df,GeneName)
+high_confidence_communities_flat$tissue = tissues_df[high_confidence_communities_flat$GeneName,Tissue]
+high_confidence_communities_flat[is.na(tissue),tissue:="multiple"]
+tissue_colors_2 = c(multiple="#CCCCCC",tissue_colors)
+ggplot(high_confidence_communities_flat,aes(x=tissue,color=tissue,bg=tissue)) + geom_bar() + facet_wrap(~as.integer(substring(Community,10)),scale="free")+
+  theme(axis.text.x = element_text(angle=90),legend.position="none",strip.background = element_blank())+
+  scale_fill_manual(values = tissue_colors_2) +scale_color_manual(values = tissue_colors_2) 
+ggsave("../figures/03/S_coexpression_tissue_composition.pdf",width=8,height=8)
+```
+
+### Day 1
+
+```{r, fig.width=10, fig.height=10}
+if (0){
+mar <- par()$mar
+par(mar = c(0, 0, 0, 0))
+
+
+coords <- coordsWholeGraph(d1_tissue_union_graph, 
+                           d8_tissue_communities, 
+                           radius = 150, target_area = 150)
+
+plotWholeGraph(d1_tissue_graph$n2, 
+               d1_filter_tissue_rho_list$n2,
+               d8_tissue_communities,
+               community_colors = colorspace::rainbow_hcl(length(d8_tissue_communities)),
+               coords = coords)
+
+plotWholeGraph(d1_tissue_graph$daf2, 
+               d1_filter_tissue_rho_list$daf2,
+               d8_tissue_communities,
+               community_colors = colorspace::rainbow_hcl(length(d8_tissue_communities)),
+               coords = coords)
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_whole_graph_d1_n2.pdf", width = 7, height = 7)
+par(mar = c(0, 0, 0, 0))
+plotWholeGraph(d1_tissue_graph$n2, 
+               d1_filter_tissue_rho_list$n2,
+               d8_tissue_communities,
+               community_colors = colorspace::rainbow_hcl(length(d8_tissue_communities)),
+               coords = coords)
+dev.off()
+
+pdf("../figures/sup_figure_7/all_genes_gene_network_whole_graph_d1_daf2.pdf", width = 7, height = 7)
+par(mar = c(0, 0, 0, 0))
+plotWholeGraph(d1_tissue_graph$daf2, 
+               d1_filter_tissue_rho_list$daf2,
+               d8_tissue_communities,
+               community_colors = colorspace::rainbow_hcl(length(d8_tissue_communities)),
+               coords = coords)
+dev.off()
+
+par(mar = mar)
+}
+```
